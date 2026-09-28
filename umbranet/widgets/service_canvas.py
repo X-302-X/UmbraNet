@@ -19,7 +19,7 @@ Toggle (~150 виджетов в области прокрутки) — при �
 Состояния прилетают обратно через set_service_states() / set_favorites()
 (refresh() движка) — тумблеры анимируются только при реальном изменении.
 
-Автор: 302XXX / UmbraNet_Official
+Автор: X-302-X / UmbraNet_Official
 Лицензия: GPLv3
 """
 

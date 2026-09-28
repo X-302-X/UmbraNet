@@ -4,7 +4,7 @@ UmbraNet — канвас списка DPI-стратегий (радио-выб
 Замена QScrollArea + карточек-QFrame из dpi_strategy_list.py. Логика
 выбора стратегии (WinWS-перезапуск и т.д.) остаётся в DpiStrategyList.
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations

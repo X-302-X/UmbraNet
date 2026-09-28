@@ -145,7 +145,7 @@ def _rebuild_modes() -> None:
     MODES = {
         "blue":  {"name": "DNS Only", "emoji": "⚙", "c1": ACCENT,   "c2": ACCENT2,   "backend": "off"},
         "black": {"name": "Combo",    "emoji": "⚡", "c1": "#6366f1", "c2": "#a855f7", "backend": "combo"},
-        "red":   {"name": "DPI Only", "emoji": "🛡", "c1": RED,      "c2": "#f59e0b", "backend": "zapret"},
+        "red":   {"name": "DPI Only", "emoji": "🛡", "c1": RED,      "c2": "#f59e0b", "backend": "dpi_only"},
     }
     BACKEND_TO_UI = {v["backend"]: k for k, v in MODES.items()}
 

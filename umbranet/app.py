@@ -37,12 +37,14 @@ from umbranet.engine_adapter import (
     get_startup_health,
     is_admin,
     network_restore_latest,
+    post_event,
     set_dns_to_localhost,
     set_nav_order,
     switch_mode,
+    verify_teardown,
 )
 from umbranet.views.about import AboutView
-from umbranet.views.kus import KusView
+from umbranet.views.extra import ExtraView
 from umbranet.views.log import LogView
 from umbranet.views.network import NetworkView
 from umbranet.views.profiles import ProfilesView
@@ -64,7 +66,7 @@ NAV_ITEMS = [
     NavItem("settings", "Настройки",          "⚙"),
     NavItem("about",    "О программе",        "ℹ"),
 ]
-SECRET_NAV = NavItem("kus", "Кусь", "😺")
+EXTRA_NAV = NavItem("extra", "\u041a\u0443\u0441\u044c", "😺")
 
 
 def _ordered_nav_items() -> list[NavItem]:
@@ -473,7 +475,7 @@ class MainWindow(GlowContainer):
         self.sidebar.orderChanged.connect(
             lambda order: set_nav_order(order, [it.key for it in NAV_ITEMS])
         )
-        self.sidebar.secretUnlocked.connect(self._unlock_kus)
+        self.sidebar.extraNavRequested.connect(self._show_extra)
         root.addWidget(self.sidebar)
 
         right = QVBoxLayout()
@@ -1171,6 +1173,41 @@ class MainWindow(GlowContainer):
                     target=_reset, daemon=True, name="UmbraNet-RestoreDNS"
                 ).start()
 
+            # Аудит после остановки: даём фоновому восстановлению DNS завершиться,
+            # затем проверяем итог и докладываем. Раньше после «Стоп» никто не
+            # искал хвосты: «Стоп нажат, а обход продолжает работать» оставался
+            # незамеченным — и программе, и её диагностике было не на что смотреть.
+            import time as _time
+
+            def _audit():
+                try:
+                    _time.sleep(2.0)  # ждём UmbraNet-RestoreDNS и добивание winws
+                    audit = verify_teardown()
+                    if audit.get("ok"):
+                        log.info("Аудит после остановки: хвостов нет")
+                    for problem in audit.get("problems") or []:
+                        log.warning("Аудит после остановки: %s", problem)
+                    for note in audit.get("notes") or []:
+                        log.info("Аудит после остановки: %s", note)
+                    try:
+                        from umbranet.engine_adapter import add_query_log_event
+                        add_query_log_event(
+                            "[Аудит остановки]",
+                            source="check" if audit.get("ok") else "leak",
+                            rcode="OK" if audit.get("ok") else "WARN",
+                            note="хвостов нет" if audit.get("ok")
+                                 else "; ".join(audit.get("problems") or [])[:200],
+                        )
+                    except Exception as exc:
+                        log.debug("Запись аудита остановки в журнал не удалась: %s", exc)
+                    post_event({"type": "teardown_audit", **audit})
+                except Exception as exc:
+                    log.debug("Аудит после остановки не удался: %s", exc)
+
+            _threading.Thread(
+                target=_audit, daemon=True, name="UmbraNet-TeardownAudit"
+            ).start()
+
         if action == "stop" and self._ai_generation_pending:
             if ok:
                 # Даём UI и фоновому DNS-reset короткий тик, затем готовим план.
@@ -1504,19 +1541,19 @@ class MainWindow(GlowContainer):
     def _on_navigate(self, key: str):
         self._show(key)
 
-    def _unlock_kus(self):
-        """Показывает скрытую вкладку «Кусь» (сессия, без сохранения в порядок)."""
-        if SECRET_NAV.key in self._pages:
-            self.sidebar.set_active(SECRET_NAV.key)
-            self._show(SECRET_NAV.key)
+    def _show_extra(self):
+        """Показывает дополнительную вкладку (сессия, без сохранения в порядок)."""
+        if EXTRA_NAV.key in self._pages:
+            self.sidebar.set_active(EXTRA_NAV.key)
+            self._show(EXTRA_NAV.key)
             return
-        page = KusView()
-        self._views[SECRET_NAV.key] = page
-        idx = self.stack.addWidget(self._scrollable_page(page, key=SECRET_NAV.key))
-        self._pages[SECRET_NAV.key] = idx
-        self.sidebar.add_item(SECRET_NAV)
-        self.sidebar.set_active(SECRET_NAV.key)
-        self._show(SECRET_NAV.key)
+        page = ExtraView()
+        self._views[EXTRA_NAV.key] = page
+        idx = self.stack.addWidget(self._scrollable_page(page, key=EXTRA_NAV.key))
+        self._pages[EXTRA_NAV.key] = idx
+        self.sidebar.add_item(EXTRA_NAV)
+        self.sidebar.set_active(EXTRA_NAV.key)
+        self._show(EXTRA_NAV.key)
 
     # ── Размер и положение окна ─────────────────────────────────────────────
     # Настройка живёт в общем состоянии UI (core/ui_state.py): тот же файл, что
@@ -1697,6 +1734,16 @@ class MainWindow(GlowContainer):
                     except Exception:
                         pass
                 self._refresh_current_view()
+            elif etype == "teardown_audit":
+                problems = event.get("problems") or []
+                if problems:
+                    msg = "После остановки: " + "; ".join(str(p) for p in problems[:2])
+                    log.warning("%s", msg)
+                    if self.tray:
+                        try:
+                            self.tray.notify("⚠ " + msg)
+                        except Exception:
+                            pass
             elif etype == "error":
                 msg = event.get("message", "Неизвестная ошибка")
                 log.warning("Событие ошибки от движка: %s", msg)
@@ -1934,7 +1981,7 @@ class MainWindow(GlowContainer):
     # Телеграмизация 2026-09: все вкладки кроме карты теперь paintEvent-чистые
     # (RoundedPanel/Canvas) и не фризят при живом resize — freeze-снимок
     # больше не нужен. Карта исключена по просьбе юзера (сырой виджет).
-    LIVE_RESIZE_PAGES = {"routing", "network", "strategy_lab", "profiles", "log", "settings", "about", "kus"}
+    LIVE_RESIZE_PAGES = {"routing", "network", "strategy_lab", "profiles", "log", "settings", "about", "extra"}
 
     # ── Когда вкладке давать прокрутку ──────────────────────────────────────
     # Пороги привязаны к минимальному окну (560x420) и его внутреннему месту:

@@ -724,7 +724,7 @@ class NetworkView(QWidget):
         self._dpi_title.setStyleSheet(f"color:{color};font-size:15px;font-weight:700;background:transparent;border:none;")
         err = st.get("last_error") or ""
         raw_mode = cfg.get("dpi_mode", "off")
-        ui_mode = {"off": "dns_only", "combo": "combo", "zapret": "dpi_only"}.get(raw_mode, "unknown")
+        ui_mode = {"off": "dns_only", "combo": "combo", "dpi_only": "dpi_only"}.get(raw_mode, "unknown")
         target_count = int(targets.get("count", 0) or 0)
         text = (
             f"Режим: {_mode_label(ui_mode)} • "

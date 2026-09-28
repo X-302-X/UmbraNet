@@ -21,7 +21,7 @@
 «Маршрутизация»), заморозку отключают целиком — там resize живой
 (см. GlowContainer.set_live_resize в app.py).
 
-Автор: 302XXX / UmbraNet_Official
+Автор: X-302-X / UmbraNet_Official
 """
 
 from __future__ import annotations

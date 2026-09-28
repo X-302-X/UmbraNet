@@ -32,7 +32,7 @@ def test_release_is_not_opened_automatically(view, monkeypatch):
     opened = Mock(return_value=True)
     monkeypatch.setattr(about.QDesktopServices, "openUrl", opened)
     checker._result = UpdateResult("available", "0.4.0",
-        "https://github.com/302XXX/UmbraNet/releases/tag/v0.4.0", "Доступна версия 0.4.0")
+        "https://github.com/X-302-X/UmbraNet/releases/tag/v0.4.0", "Доступна версия 0.4.0")
     widget._refresh_update_status()
     assert not widget._open_release.isHidden()
     assert "0.4.0" in widget._release_status.text()
@@ -73,7 +73,7 @@ def test_release_button_gets_layout_geometry_after_hidden_resize(view):
         APP.processEvents()
         assert widget._open_release.isHidden()
         checker._result = UpdateResult("available", "0.4.0",
-            "https://github.com/302XXX/UmbraNet/releases/tag/v0.4.0", "Доступна версия 0.4.0")
+            "https://github.com/X-302-X/UmbraNet/releases/tag/v0.4.0", "Доступна версия 0.4.0")
         widget._refresh_update_status()
         for _ in range(4):
             APP.processEvents()

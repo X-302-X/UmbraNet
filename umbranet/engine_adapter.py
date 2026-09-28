@@ -128,7 +128,7 @@ class _StubEngine:
         self.config["dpi_mode"] = {
             "dns_only": "off",
             "combo": "combo",
-            "dpi_only": "zapret",
+            "dpi_only": "dpi_only",
         }[ui_mode]
         # Выбор режима не запускает заглушку/движок.
         return True, ""
@@ -185,7 +185,7 @@ def switch_mode(ui_mode: str) -> tuple:
     ui_mode:
       'dns_only' — DNS-сервер включён, DPI выключен (синий)
       'combo'    — DNS + DPI в режиме split+fake (чёрный)
-      'dpi_only' — DNS + DPI в режиме zapret (красный)
+      'dpi_only' — DNS + DPI в агрессивном режиме (красный)
 
     Возвращает (ok: bool, error: str). UI вызывает только этот метод
     для смены режима — не трогает start()/stop()/set_dpi_mode() напрямую.
@@ -217,7 +217,7 @@ def switch_mode(ui_mode: str) -> tuple:
         log.warning("switch_mode недоступен в ядре, используем ручное переключение")
         try:
             # fallback тоже разрешает переключение без целей — старт заблокируем отдельно
-            MODE_MAP = {"dns_only": "off", "combo": "combo", "dpi_only": "zapret"}
+            MODE_MAP = {"dns_only": "off", "combo": "combo", "dpi_only": "dpi_only"}
             dpi_mode = MODE_MAP.get(ui_mode, "off")
             eng.set_dpi_mode(dpi_mode)
             post_event({"type": "mode_changed", "mode": ui_mode})
@@ -245,7 +245,7 @@ def get_current_mode() -> str:
             return "dns_only"
         if dpi == "combo":
             return "combo"
-        if dpi == "zapret":
+        if dpi == "dpi_only":
             return "dpi_only"
         return "dns_only"
     except Exception:
@@ -668,7 +668,7 @@ def get_startup_health() -> dict:
                 if not get_winws_engine().is_available():
                     problems.append(
                         "Режим DPI включен, но winws.exe не найден в папке bin/. "
-                        "Скачайте релиз zapret (winws) и поместите winws.exe в UmbraNet1/bin/ "
+                        "Поместите winws.exe в папку bin/ рядом с программой "
                         "или переключитесь в режим 'Только DNS'."
                     )
         except Exception as exc:
@@ -818,7 +818,7 @@ def mode_info(ui_mode: str | None = None) -> dict:
             "title": "DPI Only",
             "emoji": "🛡",
             "summary": "Агрессивный DPI-режим",
-            "details": "DNS остаётся для резолва и журнала запросов, DPI работает в режиме zapret. Используйте, если DNS Only/Combo не помогает.",
+            "details": "DNS остаётся для резолва и журнала запросов, DPI работает в агрессивном режиме. Используйте, если DNS Only/Combo не помогает.",
             "warning": "" if dpi_ok else f"DPI сейчас недоступен: {dpi_reason}. Проверьте bin/winws.exe и поставляемые с ним файлы WinDivert.",
         },
     }
@@ -2463,6 +2463,80 @@ def network_restore_latest() -> tuple[bool, str]:
         return False, str(exc)
 
 
+def verify_teardown() -> dict:
+    """Проверка ПОСЛЕ остановки: не осталось ли хвостов, которые «продолжают работать».
+
+    Зачем: раньше после «Стоп» никто не проверял итог. Пользователь видел, что
+    обход всё ещё работает, а «лечение» не находило ничего — потому что смотреть
+    было не на что. Аудит отвечает на два вопроса:
+      1) не остался ли наш winws.exe (он держит WinDivert и продолжает обработку
+         трафика — прямой механизм «Стоп нажат, а обход живёт»);
+      2) вернулся ли системный DNS к настройкам пользователя (не остался ли
+         захваченным наш 127.0.0.1 — тогда резолв уходит на fallback-резолвер
+         и сайты «продолжают работать» уже без движка).
+    Чужие winws.exe — только заметка: это не наши хвосты.
+    Ничего не чинит сам — только докладывает (лог + журнал запросов + событие UI).
+    """
+    report = {
+        "ok": True,
+        "problems": [],
+        "notes": [],
+        "winws_own": [],
+        "winws_foreign": [],
+        "dns_localhost_adapters": [],
+    }
+
+    # 1) Наши winws.exe.
+    try:
+        from winws_engine import get_winws_engine  # type: ignore
+        w = get_winws_engine()
+        own = []
+        if w and hasattr(w, "scan_own_processes"):
+            own, _scanned = w.scan_own_processes()
+        report["winws_own"] = [{"pid": p, "path": str(path)} for p, path in own]
+        if own:
+            report["ok"] = False
+            report["problems"].append(
+                "после остановки работает winws.exe нашей установки: "
+                + ", ".join(f"PID {p}" for p, _ in own[:3])
+                + " — обход мог продолжать работать"
+            )
+        if w and hasattr(w, "foreign_processes"):
+            foreign = w.foreign_processes() or []
+            if foreign:
+                report["winws_foreign"] = [{"pid": p, "path": str(path)} for p, path in foreign[:5]]
+                report["notes"].append(
+                    "рядом работают чужие winws.exe (сторонние DPI-программы): "
+                    + ", ".join(f"PID {p}" for p, _ in foreign[:3])
+                )
+    except Exception as exc:
+        log_recoverable(log, 'Аудит остановки: не удалось проверить процессы winws', exc, level=logging.WARNING)
+
+    # 2) Системный DNS: не остался ли захваченным.
+    try:
+        dns = get_current_dns_settings() or {}
+        leftovers = []
+        for name, vals in dns.items():
+            if not isinstance(vals, dict):
+                continue
+            servers = [str(s).strip() for s in (vals.get("ipv4") or [])]
+            servers += [str(s).strip() for s in (vals.get("ipv6") or [])]
+            if any(s in ("127.0.0.1", "::1") for s in servers):
+                leftovers.append(str(name))
+        report["dns_localhost_adapters"] = leftovers
+        if leftovers:
+            report["ok"] = False
+            report["problems"].append(
+                "системный DNS всё ещё указывает на UmbraNet: "
+                + ", ".join(leftovers[:3])
+                + " — резолв может уходить на fallback-резолвер"
+            )
+    except Exception as exc:
+        log_recoverable(log, 'Аудит остановки: не удалось прочитать системный DNS', exc, level=logging.WARNING)
+
+    return report
+
+
 def network_snapshot_info() -> dict:
     """Информация о последнем снапшоте сети (для тултипа кнопки отката)."""
     try:
@@ -2819,7 +2893,7 @@ def _dpi_generation_preflight(winws, progress) -> dict:
     """
     result = {"abort": False, "reason": "", "warnings": []}
 
-    # 1. Чужие winws.exe (другая копия UmbraNet / zapret / GoodbyeDPI). WinDivert
+    # 1. Чужие winws.exe (другая копия UmbraNet / сторонние DPI-программы). WinDivert
     #    занимается монопольно, поэтому нашему winws будет нечего показывать.
     try:
         foreign = winws.foreign_processes() if hasattr(winws, "foreign_processes") else None

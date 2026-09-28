@@ -6,7 +6,7 @@ UmbraNet — контроллер списка транспортов DNS (ло�
 фоновым замером самого быстрого, диалог выбора dnscrypt-резолвера.
 Внешний API прежний: transportChanged(str), refresh(), stop_workers().
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations

@@ -266,7 +266,7 @@ def test_preflight_warns_about_other_winws(monkeypatch):
 
     notes: list[str] = []
     result = ea._dpi_generation_preflight(
-        _FakeWinWS(foreign=[(777, "C:/Zapret/bin/winws.exe")]), notes.append
+        _FakeWinWS(foreign=[(777, "C:/OtherApp/bin/winws.exe")]), notes.append
     )
 
     assert result["abort"] is False

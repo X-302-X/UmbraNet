@@ -7,7 +7,7 @@ UmbraNet — контроллер списка DPI-стратегий (логи�
 
 Внешний API прежний: strategyChanged(str), refresh().
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@ UmbraNet — канвас списка транспортов DNS (радио-в
 сами, состояния active/normal/unavail и hover — тоже. Логика выбора живёт
 в TransportList (контроллере).
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations

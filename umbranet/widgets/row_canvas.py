@@ -6,7 +6,7 @@ UmbraNet — базовый канвас строчных списков (рад
 hover-подсветка строк, клики маппятся по координатам. Ни одной
 карточки-QFrame на строку (как в ServiceCanvas / ManualCanvas).
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations

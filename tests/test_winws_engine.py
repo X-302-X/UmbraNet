@@ -189,7 +189,7 @@ def test_scan_excludes_keep_pid_and_splits_foreign(tmp_path):
     eng = make_logged_engine(tmp_path)
     ours = str(eng.exe_path)
     in_bin = str(tmp_path / "bin" / "winws.exe")
-    foreign = "C:/OtherZapret/bin/winws.exe"
+    foreign = "C:/OtherApp/bin/winws.exe"
     eng.scan_result = [(101, ours), (102, in_bin), (103, foreign), (104, "")]
     eng.scan_ok = True
 
@@ -361,6 +361,42 @@ def test_stop_without_process_is_ok(tmp_path):
     eng = make_logged_engine(tmp_path)
     assert eng.stop() is True
     assert eng.ps_calls == 0
+
+
+def test_stop_sweeps_orphan_when_popen_lost(tmp_path, monkeypatch):
+    """ГЛАВНОЕ: «Стоп» добивает сироту, если Popen потерян.
+
+    Симптом бага: пользователь жмёт «Стоп», движок отвечает «ок», а winws.exe
+    из нашей bin/ продолжает держать WinDivert и обрабатывать трафик — обход
+    формально выключен, а по факту работает. Раньше stop() при proc=None сразу
+    возвращал успех, не глядя по сторонам.
+    """
+    import winws_engine as mod
+
+    eng = make_logged_engine(tmp_path)
+    assert eng.start(SLEEP_ARGS) is True
+    victim = eng.process
+    eng.process = None                     # «потеряли» Popen-объект, процесс жив
+    assert process_alive(victim), "подготовка теста: процесс должен быть жив"
+
+    eng.scan_result = [(victim.pid, str(eng.exe_path))]
+    eng.scan_ok = True
+
+    def real_kill(pid):
+        import os as _os
+        try:
+            _os.kill(int(pid), HARD_KILL_SIGNAL)
+            return True
+        except Exception:
+            return False
+
+    monkeypatch.setattr(mod, "_kill_pid_native", real_kill)
+
+    ok = eng.stop()
+
+    assert ok is True, "stop() обязан доложить успех только после зачистки"
+    victim.wait(timeout=5)
+    assert not process_alive(victim), "сирота выжил после stop() — обход продолжил бы работать"
 
 
 # ── 4. restart атомарен относительно других потоков ─────────────────────────

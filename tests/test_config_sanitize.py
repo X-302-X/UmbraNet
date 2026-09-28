@@ -105,7 +105,7 @@ def test_dns_mode_invalid_falls_back_to_doh():
 
 def test_dpi_mode_invalid_falls_back_to_off():
     """Неизвестный режим DPI → выключено: не запускаем движок наугад."""
-    cfg, warnings = _sanitize(dpi_mode="zapret-на-максимум")
+    cfg, warnings = _sanitize(dpi_mode="максимум-на-всё")
     assert cfg["dpi_mode"] == "off"
     assert _has_warning(warnings, "dpi_mode")
 

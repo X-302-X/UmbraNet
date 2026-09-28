@@ -214,7 +214,7 @@ def test_content_fits_page_width(window, about_view, monkeypatch, state):
     checker.busy = state == "checking"
     checker.result = UpdateResult(
         state, "0.4.0" if state == "available" else "",
-        "https://github.com/302XXX/UmbraNet/releases/tag/v0.4.0" if state == "available" else "",
+        "https://github.com/X-302-X/UmbraNet/releases/tag/v0.4.0" if state == "available" else "",
         "Доступна версия 0.4.0. Установка вручную." if state == "available" else "Проверка обновлений: " + state,
     )
     monkeypatch.setattr(about.ea, "get_update_checker", lambda: checker)

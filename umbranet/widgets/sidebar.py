@@ -301,7 +301,7 @@ class Sidebar(QFrame):
     navigate = Signal(str)  # key выбранного раздела
     orderChanged = Signal(list)  # новый порядок key после drag&drop
     layoutWidthChanged = Signal()  # изменилась ширина панели (в т.ч. кадр анимации)
-    secretUnlocked = Signal()  # 10 кликов по «U» за 8 с при свёрнутой панели
+    extraNavRequested = Signal()  # служебный сигнал: показать дополнительную страницу
 
     def __init__(self, items: list[NavItem], active_key: str | None = None,
                  expanded: bool = False):
@@ -318,8 +318,8 @@ class Sidebar(QFrame):
         self._buttons: dict[str, NavButton] = {}
         self._expanded = bool(expanded)
         self._drop_target_index: int | None = None
-        self._secret_clicks: list[float] = []
-        self._secret_unlocked = False
+        self._logo_clicks: list[float] = []
+        self._logo_fired = False
         self.setAcceptDrops(True)
         self.active_key = active_key or (items[0].key if items else "")
 
@@ -576,16 +576,16 @@ class Sidebar(QFrame):
         return True
 
     def _on_logo_clicked(self):
-        """Пасхалка: 10 кликов по «U» за 8 секунд — только при свёрнутой панели."""
-        if self._expanded or self._secret_unlocked:
+        """Обработчик нажатий на логотип «U» в свёрнутой панели."""
+        if self._expanded or self._logo_fired:
             return
         now = time.monotonic()
-        self._secret_clicks = [t for t in self._secret_clicks if now - t <= 8.0]
-        self._secret_clicks.append(now)
-        if len(self._secret_clicks) >= 10:
-            self._secret_unlocked = True
-            self._secret_clicks.clear()
-            self.secretUnlocked.emit()
+        self._logo_clicks = [t for t in self._logo_clicks if now - t <= 8.0]
+        self._logo_clicks.append(now)
+        if len(self._logo_clicks) >= 10:
+            self._logo_fired = True
+            self._logo_clicks.clear()
+            self.extraNavRequested.emit()
 
     def paintEvent(self, event):
         """Фон сайдбара + кэшированное свечение под активной вкладкой.

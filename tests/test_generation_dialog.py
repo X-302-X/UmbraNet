@@ -423,7 +423,7 @@ def test_warning_step_keeps_its_meaning():
     dlg = make_dialog(total=18)
     dlg.append(
         "AI-генерация: внимание — рядом работает другая программа с winws.exe: "
-        "PID 777 (C:/Zapret/bin/winws.exe). Она может держать WinDivert."
+        "PID 777 (C:/OtherApp/bin/winws.exe). Она может держать WinDivert."
     )
     step = dlg._step.text()
     assert "Внимание" in step, step

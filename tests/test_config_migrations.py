@@ -1,5 +1,5 @@
 """
-Тесты версий схемы и миграций — M1/M2 (`core/config_utils.py`, `core/ui_state.py`,
+Тесты версий схемы и миграций — M1/M2/M3 (`core/config_utils.py`, `core/ui_state.py`,
 `core/schema_version.py`).
 ====================================================================================
 
@@ -214,9 +214,15 @@ def test_legacy_field_is_removed_from_config(tmp_path):
     С `use_winws: false` в старом файле DPI после обновления молча не поднимался:
     в интерфейсе «включено», а трафик шёл без обхода. Ключ удаляется, чтобы
     поведение определялось только нынешним кодом.
+
+    Режим DPI в этом же старом файле задан прежним именем значения
+    (конфиг версии ≤ 2): миграция должна переименовать значение, сохранив выбор.
     """
+    import config_utils
+
     path = write_json(tmp_path / "config.json",
-                      {"use_winws": False, "dpi_mode": "zapret", "listen_port": 53})
+                      {"use_winws": False, "dpi_mode": config_utils._LEGACY_DPI_ONLY_NAME,
+                       "listen_port": 53})
     cfg = load_config_file(str(path))
 
     assert "use_winws" not in cfg, "устаревшее поле осталось в конфиге"
@@ -225,7 +231,7 @@ def test_legacy_field_is_removed_from_config(tmp_path):
     assert report["notes"] and "use_winws" in report["notes"][0], (
         "миграция устаревшего поля не оставила описания в отчёте"
     )
-    assert cfg["dpi_mode"] == "zapret", "миграция задела нужную настройку"
+    assert cfg["dpi_mode"] == "dpi_only", "миграция потеряла выбор режима"
 
 
 def test_map_home_fields_are_removed_from_config(tmp_path):
