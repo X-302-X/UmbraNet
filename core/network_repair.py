@@ -267,9 +267,18 @@ def repair_soft(config: dict, server_running: bool = True, dpi_running: bool = F
             _write_json(LAST_REPORT_PATH, report)
             return report
 
-        snap = snapshot_network(config, dns_getter=dns_getter, ps_runner=ps_runner)
+        # Снимаем снапшот только с ЧИСТОГО состояния (P0-2). Если DNS уже
+        # указывает на нас (ремонт запущен во время работы UmbraNet), обычный
+        # snapshot_network запечатлел бы НАШ 127.0.0.1 как «DNS пользователя» —
+        # и restore_user_dns при остановке вернул бы его же: обход формально
+        # выключен, а настройки DNS навсегда захвачены (работает как клин).
+        if dns_already_localhost(config, dns_getter=dns_getter):
+            snap = {"ok": True, "path": "", "skipped": "DNS уже указывает на UmbraNet"}
+            report["steps"].append("Snapshot пропущен: DNS уже наш — не портим снапшот пользователя")
+        else:
+            snap = snapshot_network(config, dns_getter=dns_getter, ps_runner=ps_runner)
+            report["steps"].append(f"Snapshot создан: {snap.get('path') or 'нет файла'}")
         report["snapshot"] = snap
-        report["steps"].append(f"Snapshot создан: {snap.get('path') or 'нет файла'}")
 
         before = _dns_check(config, server_running=server_running, dpi_running=dpi_running,
                             dns_getter=dns_getter, ps_runner=ps_runner)
@@ -469,6 +478,26 @@ def snapshot_info(path: str | None = None) -> dict:
     return info
 
 
+def _snapshot_is_poisoned(adapters: dict) -> bool:
+    """True, если в снапшоте лежит НАШ DNS (127.0.0.1 / ::1), а не пользователя.
+
+    Такой снапшот появляется, если он был снят во время работы UmbraNet (сбой
+    прошлых версий или внешний инструмент). «Восстановление» из него вернуло бы
+    в систему захваченный DNS: мёртвый 127.0.0.1 первым сервером и fallback
+    вторым — интернет вроде бы работает, но настройки навсегда заклинены.
+    """
+    if not isinstance(adapters, dict):
+        return False
+    for data in adapters.values():
+        if not isinstance(data, dict):
+            continue
+        servers = [str(s).strip() for s in (data.get("ipv4") or [])]
+        servers += [str(s).strip() for s in (data.get("ipv6") or [])]
+        if any(s in LOOPBACK_DNS for s in servers):
+            return True
+    return False
+
+
 def restore_user_dns(path: str | None = None, ps_runner=None) -> tuple[bool, str]:
     """Возвращает DNS в состояние ДО UmbraNet: снапшот → иначе «Авто» (DHCP).
 
@@ -499,11 +528,17 @@ def restore_user_dns(path: str | None = None, ps_runner=None) -> tuple[bool, str
             except Exception:
                 adapters = {}
             if adapters:
-                ok, msg = restore_snapshot(str(snap_path), ps_runner=ps_runner)
-                if ok:
-                    log.info("DNS восстановлен из снапшота: %s", msg)
-                    return True, msg
-                log.warning("Восстановление из снапшота не удалось (%s) — падаем на DHCP", msg)
+                if _snapshot_is_poisoned(adapters):
+                    log.warning(
+                        "Снапшот %s содержит наш собственный DNS — восстанавливать его нельзя, идём на DHCP",
+                        snap_path.name,
+                    )
+                else:
+                    ok, msg = restore_snapshot(str(snap_path), ps_runner=ps_runner)
+                    if ok:
+                        log.info("DNS восстановлен из снапшота: %s", msg)
+                        return True, msg
+                    log.warning("Восстановление из снапшота не удалось (%s) — падаем на DHCP", msg)
             else:
                 # Снапшот пустой: у пользователя и был DHCP, восстанавливать нечего.
                 log.info("В снапшоте нет статических DNS — возвращаем DHCP")

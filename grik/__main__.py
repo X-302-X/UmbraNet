@@ -8,7 +8,7 @@ UmbraNet — grik: запуск графика пинга отдельным о�
 его, не встраивая в главное меню. Замер в standalone-режиме пингует
 публичный DNS 1.1.1.1.
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations

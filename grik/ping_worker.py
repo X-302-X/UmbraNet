@@ -5,7 +5,7 @@ UmbraNet — grik: фоновый замер пинга DNS и DPI.
 Логика замера 1:1 с прежней: DNS пингуется по активному профилю,
 DPI — коннектом на 443 порт обходящего домена.
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations

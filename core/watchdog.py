@@ -54,7 +54,7 @@ UmbraNet — Watchdog Process
 
 Вывод идёт через _say(), потому что под pythonw.exe print() уронил бы watchdog.
 
-Лицензия: GPLv3 · UmbraNet_Official / 302XXX
+Лицензия: GPLv3 · UmbraNet_Official / X-302-X
 """
 
 import os

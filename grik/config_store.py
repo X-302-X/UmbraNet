@@ -5,7 +5,7 @@ UmbraNet — grik: хранение настроек графика пинга.
 Свой файл grik/grik_config.json рядом с кодом: модуль grik самодостаточен
 («виджет как карта»), свои настройки не смешивает с общим состоянием UI.
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations

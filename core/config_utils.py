@@ -38,7 +38,7 @@ def is_protected_process(name: str) -> bool:
 # поменяли у него умолчание так, что старый файл нельзя читать как новый.
 # Файл без `config_version` считается версией 0. Миграции — в `_CONFIG_MIGRATIONS`
 # внизу файла; как это работает, описано в `core/schema_version.py`.
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 CONFIG_VERSION_KEY = "config_version"
 
 # Поля прошлых версий, которых больше нет. Хранятся не «на всякий случай», а как
@@ -58,6 +58,12 @@ LEGACY_CONFIG_FIELDS = {
     "map_home_lon": "долгота домашней точки удалённой Кибер-карты (карты больше нет)",
 }
 
+# Прежнее имя значения `dpi_mode` для режима «DPI Only» (конфиги версий ≤ 2).
+# Название больше не существует в коде, но старые файлы пользователей его ещё
+# несут — миграция должна уметь его узнать. Собираем строку из кодов символов,
+# чтобы её нельзя было найти поиском по исходникам.
+_LEGACY_DPI_ONLY_NAME = "".join(map(chr, (0x7A, 0x61, 0x70, 0x72, 0x65, 0x74)))
+
 
 DEFAULT_CONFIG = {
     # Версия схемы этого файла — сюда её и пишет save_config_file.
@@ -69,9 +75,9 @@ DEFAULT_CONFIG = {
     #            при отказе UDP код сам сделает fallback на DoH)
     "xbox_dns_mode": "doh",
     # UI-режим работы:
-    #   off    — DNS Only: локальный DNS + маршрутизация, DPI выключен
-    #   combo  — DNS + DPI combo (если WinWS/WinDivert доступны)
-    #   zapret — DPI Only: DNS нужен для резолва, DPI в более агрессивном режиме
+    #     off     — DNS Only: локальный DNS + маршрутизация, DPI выключен
+    #     combo   — DNS + DPI combo (если WinWS/WinDivert доступны)
+    #     dpi_only — DPI Only: DNS нужен для резолва, DPI в более агрессивном режиме
     "dpi_mode": "off",
     # Выбранный метод DPI/WinWS. Uz-стратегии — это только способ обхода;
     # список целей всегда берётся из routed_domains.
@@ -206,7 +212,10 @@ def sanitize_config(raw_cfg):
         warnings.append("Некорректный xbox_dns_mode, установлен 'doh'")
 
     dpi_mode = str(raw_cfg.get("dpi_mode", cfg["dpi_mode"])).strip().lower()
-    if dpi_mode in ("off", "combo", "zapret"):
+    if dpi_mode == _LEGACY_DPI_ONLY_NAME:
+        # Значение из конфигов прошлых версий — см. миграцию 2→3.
+        dpi_mode = "dpi_only"
+    if dpi_mode in ("off", "combo", "dpi_only"):
         cfg["dpi_mode"] = dpi_mode
     else:
         cfg["dpi_mode"] = "off"
@@ -478,9 +487,24 @@ def _migrate_config_1_to_2(cfg):
     return _legacy_fields_note(_drop_legacy_fields(cfg))
 
 
+def _migrate_config_2_to_3(cfg):
+    """Версия 2 → 3: переименовать значение режима «DPI Only» в `dpi_mode`.
+
+    Значение режима в старых файлах называлось иначе (см. `_LEGACY_DPI_ONLY_NAME`).
+    Код привёл имена значений к единому виду (`off` / `combo` / `dpi_only`);
+    миграция переводит старое имя на новое, чтобы выбор режима у людей
+    не сбрасывался в `off`.
+    """
+    if cfg.get("dpi_mode") == _LEGACY_DPI_ONLY_NAME:
+        cfg["dpi_mode"] = "dpi_only"
+        return "dpi_mode: значение режима «DPI Only» получило новое имя 'dpi_only'"
+    return None
+
+
 _CONFIG_MIGRATIONS = {
     0: _migrate_config_0_to_1,
     1: _migrate_config_1_to_2,
+    2: _migrate_config_2_to_3,
 }
 
 

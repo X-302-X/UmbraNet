@@ -1714,9 +1714,9 @@ class UmbraNetDNS:
         Устанавливает режим работы DPI.
 
         mode:
-          'off'    — DPI выключен (только DNS; синий режим)
-          'combo'  — split + fake (комбо; чёрный режим)
-          'zapret' — split + fake + disorder (только DPI; красный режим)
+          'off'      — DPI выключен (только DNS; синий режим)
+          'combo'    — split + fake (комбо; чёрный режим)
+          'dpi_only' — split + fake + disorder (только DPI; красный режим)
         """
         log.info(f"Переключение режима DPI → {mode}")
         self.config["dpi_mode"] = mode
@@ -1733,7 +1733,7 @@ class UmbraNetDNS:
           'dns_only' (синий)  — DNS-сервер работает, DPI выключен.
           'combo'    (чёрный) — DNS-сервер работает, DPI в режиме combo.
           'dpi_only' (красный)— DNS-сервер работает (нужен для IP-резолва),
-                                DPI в режиме zapret.
+                                DPI в агрессивном режиме.
 
         Все переключения выполняются атомарно: сначала гарантируется
         корректное состояние DNS, затем меняется DPI.
@@ -1772,7 +1772,7 @@ class UmbraNetDNS:
             elif ui_mode == "combo":
                 self.set_dpi_mode("combo")
             elif ui_mode == "dpi_only":
-                self.set_dpi_mode("zapret")
+                self.set_dpi_mode("dpi_only")
 
             return True, ""
         except Exception as exc:

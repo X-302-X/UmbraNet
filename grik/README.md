@@ -43,4 +43,4 @@ lay.addWidget(panel)          # в правую панель «Маршрути�
 panel.set_mode_visible("combo")   # dns_only / dpi_only / combo
 ```
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.

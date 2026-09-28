@@ -50,7 +50,7 @@ log = logging.getLogger("UmbraNet.BogusUpdater")
 # URL удалённого списка: raw-файл прямо из репозитория UmbraNet на GitHub.
 # Меняем только этот URL, если репо переедет.
 REMOTE_URL = (
-    "https://raw.githubusercontent.com/302XXX/UmbraNet/main/bogus_ips_remote.json"
+    "https://raw.githubusercontent.com/X-302-X/UmbraNet/main/bogus_ips_remote.json"
 )
 
 # Локальный бандл: файл bogus_ips_remote.json поставляется вместе с программой

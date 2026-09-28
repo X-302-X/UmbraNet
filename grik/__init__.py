@@ -14,7 +14,7 @@ UmbraNet — grik: график пинга (standalone-виджет, «как к
 таймера во время живого resize окна давали «слайд-шоу» (диагностика
 юзера: чем выше частота обновления в настройках, тем сильнее).
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from grik.config_store import get_graph_settings, set_graph_settings

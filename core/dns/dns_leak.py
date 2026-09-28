@@ -221,7 +221,7 @@ def check_dns_leak(config: dict, server_running: bool, dpi_running: bool = False
             except Exception:
                 dpi_risks.append(
                     f"Сбой DPI обхода на домене «{target}»: Соединение заблокировано или сброшено провайдером. "
-                    f"Рекомендуется проверить стратегию DPI (например, переключить на Zapret/Combo)."
+                    f"Рекомендуется проверить стратегию DPI (например, переключить режим на «DPI Only» или «Combo»)."
                 )
         else:
             dpi_risks.append(

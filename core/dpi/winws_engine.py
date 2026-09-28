@@ -76,7 +76,7 @@ def build_orphan_kill_command(exe_path, bin_dir, keep_pid=None) -> str:
     """Готовит PowerShell-команду зачистки winws.exe текущей установки.
 
     Убиваем только процессы, связанные с НАШЕЙ папкой bin, чтобы не трогать
-    чужие установки zapret/winws. keep_pid — PID, который трогать нельзя
+    посторонние копии winws. keep_pid — PID, который трогать нельзя
     (живой WinWS движка): без этого ограничения зачистка убивает свежий запуск.
     """
     exe_ps = str(exe_path).replace("'", "''")
@@ -465,7 +465,7 @@ class WinWSEngine:
         """Свои winws.exe: список (pid, путь) и признак «посмотреть удалось».
 
         «Свои» — запущенные из нашего exe или из нашей папки bin. Чужие
-        установки zapret/winws не трогаем. keep_pid — наоборот, исключаем: это
+        копии winws не трогаем. keep_pid — наоборот, исключаем: это
         живой WinWS движка, убивать его нельзя.
         """
         scanned = _scan_processes()
@@ -487,7 +487,7 @@ class WinWSEngine:
         """winws.exe, НЕ относящиеся к нашей установке — «похожие программы».
 
         Нужны для понятной диагностики: если WinDivert занят чужой программой
-        (GoodbyeDPI/zapret/другая копия), наш winws.exe не сможет захватить
+        (сторонняя DPI-программа или другая копия), наш winws.exe не сможет захватить
         драйвер, и ни один вариант не покажет результат. Об этом лучше сказать
         прямо, чем показывать «стратегия не найдена».
         """
@@ -602,7 +602,19 @@ class WinWSEngine:
             self.process = None
             if proc is None:
                 self._close_log_handle()
-                return True
+                # Popen мог потеряться (restart из другого потока, сбой), а сирота
+                # из нашей bin/ всё ещё держит WinDivert и ПРОДОЛЖАЕТ обход —
+                # как раз случай «Стоп нажат, а трафик всё ещё обрабатывается».
+                # Обычный путь остановки такой процесс не видит, поэтому здесь
+                # быстрая зачистка только СВОИХ процессов, без PowerShell.
+                sweep = self.sweep_stale(keep_pid=None)
+                if sweep.get("killed") or sweep.get("left"):
+                    log.warning(
+                        "stop(): привязка к процессу потеряна, но нашлись winws.exe нашей установки — "
+                        "убито %s, осталось %s",
+                        sweep.get("killed"), sweep.get("left"),
+                    )
+                return not bool(sweep.get("left"))
 
             pid = getattr(proc, "pid", None)
             dead = self._terminate(proc)
