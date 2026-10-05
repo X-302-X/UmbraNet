@@ -299,11 +299,11 @@ def test_discord_cdn_gets_a_mild_section(manager):
     assert "cdn.discordapp.com" not in main
     assert any(a.endswith("active_discord_cdn_hostlist.txt") or "active_discord_cdn_hostlist.txt" in a
                for a in args)
-    assert "--dpi-desync-fooling=md5sig" in args
+    assert "--dpi-desync-fooling=ts" in args
     assert "--dpi-desync-cutoff=n2" in args
     # Мягкая секция стоит после --wf-* и до агрессивного тела.
     wf_udp = args.index("--wf-udp=443")
-    mild = args.index("--dpi-desync-fooling=md5sig")
+    mild = args.index("--dpi-desync-fooling=ts")
     aggressive = args.index("--dpi-desync=fake,multisplit")
     assert wf_udp < mild < aggressive
     assert is_discord_cdn_host("images-ext-2.discordapp.net")
@@ -317,3 +317,52 @@ def test_no_cdn_split_without_discord(manager):
     assert "--dpi-desync-fooling=md5sig" not in args
     assert not manager.cdn_hostlist_path.exists()
     assert "example.com" in manager.active_hostlist_path.read_text(encoding="utf-8")
+
+
+# ── Голосовые секции (только с Discord) ─────────────────────────────────────
+
+def _voice_args():
+    return [
+        "--wf-tcp=443",
+        "--wf-udp=443,50000-65535",
+        "--filter-udp=443",
+        "{hostlist}",
+        "--dpi-desync=fake",
+        "--new",
+        "--filter-udp=19294-19344,50000-65535",
+        "--dpi-desync=fake",
+        "--dpi-desync-any-protocol=1",
+        "--dpi-desync-fake-stun={bin}\\stun.bin",
+        "--dpi-desync-repeats=6",
+    ]
+
+
+def test_voice_section_dropped_without_discord(manager):
+    """Нет галочки Discord — голосовой секции нет (решение 2026-10-05)."""
+    _simple(manager, args=_voice_args())
+    args = manager.get_args("uz1", routed_domains=["youtube.com"])
+    assert args, manager.last_error
+    assert not any(a.startswith("--dpi-desync-fake-stun") for a in args), \
+        "голосовые фейки без Discord недопустимы"
+    assert not any(a.startswith("--filter-udp=") and "50000" in a for a in args), \
+        "голосовая секция должна быть удалена"
+    assert any(a.startswith("--filter-udp=443") for a in args), "QUIC-секция должна остаться"
+    assert "--new" not in args, "после удаления пустых секций --new остаться не должен"
+
+
+def test_voice_section_kept_with_discord(manager):
+    """Discord включён — голосовая секция работает (порты 50000-65535)."""
+    _simple(manager, args=_voice_args())
+    args = manager.get_args("uz1", routed_domains=["youtube.com", "discord.com"])
+    assert args, manager.last_error
+    assert any(a.startswith("--dpi-desync-fake-stun") for a in args)
+    assert any(a.startswith("--filter-udp=19294-19344,50000-65535") for a in args)
+
+
+def test_voice_ports_full_range_in_uz1():
+    """Uz1: полный диапазон голосовых портов 50000-65535 (не рецепт 50000-50100)."""
+    uz1 = pathlib.Path(__file__).resolve().parents[1] / "strategies" / "uz1.json"
+    data = json.loads(uz1.read_text(encoding="utf-8"))
+    joined = "\n".join(data["args"])
+    assert "50000-65535" in joined
+    assert "50000-50100" not in joined, "узкий рецепт должен быть расширен до полного диапазона"

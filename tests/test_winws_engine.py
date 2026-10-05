@@ -88,6 +88,7 @@ def make_engine(tmp_path) -> WinWSEngine:
     """
     eng = WinWSEngine()
     eng._exe_path = pathlib.Path(sys.executable)
+    eng._build_cmd = lambda args: [str(eng._exe_path)] + list(args)  # фейковый exe = python
     eng._bin_dir = tmp_path
     eng._log_path = tmp_path / "winws.log"
     eng.ps_calls_seen = []
@@ -155,7 +156,7 @@ def test_orphan_kill_command_excludes_kept_pid():
     """Команда зачистки обязана исключать живой PID движка."""
     cmd = build_orphan_kill_command("C:/U/bin/winws.exe", "C:/U/bin", keep_pid=4242)
     assert "-ne 4242" in cmd, f"нет исключения живого PID: {cmd}"
-    assert "winws.exe" in cmd
+    assert "e1-spike.exe" in cmd
     assert "Stop-Process" in cmd
 
 
@@ -296,7 +297,7 @@ def test_cleanup_orphans_hard_mode_kills_own_live_process(tmp_path, monkeypatch)
     # Жёсткий режим бывает раз за запуск, поэтому здесь дополнительно остаётся
     # страховка по маске пути: она видит и то, чего не видит обзор по exe.
     assert eng.ps_calls == 1, "страховка по маске пути на выходе должна остаться"
-    assert "winws.exe" in eng.ps_calls_seen[-1]
+    assert "e1-spike.exe" in eng.ps_calls_seen[-1]
 
 
 # ── 3. Эскалация: PowerShell только когда процесс не умер ────────────────────
@@ -308,7 +309,7 @@ def test_stop_escalates_via_pid_when_terminate_fails(tmp_path, monkeypatch):
     pid = eng.process.pid
 
     # Имитируем ситуацию «процесс не отдал управление»: terminate/kill не сработали.
-    monkeypatch.setattr(eng, "_terminate", lambda proc: False)
+    monkeypatch.setattr(eng, "_terminate", lambda proc, reset_connections=True: False)
     # Нативное TerminateProcess в тесте не используем: на Windows оно реально
     # убивает процесс, и PowerShell-ветка эскалации (то, что проверяем) не
     # выполняется. На Linux нативного убийства и так нет.
@@ -338,7 +339,7 @@ def test_stop_reports_failure_when_process_survives(tmp_path, monkeypatch):
     assert eng.start(SLEEP_ARGS) is True
     proc = eng.process
 
-    monkeypatch.setattr(eng, "_terminate", lambda p: False)
+    monkeypatch.setattr(eng, "_terminate", lambda p, reset_connections=True: False)
 
     class Immortal:
         """Процесс, который «не умирает» с точки зрения проверок."""
