@@ -500,8 +500,8 @@ class NetworkView(QWidget):
         return card
 
     def _build_dpi_tools(self):
-        card, lay = _card("🛡  DPI / WinWS")
-        self._dpi_title = QLabel("WinWS: —")
+        card, lay = _card("🛡  DPI-движок")
+        self._dpi_title = QLabel("Движок: —")
         self._dpi_title.setStyleSheet(f"color:{theme.TEXT};font-size:15px;font-weight:700;background:transparent;border:none;")
         self._dpi_text = QLabel("Статус DPI-движка, стратегия и лог запуска.")
         _wrapped(self._dpi_text, 48)
@@ -509,7 +509,7 @@ class NetworkView(QWidget):
         lay.addWidget(self._dpi_title)
         lay.addWidget(self._dpi_text)
 
-        self._btn_open_winws_log = self._flat_btn("Открыть winws.log", self._open_winws_log)
+        self._btn_open_winws_log = self._flat_btn("Открыть лог движка", self._open_winws_log)
         self._btn_copy_winws_diag = self._flat_btn("📋 Скопировать DPI-диагностику", self._copy_winws_diagnostics)
         lay.addLayout(_button_row(self._btn_open_winws_log, self._btn_copy_winws_diag))
         return card
@@ -677,12 +677,12 @@ class NetworkView(QWidget):
 
     def _winws_log_tail(self, max_chars: int = 5000) -> str:
         try:
-            path = Path(self._get_winws_status().get("log_path") or "winws.log")
+            path = Path(self._get_winws_status().get("log_path") or "e1-spike.log")
             if not path.exists():
                 return ""
             return path.read_text(encoding="utf-8", errors="replace")[-max_chars:].strip()
         except Exception as exc:
-            return f"<не удалось прочитать winws.log: {exc}>"
+            return f"<не удалось прочитать лог движка: {exc}>"
 
     def _dpi_targets_info(self) -> dict:
         cfg = getattr(self.engine, "config", {}) or {}
@@ -713,13 +713,13 @@ class NetworkView(QWidget):
         st = self._get_winws_status()
         if st.get("running"):
             color = theme.GREEN
-            title = "WinWS: запущен"
+            title = "Движок: запущен"
         elif st.get("available"):
             color = theme.YELLOW if cfg.get("dpi_mode", "off") != "off" else theme.MUTED
-            title = "WinWS: остановлен"
+            title = "Движок: остановлен"
         else:
             color = theme.RED
-            title = "WinWS: не найден"
+            title = "Движок: не найден"
         self._dpi_title.setText(title)
         self._dpi_title.setStyleSheet(f"color:{color};font-size:15px;font-weight:700;background:transparent;border:none;")
         err = st.get("last_error") or ""
@@ -751,10 +751,10 @@ class NetworkView(QWidget):
             import os
             import webbrowser
             status = self._get_winws_status()
-            path = Path(status.get("log_path") or "winws.log")
+            path = Path(status.get("log_path") or "e1-spike.log")
             if not path.exists():
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("winws.log пока пуст: WinWS ещё не запускался.\n", encoding="utf-8")
+                path.write_text("Лог движка пока пуст: движок ещё не запускался.\n", encoding="utf-8")
             if hasattr(os, "startfile"):
                 os.startfile(str(path))
             else:
@@ -763,7 +763,7 @@ class NetworkView(QWidget):
         except Exception as exc:
             self._btn_open_winws_log.setText("Ошибка")
             self._dpi_text.setText(f"Не удалось открыть winws.log: {exc}")
-        QTimer.singleShot(1500, lambda: self._btn_open_winws_log.setText("Открыть winws.log"))
+        QTimer.singleShot(1500, lambda: self._btn_open_winws_log.setText("Открыть лог движка"))
 
     def _copy_winws_diagnostics(self):
         cfg = getattr(self.engine, "config", {}) or {}

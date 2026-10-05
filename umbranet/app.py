@@ -1183,6 +1183,25 @@ class MainWindow(GlowContainer):
                 try:
                     _time.sleep(2.0)  # ждём UmbraNet-RestoreDNS и добивание winws
                     audit = verify_teardown()
+                    # Самолечение (поле 2026-10-05): netsh отчитался об успехе,
+                    # но аудит всё ещё видел 127.0.0.1 в системном DNS.
+                    # Повторяем откат и проверяем ещё раз — предупреждение
+                    # остаётся только если и повтор не помог.
+                    if any("DNS" in str(p) for p in (audit.get("problems") or [])):
+                        try:
+                            from umbranet.engine_adapter import network_restore_latest
+                            ok2, msg2 = network_restore_latest()
+                            log.info(
+                                "Аудит после остановки: повторный откат DNS (%s): %s",
+                                ok2, msg2,
+                            )
+                            _time.sleep(1.5)
+                            audit = verify_teardown()
+                        except Exception as heal_exc:
+                            log.warning(
+                                "Аудит после остановки: повторный откат DNS не удался: %s",
+                                heal_exc,
+                            )
                     if audit.get("ok"):
                         log.info("Аудит после остановки: хвостов нет")
                     for problem in audit.get("problems") or []:

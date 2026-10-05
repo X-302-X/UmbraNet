@@ -131,11 +131,13 @@ if errorlevel 1 (
 
 echo.
 echo  Обновление pip / setuptools / wheel ...
-"%PY%" -m pip install --upgrade --no-cache-dir -c "%APP_DIR%constraints.txt" pip setuptools wheel
+REM Bootstrap-инструменты БЕЗ constraints.txt (пины там только для рантайма)
+REM и НЕ роняем установку, если PyPI моргнул: setuptools/wheel для UmbraNet
+REM не обязательны (все зависимости ставятся wheel-пакетами).
+"%PY%" -m pip install --upgrade --no-cache-dir pip setuptools wheel
 if errorlevel 1 (
-    echo  [ОШИБКА] Не удалось обновить pip.
-    if not defined UMBRANET_INSTALL_NO_PAUSE pause
-    exit /b 1
+    echo  [ПРЕДУПРЕЖДЕНИЕ] setuptools/wheel не обновились - это НЕ критично.
+    echo                 Продолжаем установку зависимостей...
 )
 
 REM ── Основные и encrypted DNS зависимости ─────────────────────────────
@@ -152,6 +154,9 @@ if errorlevel 1 (
     echo  Причина указана pip выше. Сохраните этот вывод для диагностики.
     echo  No matching distribution / ResolutionImpossible: проверьте версии пакетов
     echo  и Python. Убедитесь, что requirements.txt и constraints.txt из одной версии UmbraNet.
+    echo  Если в ошибке есть "No matching distribution" или "from versions: none" - это сеть:
+    echo  pip не видит PyPI. Проверьте интернет/VPN/антивирус и запустите
+    echo  install.bat ещё раз.
     echo  Ошибка сети / TLS / прокси: проверьте доступ к PyPI и настройки сети.
     echo  Только при ошибке длинного пути / Errno 2 / 206 перенесите папку в C:\UmbraNet.
     echo  Текущий путь: "%CD%"

@@ -667,8 +667,8 @@ def get_startup_health() -> dict:
                 from core.dpi.winws_engine import get_winws_engine
                 if not get_winws_engine().is_available():
                     problems.append(
-                        "Режим DPI включен, но winws.exe не найден в папке bin/. "
-                        "Поместите winws.exe в папку bin/ рядом с программой "
+                        "Режим DPI включен, но e1-spike.exe не найден в папке bin/. "
+                        "Поместите e1-spike.exe в папку bin/ рядом с программой "
                         "или переключитесь в режим 'Только DNS'."
                     )
         except Exception as exc:
@@ -789,7 +789,7 @@ def dpi_available() -> tuple[bool, str]:
         from core.dpi.winws_engine import get_winws_engine  # type: ignore
         engine = get_winws_engine()
         if not engine.is_available():
-            return False, f"winws.exe не найден: {engine.exe_path}"
+            return False, f"e1-spike.exe не найден: {engine.exe_path}"
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -3098,7 +3098,7 @@ def dpi_strategy_ai_run_controlled(mode: str = "quick", on_progress=None, should
                     progress(f"AI-генерация: WinWS запущен для {vid} за {start_ms} мс")
                 if cancelled():
                     try:
-                        winws.stop()
+                        winws.stop(reset_connections=False)
                     except Exception as exc:
                         log_recoverable(log, 'Не удалось остановить WinWS после отмены генерации', exc, level=logging.ERROR)
                     progress("AI-генерация: отменена пользователем")
@@ -3176,7 +3176,7 @@ def dpi_strategy_ai_run_controlled(mode: str = "quick", on_progress=None, should
             finally:
                 try:
                     if started or winws.is_running():
-                        if not winws.stop():
+                        if not winws.stop(reset_connections=False):
                             progress(f"AI-генерация: WinWS не остановился для {vid}")
                     # ВАЖНО: зачистка обязана идти ПОСЛЕ КАЖДОГО варианта, а не
                     # только когда stop() вернул False. Раньше здесь стоял
@@ -3330,7 +3330,7 @@ def dpi_strategy_check_all_controlled(on_progress=None, should_cancel=None) -> d
             finally:
                 try:
                     if started or winws.is_running():
-                        if not winws.stop():
+                        if not winws.stop(reset_connections=False):
                             progress(f"Проверка Uz: WinWS не остановился для {sid}")
                     # См. комментарий в AI-генерации: зачистка после КАЖДОЙ
                     # стратегии. Она дешёвая (WinAPI-обзор, без PowerShell), но
