@@ -257,12 +257,12 @@ def check_dns_leak(config: dict, server_running: bool, dpi_running: bool = False
     if dns_risks and dpi_risks:
         fix_hint = (
             "Рекомендация: нажмите «Исправить» для ликвидации DNS/IPv6-утечек. "
-            "Для DPI-проблемы проверьте запуск WinWS или смените стратегию."
+            "Для DPI-проблемы проверьте запуск DPI-движка или смените стратегию."
         )
     elif dns_risks:
         fix_hint = "Рекомендация: нажмите «Исправить» для ликвидации DNS/IPv6-утечек."
     else:
-        fix_hint = "DNS-утечек не видно. Для DPI-проблемы проверьте запуск WinWS или смените стратегию."
+        fix_hint = "DNS-утечек не видно. Для DPI-проблемы проверьте запуск DPI-движка или смените стратегию."
     result = {
         "status": LEAK_RISK,
         "title": "⚠ Обнаружены утечки DNS или блокировки DPI",

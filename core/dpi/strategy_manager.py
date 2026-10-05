@@ -57,7 +57,9 @@ def _discord_cdn_section(cdn_hostlist_arg: str) -> list[str]:
         cdn_hostlist_arg,
         "--dpi-desync=fake,split2",
         "--dpi-desync-split-pos=1",
-        "--dpi-desync-fooling=md5sig",
+        # ts — проверенный fooling всех рабочих секций (md5sig флакал:
+        # картинки грузились через раз, поле 2026-10-05).
+        "--dpi-desync-fooling=ts",
         "--dpi-desync-repeats=6",
         "--new",
         "--filter-udp=443",
@@ -69,6 +71,46 @@ def _discord_cdn_section(cdn_hostlist_arg: str) -> list[str]:
         "--dpi-desync-fake-quic={bin}\\quic_initial_www_google_com.bin",
         "--new",
     ]
+
+
+def _has_discord(domains: list[str]) -> bool:
+    """Есть ли среди целей Discord (галочка Discord в главном меню)."""
+    return any("discord" in d.lower() for d in domains)
+
+
+def _drop_voice_sections(args: list[str]) -> list[str]:
+    """Убирает ГОЛОСОВЫЕ секции (fake-stun / UDP-порты голоса).
+
+    Работает только при включённом Discord (решение 2026-10-05): нет
+    галочки — секции нет, голосовые фейки не шлются. Секция определяется
+    по --dpi-desync-fake-stun или --filter-udp с портами, кроме 443
+    (443 — QUIC, он не голос).
+    """
+
+    def is_voice(sec: list[str]) -> bool:
+        for a in sec:
+            if a.startswith("--dpi-desync-fake-stun") or a.startswith("--dpi-desync-fake-discord"):
+                return True
+            if a.startswith("--filter-udp="):
+                for p in a.split("=", 1)[1].split(","):
+                    lo = p.strip().split("-")[0]
+                    if lo.isdigit() and lo != "443":
+                        return True
+        return False
+
+    sections: list[list[str]] = [[]]
+    for a in args:
+        if a == "--new":
+            sections.append([])
+        else:
+            sections[-1].append(a)
+    kept = [sec for sec in sections if not is_voice(sec)]
+    out: list[str] = []
+    for i, sec in enumerate(kept):
+        if i:
+            out.append("--new")
+        out.extend(sec)
+    return out
 
 
 def _inject_after_wf(args: list[str], extra: list[str]) -> list[str]:
@@ -221,6 +263,13 @@ class StrategyManager:
                 self.last_error = "Для DPI не выбраны цели: включите сервисы/домены в главном меню."
                 log.warning(self.last_error)
                 return []
+            # Голосовые секции — только при включённом Discord (2026-10-05).
+            if not _has_discord(domains):
+                args = _drop_voice_sections(args)
+                if not args:
+                    self.last_error = f"Стратегия '{sid}': после удаления голосовой секции не осталось аргументов"
+                    log.warning(self.last_error)
+                    return []
 
         if "{hostlist}" in " ".join(args):
             if not hostlist_arg:

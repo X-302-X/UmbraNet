@@ -5,14 +5,12 @@
   "enabled": true,
   "args": [
     "--wf-tcp=80,443,2053,2083,2087,2096,8443",
-    "--wf-udp=443",
-
+    "--wf-udp=443,19294-19344,50000-65535",
     "--filter-udp=443",
     "{hostlist}",
     "--dpi-desync=fake",
     "--dpi-desync-repeats=11",
     "--dpi-desync-fake-quic={bin}\\quic_initial_www_google_com.bin",
-
     "--new",
     "--filter-tcp=443",
     "{hostlist}",
@@ -24,7 +22,6 @@
     "--dpi-desync-repeats=8",
     "--dpi-desync-split-seqovl-pattern={bin}\\tls_clienthello_www_google_com.bin",
     "--dpi-desync-fake-tls={bin}\\tls_clienthello_www_google_com.bin",
-
     "--new",
     "--filter-tcp=80,443,8443,2053,2083,2087,2096",
     "{hostlist}",
@@ -36,7 +33,14 @@
     "--dpi-desync-split-seqovl-pattern={bin}\\tls_clienthello_max_ru.bin",
     "--dpi-desync-fake-tls={bin}\\stun.bin",
     "--dpi-desync-fake-tls={bin}\\tls_clienthello_max_ru.bin",
-    "--dpi-desync-fake-http={bin}\\tls_clienthello_max_ru.bin"
+    "--dpi-desync-fake-http={bin}\\tls_clienthello_max_ru.bin",
+    "--new",
+    "--filter-udp=19294-19344,50000-65535",
+    "--filter-l7=discord,stun",
+    "--dpi-desync=fake",
+    "--dpi-desync-repeats=6",
+    "--dpi-desync-fake-discord={bin}\\\\stun.bin",
+    "--dpi-desync-fake-stun={bin}\\\\stun.bin"
   ],
   "hostlist": []
 }

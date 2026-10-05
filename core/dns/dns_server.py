@@ -67,11 +67,15 @@ from winws_engine import get_winws_engine
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
+# Все логи — в одной папке logs\ (раньше umbranet.log жил в корне).
+LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(PROJECT_ROOT, 'umbranet.log'), encoding='utf-8'),
+        logging.FileHandler(os.path.join(LOG_DIR, 'umbranet.log'), encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -1516,11 +1520,11 @@ class UmbraNetDNS:
                     self.winws.start(args)
                 else:
                     log.warning(
-                        "WinWS не запущен: %s",
+                        "DPI-движок не запущен: %s",
                         manager.last_error or f"стратегия {strategy_id} не готова",
                     )
             except Exception as exc:
-                log.error(f"Ошибка запуска WinWS: {exc}")
+                log.error(f"Ошибка запуска DPI-движка: {exc}")
 
         resolver = UmbraNetResolver(self._cfg_ref, self.cache, self.process_tracker)
         self._resolver = resolver   # нужен для on_update callback BogusUpdater'а
@@ -1619,7 +1623,7 @@ class UmbraNetDNS:
                 if hasattr(self, "winws") and self.winws:
                     self.winws.stop()
             except Exception as exc:
-                log_recoverable(log, 'Не удалось остановить WinWS после неудачного старта DNS', exc, level=logging.ERROR)
+                log_recoverable(log, 'Не удалось остановить DPI-движок после неудачного старта DNS', exc, level=logging.ERROR)
             # До создания DNS-сокетов мы уже могли запустить фоновые helper'ы.
             # Не оставляем их жить после неудачного старта: иначе повторный
             # запуск создавал лишние потоки и stale-состояние трекера.
