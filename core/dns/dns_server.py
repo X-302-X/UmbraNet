@@ -70,6 +70,13 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 # Все логи — в одной папке logs\ (раньше umbranet.log жил в корне).
 LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
+# Старые логи в корне (до появления logs\) убираем сами — пользователь
+# 2026-10-05: «удали оставшиеся логи вне папки logs».
+try:
+    from winws_engine import remove_legacy_root_logs
+    remove_legacy_root_logs(PROJECT_ROOT)
+except Exception:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,

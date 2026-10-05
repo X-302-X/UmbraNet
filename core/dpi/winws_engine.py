@@ -209,6 +209,24 @@ def _kill_pid_native(pid: int) -> bool:
         return False
 
 
+def remove_legacy_root_logs(project_root=None):
+    """Убирает старые логи из КОРНЯ проекта (когда они писались не в logs\).
+
+    Программа туда больше не пишет; хвосты только путают («почему umbranet.log
+    вне папки logs?» — пожелание 2026-10-05). Удаляется только известный
+    набор файлов в корне; содержимое logs\ не трогается.
+    """
+    if project_root is None:
+        project_root = Path(__file__).resolve().parents[2]
+    for name in ("umbranet.log", "e1-spike.log", "e1spike_args.json"):
+        try:
+            legacy = Path(project_root) / name
+            if legacy.is_file():
+                legacy.unlink()
+        except OSError:
+            pass  # файл занят другим процессом — не мешаем запуску
+
+
 class WinWSEngine:
     def __init__(self):
         self.process = None
@@ -220,6 +238,7 @@ class WinWSEngine:
         logs_dir = self._bin_dir.parent / "logs"
         self._log_path = logs_dir / "e1-spike.log"
         self._args_path = logs_dir / "e1spike_args.json"
+        remove_legacy_root_logs(self._bin_dir.parent)
         self.last_error = ""
         self.last_args = []
         self.last_cmd = []
