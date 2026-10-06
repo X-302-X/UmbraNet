@@ -393,11 +393,12 @@ class AiGenerationProgressDialog(QDialog):
         if left is None:
             self._eta.setText(self._eta_idle_text())
             return
-        done = max(0, self._items_done)
         # «примерно» уже сказано словами, поэтому тильду из формата убираем —
         # иначе в строке два знака приблизительности подряд.
+        # Счётчик «готово X из Y» живёт ТОЛЬКО в основной шкале (2026-10-06,
+        # пожелание пользователя): в строке с временем он отставал на 1 и путал.
         human = self._format_left(left).lstrip("~")
-        self._eta.setText(f"Осталось примерно: {human} • готово {done} из {self._total}")
+        self._eta.setText(f"Осталось примерно: {human}")
 
     # ── Подпись шага ─────────────────────────────────────────────────────────
     @staticmethod
@@ -462,6 +463,7 @@ class AiGenerationProgressDialog(QDialog):
         if result.get("stage") == "strategy_check":
             self._title.setText("Проверка стратегий завершена" if ok else "Проверка стратегий остановлена")
             self._subtitle.setText("Результаты проверки всех Uz-стратегий")
+            self._subtitle_full = self._subtitle.text()
             self._progress.setValue(self._total)
             self._progress.setFormat(f"{self._total} / {self._total}")
             best = result.get("best") if isinstance(result.get("best"), dict) else {}
@@ -473,11 +475,12 @@ class AiGenerationProgressDialog(QDialog):
                 self.append("— Итоговый отчёт —")
                 for line in report_lines:
                     self.append(line)
-            self._step.setText("Готово. Проверьте отчёт и нажмите «Закрыть».")
+            self._step_full_text = "Готово. Проверьте отчёт и нажмите «Закрыть»."
         elif ok:
             sid = str(result.get("created_id", ""))
             self._title.setText("AI-генерация завершена")
             self._subtitle.setText(f"Создана стратегия {sid or 'Uz'}")
+            self._subtitle_full = self._subtitle.text()
             self._progress.setValue(self._total)
             self._progress.setFormat(f"{self._total} / {self._total}")
             self._best.setText(f"Лучший результат: score {best_score}")
@@ -486,24 +489,27 @@ class AiGenerationProgressDialog(QDialog):
                 self.append("— Итоговый отчёт —")
                 for line in report_lines:
                     self.append(line)
-            self._step.setText("Всё готово. Проверьте итоговый отчёт и нажмите «Закрыть».")
+            self._step_full_text = "Всё готово. Проверьте итоговый отчёт и нажмите «Закрыть»."
         else:
             reason = str(result.get("reason_text") or result.get("error") or result.get("reason") or "рабочая стратегия не найдена")
             if result.get("cancelled"):
                 self._title.setText("AI-генерация отменена")
-                self._subtitle.setText("Uz не создана")
             else:
                 self._title.setText("AI-генерация завершена")
-                self._subtitle.setText("Uz не создана")
+            self._subtitle.setText("Uz не создана")
+            self._subtitle_full = self._subtitle.text()
             self._best.setText(f"Лучший результат: score {best_score}")
             self.append(f"Uz не создана: {reason} • лучший score: {best_score}")
             if report_lines:
                 self.append("— Итоговый отчёт —")
                 for line in report_lines:
                     self.append(line)
-            self._step.setText("Готово. Проверьте итоговый отчёт и нажмите «Закрыть».")
+            self._step_full_text = "Готово. Проверьте итоговый отчёт и нажмите «Закрыть»."
         self._finished = True
-        self._subtitle_full = self._subtitle.text()     # чтобы элизия считалась от нового текста
+        # ВАЖНО (баг «ничего не отображается», 2026-10-06): append() пишет
+        # _step_full_text из каждой строки лога и перечитывает _subtitle_full.
+        # Итоговые тексты выставлены ВЫШЕ как _step_full_text/_subtitle_full —
+        # финальная элизия отрисует их, а не последнюю строку отчёта.
         self._apply_step_text()
         try:
             self._eta_timer.stop()

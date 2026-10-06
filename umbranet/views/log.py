@@ -712,6 +712,14 @@ class LogView(QWidget):
             chip.setStyleSheet(self._chip_qss(k == key))
         self._rebuild()
 
+    def set_filter(self, key: str):
+        """Публичный выбор категории (фильтра) из других вкладок.
+
+        Например «fixed» — «🔧 Починки» (лечение): кнопка «📋 Лог» в виджете
+        автодиагностики ведёт сюда сразу с этой категорией (2026-10-06).
+        """
+        self._set_filter(key)
+
     def _on_search(self, text: str):
         self._search = (text or "").lower().strip()
         self._rebuild()

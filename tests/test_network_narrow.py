@@ -42,7 +42,7 @@ for _p in (str(ROOT), str(ROOT / "core"), str(ROOT / "umbranet")):
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 QtWidgets = pytest.importorskip("PySide6.QtWidgets")
-from PySide6.QtCore import QSize
+from PySide6.QtCore import QPoint, QRect, QSize
 from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
@@ -488,3 +488,34 @@ def test_flow_layout_wraps_and_reports_height():
 
     with suppress(RuntimeError):
         host.close()
+
+
+# ── 2. Жалоба 2026-10-06: «текст съезжает, когда уменьшаешь страницу» ────────
+# Старые тесты гоняли только ширину при высоте 900. Проверяем перекрытие
+# соседних подписей (настоящее «съезжание») на маленьких высотах тоже.
+
+def test_no_labels_overlap(window, net_view):
+    """Ни одна подпись не перекрывает соседнюю ни на одной геометрии окна.
+
+    «Съезжание» глазами = прямоугольки текстов накладываются друг на друга.
+    Проверяем попарно по глобальным координатам для ширины и высоты вместе.
+    """
+    problems = []
+    for width in (560, 760, 960, 1280):
+        for height in (560, 640, 720, 900):
+            window.resize(width, height)
+            settle(6)
+            for card in cards_of(net_view):
+                labels = [
+                    lb for lb in card.findChildren(QLabel)
+                    if lb.text() and lb.isVisible()
+                ]
+                for a, b in itertools.combinations(labels, 2):
+                    rect_a = QRect(a.mapToGlobal(QPoint(0, 0)), a.size())
+                    rect_b = QRect(b.mapToGlobal(QPoint(0, 0)), b.size())
+                    inter = rect_a.adjusted(1, 1, -1, -1) & rect_b.adjusted(1, 1, -1, -1)
+                    if not inter.isEmpty():
+                        problems.append(
+                            f"{width}x{height}: «{a.text()[:18]}…» × «{b.text()[:18]}…»"
+                        )
+    assert not problems, "подписи перекрываются: " + "; ".join(problems[:6])

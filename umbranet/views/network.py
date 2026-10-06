@@ -251,6 +251,9 @@ class _RestoreNetworkWorker(QThread):
 
 
 class NetworkView(QWidget):
+    # Открыть вкладку «Логи» с выбранной категорией («fixed» = Починки/лечение).
+    openLogRequested = Signal(str)
+
     def __init__(self):
         super().__init__()
         self.engine = get_engine()
@@ -464,26 +467,35 @@ class NetworkView(QWidget):
             self._answer_counters.setText("Записей пока нет.")
 
     def _build_health_doctor(self):
+        """Компактная карточка лечения (2026-10-06, виджет «полностью переделан»).
+
+        Пользователь просил: «статус одной строкой + ряд кнопок, минимум места,
+        текст не съезжает». Контракты узкого окна сохранены: подписи по-прежнему
+        переносятся и растут (tests/test_network_narrow.py), а ряд кнопок
+        переносится на вторую строку (_FlowLayout). Рядом с «Лог» — кнопка-
+        переключатель «Уведомления» с видимой галочкой (вкл/выкл).
+        """
         card, lay = _card("🩺  Автодиагностика и лечение")
         row = QHBoxLayout()
-        row.setSpacing(14)
+        row.setSpacing(12)
 
+        # Пилюля-оценка: компактная, без жёстких 92px/30px (съедали место).
         self._health_score_label = QLabel("—")
-        self._health_score_label.setFixedWidth(92)
+        self._health_score_label.setFixedSize(64, 48)
         self._health_score_label.setAlignment(Qt.AlignCenter)
         self._health_score_label.setStyleSheet(
-            f"color:{theme.MUTED};font-size:30px;font-weight:900;background:{theme.INPUT_BG};"
-            f"border:1px solid {theme.BORDER};border-radius:14px;padding:10px;"
+            f"color:{theme.MUTED};font-size:22px;font-weight:900;background:{theme.INPUT_BG};"
+            f"border:1px solid {theme.BORDER};border-radius:12px;"
         )
-        row.addWidget(self._health_score_label)
+        row.addWidget(self._health_score_label, 0, Qt.AlignTop)
 
         texts = QVBoxLayout()
-        texts.setSpacing(5)
+        texts.setSpacing(3)
         self._health_title = QLabel("Проверка ещё не запускалась")
         # Health reports can have long titles. Like their details, they must
         # wrap instead of imposing a minimum width on the whole network page.
         self._health_title.setWordWrap(True)
-        self._health_title.setStyleSheet(f"color:{theme.TEXT};font-size:16px;font-weight:800;background:transparent;border:none;")
+        self._health_title.setStyleSheet(f"color:{theme.TEXT};font-size:14px;font-weight:800;background:transparent;border:none;")
         self._health_text = QLabel("Нажмите одну кнопку — UmbraNet проверит состояние и сам применит безопасную починку, если она нужна.")
         _wrapped(self._health_text, 42)
         self._health_text.setStyleSheet(f"color:{theme.SUBTEXT};font-size:12px;background:transparent;border:none;")
@@ -493,11 +505,37 @@ class NetworkView(QWidget):
         lay.addLayout(row)
 
         self._btn_doctor = self._grad_btn("🛠 Проверить и вылечить", theme.ACCENT, theme.ACCENT2, self._run_auto_doctor)
-        self._btn_health_refresh = self._flat_btn("Обновить", self._refresh_health_score)
+        self._btn_open_log = self._flat_btn("📋 Лог", self._open_doctor_log)
+        self._btn_notify = self._flat_btn("✓ Уведомления: вкл", self._toggle_notify)
+        self._btn_notify.setCheckable(True)
         self._btn_copy_full_report = self._flat_btn("📋 Скопировать отчёт", self._copy_full_report)
-        lay.addLayout(_button_row(self._btn_doctor, self._btn_health_refresh,
-                                  self._btn_copy_full_report))
+        lay.addLayout(_button_row(self._btn_doctor, self._btn_open_log,
+                                  self._btn_notify, self._btn_copy_full_report))
+        self._sync_notify_btn()
         return card
+
+    # ── Лог лечения и переключатель уведомлений (2026-10-06) ────────────────
+    def _open_doctor_log(self):
+        """Открывает вкладку «Логи» сразу с категорией «🔧 Починки» (лечение)."""
+        self.openLogRequested.emit("fixed")
+
+    def _toggle_notify(self):
+        from umbranet.engine_adapter import set_doctor_notify
+        set_doctor_notify(bool(self._btn_notify.isChecked()))
+        self._sync_notify_btn()
+
+    def _sync_notify_btn(self):
+        from umbranet.engine_adapter import get_doctor_notify
+        on = bool(get_doctor_notify())
+        self._btn_notify.setChecked(on)
+        self._btn_notify.setText("✓ Уведомления: вкл" if on else "🔕 Уведомления: выкл")
+        border = theme.ACCENT if on else theme.BORDER
+        self._btn_notify.setStyleSheet(
+            f"QPushButton{{background:{theme.CARD};color:{theme.TEXT};"
+            f"border:1px solid {border};border-radius:10px;padding:0 13px;}}"
+            f"QPushButton:hover{{border-color:{theme.ACCENT};}}"
+            f"QPushButton:disabled{{color:{theme.MUTED};border-color:{theme.BORDER};}}"
+        )
 
     def _build_dpi_tools(self):
         card, lay = _card("🛡  DPI-движок")
@@ -577,8 +615,6 @@ class NetworkView(QWidget):
     def _refresh_health_score(self):
         if self._health_worker and self._health_worker.isRunning():
             return
-        self._btn_health_refresh.setEnabled(False)
-        self._btn_health_refresh.setText("Считаю...")
         self._health_title.setText("⏳ Проверяю состояние...")
         self._health_worker = _HealthWorker()
         self._health_worker.done.connect(self._on_health_ready)
@@ -586,8 +622,6 @@ class NetworkView(QWidget):
 
     def _on_health_ready(self, hs: dict):
         self._last_health = hs or {}
-        self._btn_health_refresh.setEnabled(True)
-        self._btn_health_refresh.setText("Обновить")
         if hs.get("error"):
             self._health_score_label.setText("!")
             self._health_title.setText("Health недоступен")

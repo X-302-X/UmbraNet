@@ -1444,6 +1444,28 @@ def set_auto_transport(enabled: bool) -> None:
     _patch_ui_state("auto_transport", bool(enabled))
 
 
+def get_doctor_notify() -> bool:
+    """Показывать ли фоновые уведомления Автодоктора/аудита (2026-10-06).
+
+    Жалоба пользователя: «постоянные уведомления, которые нельзя отключить».
+    Галочка живёт в umbranet_ui.json (поле doctor_notify), по умолчанию вкл.
+    """
+    try:
+        import ui_state as _us
+        return bool(_us.get_value("doctor_notify", True))
+    except Exception:
+        return True
+
+
+def set_doctor_notify(value: bool) -> None:
+    """Сохраняет состояние галочки «Уведомления» в виджете лечения."""
+    try:
+        import ui_state as _us
+        _us.update_state(doctor_notify=bool(value))
+    except Exception:
+        pass
+
+
 def get_nav_order(default_keys: list[str]) -> list[str]:
     """Возвращает сохранённый порядок вкладок бокового меню.
 
@@ -1825,11 +1847,15 @@ def normalize_domain(value: str) -> str:
     return d.rstrip(".")
 
 
-def get_current_dns_settings() -> dict:
-    """Текущие DNS-адреса Windows по адаптерам. На других ОС — пустой dict."""
+def get_current_dns_settings(use_cache: bool = True) -> dict:
+    """Текущие DNS-адреса Windows по адаптерам. На других ОС — пустой dict.
+
+    use_cache=False — свежее чтение (аудит после Стопа обязан видеть реальное
+    состояние, а не кэш пятилетней давности — поле 2026-10-06).
+    """
     try:
         from process_monitor import get_current_dns as _g  # type: ignore
-        return _g() or {}
+        return _g(use_cache=use_cache) or {}
     except Exception:
         return {}
 
@@ -2512,9 +2538,10 @@ def verify_teardown() -> dict:
     except Exception as exc:
         log_recoverable(log, 'Аудит остановки: не удалось проверить процессы winws', exc, level=logging.WARNING)
 
-    # 2) Системный DNS: не остался ли захваченным.
+    # 2) Системный DNS: не остался ли захваченным. Читаем СВЕЖЕЕ состояние —
+    # кэш чтения врёт после недавнего восстановления (поле 2026-10-06).
     try:
-        dns = get_current_dns_settings() or {}
+        dns = get_current_dns_settings(use_cache=False) or {}
         leftovers = []
         for name, vals in dns.items():
             if not isinstance(vals, dict):
@@ -2798,6 +2825,17 @@ def _dpi_write_ai_strategy_from_variant(variant: dict, score: dict, generation_d
         existing_items = m.list_strategies(enabled_only=False)
         if len(existing_items) >= DPI_STRATEGY_LIMIT:
             return False, f"Достигнут лимит: максимум {DPI_STRATEGY_LIMIT} стратегий", ""
+        # Ворота сохранения (последний рубеж): поломанная стратегия не пишется.
+        from ai_strategy.validate import validate_strategy_args  # type: ignore
+        vres = validate_strategy_args(
+            list(variant.get("args", []) or []),
+            bin_dir=m.strategies_dir.parent / "bin",
+        )
+        if not vres.get("ok"):
+            return False, (
+                "Отказ сохранения — стратегия структурно поломана: "
+                + "; ".join(vres.get("problems") or [])
+            ), ""
         n = _dpi_next_strategy_number(existing_items)
         if not n:
             return False, f"Нет свободных Uz-слотов: максимум Uz{DPI_STRATEGY_LIMIT}", ""
@@ -3012,6 +3050,7 @@ def dpi_strategy_ai_run_controlled(mode: str = "quick", on_progress=None, should
 
     try:
         from ai_strategy.mutations import generate_variants  # type: ignore
+        from ai_strategy.validate import validate_strategy_args  # type: ignore
         from ai_strategy.probes import run_basic_probes  # type: ignore
         from ai_strategy.scoring import choose_best, score_variant  # type: ignore
         from ai_strategy.session import session_policy  # type: ignore
@@ -3076,6 +3115,18 @@ def dpi_strategy_ai_run_controlled(mode: str = "quick", on_progress=None, should
                 f"AI-генерация: вариант {idx}/{len(variants)} • "
                 f"seed={seed_id} • mutation={mutation} • mask={mask_id}"
             )
+            # Структурные ворота (цель: только полностью рабочие стратегии).
+            # Поломанный вариант не запускаем и не тратим на него probes.
+            vres = validate_strategy_args(list(variant.get("args", []) or []))
+            if not vres.get("ok"):
+                scores.append({
+                    "variant_id": vid,
+                    "score": 0,
+                    "ok": False,
+                    "error": "структурная валидация: " + "; ".join(vres.get("problems") or []),
+                })
+                progress(f"AI-генерация: {vid} отклонён — {scores[-1]['error']}")
+                continue
             args, err = _dpi_expand_ai_variant_args(list(variant.get("args", []) or []), generation_domains)
             if not args:
                 scores.append({

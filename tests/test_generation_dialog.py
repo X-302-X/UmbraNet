@@ -200,6 +200,40 @@ def test_no_service_names_in_dialog_headlines():
 
 # ── 2. Оценка времени до конца ──────────────────────────────────────────────
 
+def test_finish_shows_verdict_not_report_lines():
+    """Баг «ничего не отображается» (2026-10-06): после finish() подписи
+    показывали мусор — подзаголовок откатывался к «потерпите», а строка шага
+    становилась последней строкой отчёта. Итог должен быть читаемым."""
+    dlg = make_dialog(total=4)
+    dlg.append("AI-генерация: вариант 1/4 • seed=uz1")
+    dlg.finish({
+        "ok": False, "stage": "ai_generation",
+        "reason_text": "обязательные проверки Discord/YouTube не прошли",
+        "created_id": "",
+        "best": {"score": 94},
+        "report_lines": ["YouTube: FAIL", "  required: music=FAIL, media=OK"],
+    })
+    assert "Uz не создана" in dlg._subtitle.text(), dlg._subtitle.text()
+    assert "потерпите" not in dlg._subtitle.text().lower(), dlg._subtitle.text()
+    assert "Готово" in dlg._step.text(), dlg._step.text()
+    assert "music=FAIL" not in dlg._step.text(), dlg._step.text()
+    log = dlg._log.toPlainText()
+    assert "music=FAIL" in log, "отчёт должен быть в логе окна"
+
+
+def test_finish_ok_shows_created_strategy():
+    dlg = make_dialog(total=4)
+    dlg.finish({
+        "ok": True, "stage": "ai_generation",
+        "created_id": "uz2", "message": "AI-стратегия создана: Uz2",
+        "best": {"score": 90},
+        "report_lines": ["Список истины: 3 домена"],
+    })
+    assert "Создана стратегия uz2" in dlg._subtitle.text(), dlg._subtitle.text()
+    assert "Готово" in dlg._step.text() or "готово" in dlg._step.text(), dlg._step.text()
+    assert "Список истины" not in dlg._step.text()
+
+
 def test_eta_asks_to_wait_before_first_result():
     dlg = make_dialog(total=4)
     assert "первого варианта" in dlg._eta.text()
@@ -220,7 +254,12 @@ def test_eta_counts_down_after_first_variant():
 
     # 10 секунд на вариант → осталось 3 варианта ≈ 30 секунд
     assert "30 с" in dlg._eta.text(), dlg._eta.text()
-    assert "готово 1 из 4" in dlg._eta.text(), dlg._eta.text()
+    # Счётчик готовности — только в основной шкале (пожелание 2026-10-06):
+    # в строке с временем он отставал на 1.
+    assert "готово" not in dlg._eta.text(), dlg._eta.text()
+    assert "1 / 4" in dlg._progress.text() or "1 / 4" in dlg._progress.format(), (
+        dlg._progress.text()
+    )
 
 
 def test_eta_shrinks_while_current_variant_runs():

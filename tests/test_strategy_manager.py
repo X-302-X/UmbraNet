@@ -127,7 +127,9 @@ def test_hostlist_is_written_and_injected(manager):
 
     hostlist = manager.active_hostlist_path
     assert hostlist.exists(), "файл со списком целей не создан"
-    assert hostlist.read_text(encoding="utf-8") == "example.com\ntwitter.com\n"
+    # Пин обновлён 2026-10-06: служебная обложка ECH (cloudflare-ech.com)
+    # всегда присутствует в списке — иначе ECH-потоки зависают без обхода.
+    assert hostlist.read_text(encoding="utf-8") == "example.com\ntwitter.com\ncloudflare-ech.com\n"
     assert args[0] == f"--hostlist={hostlist.absolute()}", f"первый аргумент: {args[0]}"
     assert args[1:] == ["--dpi-desync=fake"]
     assert manager.last_hostlist_count == 2
@@ -143,6 +145,17 @@ def test_hostlist_is_repeated_before_each_section(manager):
     assert args == [host, "--dpi-desync=fake", "--new", host, "--dpi-desync=split"], (
         f"разложилось неверно: {args}"
     )
+
+
+def test_ech_cover_always_present_and_not_counted(manager):
+    """ECH-обложка в файле всегда; «цели: N» — только домены пользователя."""
+    _simple(manager, args=["--dpi-desync=fake"])
+    args = manager.get_args("uz1", routed_domains=["example.com"])
+    hostlist = manager.active_hostlist_path
+    lines = hostlist.read_text(encoding="utf-8").splitlines()
+    assert lines[-1] == "cloudflare-ech.com"
+    assert manager.last_hostlist_count == 1, "обложка не должна считаться целью"
+    assert args[0] == f"--hostlist={hostlist.absolute()}"
 
 
 def test_hostlist_not_added_without_domains(manager):
@@ -195,8 +208,9 @@ def test_domains_are_cleaned(manager):
     ])
 
     content = manager.active_hostlist_path.read_text(encoding="utf-8").splitlines()
-    assert content == ["twitter.com", "www.youtube.com", "example.com", "нет-точки"] or \
-           content == ["twitter.com", "www.youtube.com", "example.com"], (
+    # Последняя строка — служебная обложка ECH (пин обновлён 2026-10-06).
+    assert content == ["twitter.com", "www.youtube.com", "example.com", "нет-точки", "cloudflare-ech.com"] or \
+           content == ["twitter.com", "www.youtube.com", "example.com", "cloudflare-ech.com"], (
         f"список целей разобран не так: {content}"
     )
     assert "localhost" not in content, "в список целей попал не-домен"

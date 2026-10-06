@@ -50,7 +50,9 @@ def fake_check(host: str, ok: bool = True, stage: str = "http", delay: float = 0
 # ── 1. Проверки идут параллельно ───────────────────────────────────────────
 
 def test_youtube_checks_run_in_parallel(monkeypatch):
-    """4 проверки YouTube × 0.4 с: последовательно 1.6 с, параллельно ~0.4 с."""
+    """6 проверок YouTube × 0.4 с: последовательно 2.4 с, параллельно ~0.4 с.
+
+    Список вырос 2026-10-06: добавлены обязательные музыка и googlevideo."""
     calls: list[str] = []
 
     def slow_probe(host, *args, **kwargs):
@@ -62,7 +64,7 @@ def test_youtube_checks_run_in_parallel(monkeypatch):
     result = probes.probe_youtube_basic(timeout=1.0)
     elapsed = time.monotonic() - started
 
-    assert len(calls) == 4, f"список проверок изменился: {calls}"
+    assert len(calls) == 6, f"список проверок изменился: {calls}"
     assert elapsed < 1.0, (
         f"проверки YouTube шли последовательно: {elapsed:.2f}с вместо ~0.4с — "
         f"это и растягивало генерацию на минуты"
@@ -150,6 +152,7 @@ def test_probe_result_shape_unchanged(monkeypatch):
     """Параллельность не должна менять структуру ответа, из которой считается score."""
     answers = {
         "www.youtube.com": True,
+        "music.youtube.com": True,
         "youtubei.googleapis.com": True,
         "i.ytimg.com": True,
         "redirector.googlevideo.com": False,
@@ -158,10 +161,14 @@ def test_probe_result_shape_unchanged(monkeypatch):
                         lambda host, *a, **kw: fake_check(host, ok=answers.get(host, False)))
     youtube = probes.probe_youtube_basic(timeout=1.0)
 
-    for key in ("service", "level", "ok", "score", "checks"):
+    for key in ("service", "level", "ok", "score", "checks", "required"):
         assert key in youtube, f"пропало поле {key}"
-    assert youtube["score"] == 75, "оценка YouTube считается иначе, чем раньше"
-    assert youtube["ok"] is True, "3 из 4 проверок — это зачёт"
+    # Контракт обновлён 2026-10-06: googlevideo (треки) — обязательная проба,
+    # сломанные треки больше не проходят «в зачёт».
+    assert youtube["score"] == 67, "оценка YouTube считается иначе, чем раньше"
+    assert youtube["ok"] is False, "сломанный googlevideo (треки) — не зачёт"
+    assert youtube["required"]["music"] is True
+    assert youtube["required"]["media"] is False
 
 
 def test_scoring_ignores_new_probe_fields(monkeypatch):

@@ -38,7 +38,7 @@ def _run_audit(monkeypatch, *, winws, dns_settings):
     import umbranet.engine_adapter as ea
 
     monkeypatch.setattr(winws_engine, "get_winws_engine", lambda: winws)
-    monkeypatch.setattr(ea, "get_current_dns_settings", lambda: dns_settings)
+    monkeypatch.setattr(ea, "get_current_dns_settings", lambda use_cache=True: dns_settings)
     return ea.verify_teardown()
 
 
@@ -105,7 +105,7 @@ def test_audit_survives_probe_failures(monkeypatch):
     import winws_engine
 
     monkeypatch.setattr(winws_engine, "get_winws_engine", lambda: _BrokenWinWS())
-    monkeypatch.setattr(ea, "get_current_dns_settings", lambda: (_ for _ in ()).throw(OSError("ps down")))
+    monkeypatch.setattr(ea, "get_current_dns_settings", lambda use_cache=True: (_ for _ in ()).throw(OSError("ps down")))
 
     report = ea.verify_teardown()
     assert "ok" in report and "problems" in report, "аудит обязан вернуть структуру даже при сбоях"

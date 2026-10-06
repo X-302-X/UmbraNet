@@ -33,6 +33,7 @@ from umbranet.engine_adapter import (
     get_current_mode,
     get_dpi_targets,
     get_engine,
+    get_doctor_notify,
     get_nav_order,
     get_startup_health,
     is_admin,
@@ -496,6 +497,7 @@ class MainWindow(GlowContainer):
                 page = ProfilesView()
             elif it.key == "network":
                 page = NetworkView()
+                page.openLogRequested.connect(self._on_open_log_with_filter)
             elif it.key == "strategy_lab":
                 page = StrategyLabView()
                 page.generationRequested.connect(self._on_ai_generation_requested)
@@ -632,7 +634,14 @@ class MainWindow(GlowContainer):
         return " • ".join(str(x) for x in items[:3])
 
     def _update_startup_health(self) -> dict:
-        """Запускает предстартовую диагностику в фоне и возвращает последний результат."""
+        """Запускает предстартовую диагностику в фоне и возвращает последний результат.
+
+        2026-10-06: без Старта — полная тишина. Раньше таймер опрашивал Health
+        каждые 30 секунд даже в простое («доктор видит что-то, даже когда я не
+        нажал старт»). Теперь проверки идут только после Старта и по кнопкам.
+        """
+        if not bool(getattr(get_engine(), "running", False)):
+            return self._last_startup_health
         if self._startup_health_worker and self._startup_health_worker.isRunning():
             return self._last_startup_health
         self._startup_health_worker = _StartupHealthWorker()
@@ -816,6 +825,11 @@ class MainWindow(GlowContainer):
         """Запускает action в фоновом потоке с блокировкой повторных кликов."""
         if self._busy:
             return
+        # Каждый Старт/Стоп — новое «поколение» сессии. Фоновые проверки
+        # (автодоктор, аудит после Стопа) сверяются с ним и не вмешиваются
+        # в другую сессию (поле 2026-10-06: после быстрой проверки
+        # Стоп→Старт аудит первого Стопа сбрасывал DNS новой сессии).
+        self._runtime_gen = getattr(self, "_runtime_gen", 0) + 1
         # Блок Старта без целей — вместо блока переключения режимов
         if action in ("start", "restart") and not self._can_start():
             self._show_start_guard_dialog()
@@ -1135,6 +1149,7 @@ class MainWindow(GlowContainer):
                         # Health → если надо repair → Health → запись в логи.
                         _threading.Thread(
                             target=self._auto_doctor_after_start,
+                            args=(getattr(self, "_runtime_gen", 0),),
                             daemon=True, name="UmbraNet-AutoDoctor"
                         ).start()
                 _threading.Thread(target=_set_dns, daemon=True, name="UmbraNet-SetDNS").start()
@@ -1178,16 +1193,24 @@ class MainWindow(GlowContainer):
             # искал хвосты: «Стоп нажат, а обход продолжает работать» оставался
             # незамеченным — и программе, и её диагностике было не на что смотреть.
             import time as _time
+            audit_gen = getattr(self, "_runtime_gen", 0)
 
             def _audit():
                 try:
                     _time.sleep(2.0)  # ждём UmbraNet-RestoreDNS и добивание winws
+                    # Уже запущена новая сессия — не трогаем чужой запуск
+                    # (поле 2026-10-06: быстрый Стоп→Старт гонял аудит по живой
+                    # сессии и сбрасывал ей DNS).
+                    if getattr(self, "_runtime_gen", 0) != audit_gen:
+                        log.info("Аудит после остановки пропущен: уже запущена новая сессия")
+                        return
                     audit = verify_teardown()
                     # Самолечение (поле 2026-10-05): netsh отчитался об успехе,
                     # но аудит всё ещё видел 127.0.0.1 в системном DNS.
                     # Повторяем откат и проверяем ещё раз — предупреждение
                     # остаётся только если и повтор не помог.
-                    if any("DNS" in str(p) for p in (audit.get("problems") or [])):
+                    if any("DNS" in str(p) for p in (audit.get("problems") or [])) \
+                            and getattr(self, "_runtime_gen", 0) == audit_gen:
                         try:
                             from umbranet.engine_adapter import network_restore_latest
                             ok2, msg2 = network_restore_latest()
@@ -1251,7 +1274,7 @@ class MainWindow(GlowContainer):
         QTimer.singleShot(300, self._update_startup_health)
         self._refresh_current_view()
 
-    def _auto_doctor_after_start(self):
+    def _auto_doctor_after_start(self, my_gen: int | None = None):
         """Фоновый автодоктор после успешного старта.
 
         Идея: пользователь не должен руками выбирать «что чинить». После старта
@@ -1260,6 +1283,11 @@ class MainWindow(GlowContainer):
         """
         import time
         time.sleep(2.0)  # ждём DNS/WinWS и применение DNS-настроек Windows
+        # Сессия сменилась во время ожидания (Стоп или новый Старт) —
+        # не вмешиваемся в чужую сессию (поле 2026-10-06).
+        if my_gen is not None and getattr(self, "_runtime_gen", 0) != my_gen:
+            log.info("Автодоктор пропущен: сессия сменилась во время ожидания")
+            return
         try:
             from umbranet.engine_adapter import (
                 add_query_log_event,
@@ -1557,6 +1585,13 @@ class MainWindow(GlowContainer):
         except Exception:
             pass
 
+    def _on_open_log_with_filter(self, filter_key: str):
+        """Кнопка «📋 Лог» в виджете лечения: вкладка «Логи» + категория."""
+        log_view = self._views.get("log")
+        if log_view is not None and hasattr(log_view, "set_filter"):
+            log_view.set_filter(filter_key)
+        self._on_navigate("log")
+
     def _on_navigate(self, key: str):
         self._show(key)
 
@@ -1747,7 +1782,9 @@ class MainWindow(GlowContainer):
                 msg = event.get("message", "Автодоктор завершён")
                 ok = bool(event.get("ok", False))
                 log.info("%s", msg)
-                if self.tray:
+                # Фоновые уведомления — по галочке «Уведомления» в виджете
+                # лечения (2026-10-06: «постоянные уведомления нельзя отключить»).
+                if self.tray and get_doctor_notify():
                     try:
                         self.tray.notify(("✅ " if ok else "⚠ ") + msg)
                     except Exception:
@@ -1758,7 +1795,7 @@ class MainWindow(GlowContainer):
                 if problems:
                     msg = "После остановки: " + "; ".join(str(p) for p in problems[:2])
                     log.warning("%s", msg)
-                    if self.tray:
+                    if self.tray and get_doctor_notify():
                         try:
                             self.tray.notify("⚠ " + msg)
                         except Exception:
