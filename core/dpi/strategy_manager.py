@@ -212,10 +212,23 @@ class StrategyManager:
             return ""
         return f"--hostlist={path.absolute()}"
 
+    # ECH-обложка Chrome: при шифрованном ClientHello DPI видит именно это
+    # имя (поле 2026-10-06: 49 рукопожатий за прогон). Без него ECH-потоки не
+    # получают обход и зависают — «сайт вечно грузится» (YT Music).
+    ECH_COVER_DOMAIN = "cloudflare-ech.com"
+
+    def _routed_with_cover(self, domains: list[str]) -> list[str]:
+        """Основной список целей + служебная обложка ECH (без неё ECH-потоки
+        не получают обход и зависают). В счётчик целей не входит."""
+        return list(domains) + [self.ECH_COVER_DOMAIN] if domains else []
+
     def _write_active_hostlist(self, routed_domains) -> tuple[str, int]:
         domains = self._clean_domains(routed_domains or [])
         self.last_hostlist_count = len(domains)
-        arg = self._write_hostlist_file(self.active_hostlist_path, domains)
+        arg = self._write_hostlist_file(
+            self.active_hostlist_path,
+            self._routed_with_cover(domains),
+        )
         return arg, (len(domains) if arg or not domains else 0)
 
     def get_args(self, strategy_id: str, routed_domains=None, require_hostlist: bool = False):
@@ -254,10 +267,14 @@ class StrategyManager:
             # Режем только когда есть И обычные цели, И CDN: иначе некуда
             # деть discord.com / gateway, либо наоборот — один список как раньше.
             if main and cdn:
-                hostlist_arg = self._write_hostlist_file(self.active_hostlist_path, main)
+                hostlist_arg = self._write_hostlist_file(
+                    self.active_hostlist_path, self._routed_with_cover(main)
+                )
                 cdn_arg = self._write_hostlist_file(self.cdn_hostlist_path, cdn)
             else:
-                hostlist_arg = self._write_hostlist_file(self.active_hostlist_path, domains)
+                hostlist_arg = self._write_hostlist_file(
+                    self.active_hostlist_path, self._routed_with_cover(domains)
+                )
                 self._write_hostlist_file(self.cdn_hostlist_path, [])
             if require_hostlist and not hostlist_arg:
                 self.last_error = "Для DPI не выбраны цели: включите сервисы/домены в главном меню."

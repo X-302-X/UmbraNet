@@ -16,6 +16,19 @@ GOOGLE_QUIC = "{bin}\\quic_initial_www_google_com.bin"
 MAX_TLS = "{bin}\\tls_clienthello_max_ru.bin"
 STUN_BIN = "{bin}\\stun.bin"
 
+# Голосовая секция — ОБЯЗАТЕЛЬНАЯ часть каждого полного seed (2026-10-06).
+# Держать в точности как в strategies/uz1.json (пинит tests/test_uz_parity.py):
+# голос Дискорда не должен ломаться из-за того, что генерация «забыла» про голос.
+VOICE_WF = "--wf-udp=19294-19344,50000-65535"
+VOICE_SECTION = [
+    "--filter-udp=19294-19344,50000-65535",
+    "--filter-l7=discord,stun",
+    "--dpi-desync=fake",
+    "--dpi-desync-repeats=6",
+    "--dpi-desync-fake-discord={bin}\\\\stun.bin",
+    "--dpi-desync-fake-stun={bin}\\\\stun.bin",
+]
+
 SEEDS: list[dict[str, Any]] = [
     {
         "id": "minimal_tls_split",
@@ -26,10 +39,13 @@ SEEDS: list[dict[str, Any]] = [
         "description": "Диагностический мягкий seed. Не должен побеждать полноценный balanced-вариант только из-за low-risk.",
         "args": [
             "--wf-tcp=80,443,2053,2083,2087,2096,8443",
+            VOICE_WF,
             "--filter-tcp=443",
             "{hostlist}",
             "--dpi-desync=split2",
             "--dpi-desync-split-pos=1",
+            "--new",
+            *VOICE_SECTION,
         ],
     },
     {
@@ -41,7 +57,7 @@ SEEDS: list[dict[str, Any]] = [
         "description": "Основной рекомендуемый seed на базе рабочей Uz1-структуры.",
         "args": [
             "--wf-tcp=80,443,2053,2083,2087,2096,8443",
-            "--wf-udp=443",
+            "--wf-udp=443,19294-19344,50000-65535",
             "--filter-udp=443",
             "{hostlist}",
             "--dpi-desync=fake",
@@ -69,6 +85,9 @@ SEEDS: list[dict[str, Any]] = [
             f"--dpi-desync-split-seqovl-pattern={MAX_TLS}",
             f"--dpi-desync-fake-tls={STUN_BIN}",
             f"--dpi-desync-fake-tls={MAX_TLS}",
+            f"--dpi-desync-fake-http={MAX_TLS}",
+            "--new",
+            *VOICE_SECTION,
         ],
     },
     {
@@ -80,6 +99,7 @@ SEEDS: list[dict[str, Any]] = [
         "description": "Seed с упором на TCP/TLS, без отдельного UDP-блока.",
         "args": [
             "--wf-tcp=80,443,2053,2083,2087,2096,8443",
+            VOICE_WF,
             "--filter-tcp=443",
             "{hostlist}",
             "--ip-id=zero",
@@ -100,6 +120,8 @@ SEEDS: list[dict[str, Any]] = [
             "--dpi-desync-repeats=6",
             f"--dpi-desync-split-seqovl-pattern={MAX_TLS}",
             f"--dpi-desync-fake-tls={MAX_TLS}",
+            "--new",
+            *VOICE_SECTION,
         ],
     },
     {
@@ -110,12 +132,15 @@ SEEDS: list[dict[str, Any]] = [
         "save_priority": 35,
         "description": "Диагностический seed для проверки UDP/QUIC-пути.",
         "args": [
-            "--wf-udp=443",
+            "--wf-tcp=80,443,2053,2083,2087,2096,8443",
+            "--wf-udp=443,19294-19344,50000-65535",
             "--filter-udp=443",
             "{hostlist}",
             "--dpi-desync=fake",
             "--dpi-desync-repeats=11",
             f"--dpi-desync-fake-quic={GOOGLE_QUIC}",
+            "--new",
+            *VOICE_SECTION,
         ],
     },
     {
@@ -127,7 +152,7 @@ SEEDS: list[dict[str, Any]] = [
         "description": "Более агрессивный seed для будущего глубокого подбора.",
         "args": [
             "--wf-tcp=80,443,2053,2083,2087,2096,8443",
-            "--wf-udp=443",
+            "--wf-udp=443,19294-19344,50000-65535",
             "--filter-udp=443",
             "{hostlist}",
             "--dpi-desync=fake",
@@ -155,6 +180,9 @@ SEEDS: list[dict[str, Any]] = [
             f"--dpi-desync-split-seqovl-pattern={MAX_TLS}",
             f"--dpi-desync-fake-tls={STUN_BIN}",
             f"--dpi-desync-fake-tls={MAX_TLS}",
+            f"--dpi-desync-fake-http={MAX_TLS}",
+            "--new",
+            *VOICE_SECTION,
         ],
     },
 ]

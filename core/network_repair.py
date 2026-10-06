@@ -536,9 +536,27 @@ def restore_user_dns(path: str | None = None, ps_runner=None) -> tuple[bool, str
                 else:
                     ok, msg = restore_snapshot(str(snap_path), ps_runner=ps_runner)
                     if ok:
-                        log.info("DNS восстановлен из снапшота: %s", msg)
-                        return True, msg
-                    log.warning("Восстановление из снапшота не удалось (%s) — падаем на DHCP", msg)
+                        # Самопроверка (поле 2026-10-06): netsh может отчитаться
+                        # об успехе, а DNS остаться нашим. Только СВЕЖЕЕ чтение
+                        # решает; если яд остался — не врём, идём на DHCP.
+                        try:
+                            from process_monitor import get_current_dns, invalidate_dns_cache
+                            invalidate_dns_cache()
+                            fresh = get_current_dns(use_cache=False) or {}
+                            poisoned = any(
+                                any(str(s).strip() in LOOPBACK_DNS
+                                    for s in ((d or {}).get("ipv4") or []) + ((d or {}).get("ipv6") or []))
+                                for d in fresh.values() if isinstance(d, dict)
+                            )
+                        except Exception:
+                            poisoned = False
+                        if poisoned:
+                            log.warning("Снапшот применён, но DNS всё ещё наш (127.0.0.1/::1) — идём на DHCP")
+                        else:
+                            log.info("DNS восстановлен из снапшота: %s", msg)
+                            return True, msg
+                    else:
+                        log.warning("Восстановление из снапшота не удалось (%s) — падаем на DHCP", msg)
             else:
                 # Снапшот пустой: у пользователя и был DHCP, восстанавливать нечего.
                 log.info("В снапшоте нет статических DNS — возвращаем DHCP")
@@ -549,8 +567,9 @@ def restore_user_dns(path: str | None = None, ps_runner=None) -> tuple[bool, str
 
     # 2) Фолбэк: DHCP. Гарантированно убирает наш 127.0.0.1.
     try:
-        from process_monitor import reset_dns_to_auto
+        from process_monitor import reset_dns_to_auto, invalidate_dns_cache
         ok, msg = reset_dns_to_auto()
+        invalidate_dns_cache()
         if ok:
             log.info("DNS возвращён на DHCP: %s", msg)
         else:

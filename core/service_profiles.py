@@ -53,7 +53,14 @@ YOUTUBE_RUNTIME_DOMAINS = _unique(['youtube.com',
  'yt4.ggpht.com',
  'yt3.googleusercontent.com',
  'jnn-pa.googleapis.com',
- 'play.google.com'])
+ 'play.google.com',
+ # YT Music (2026-10-06): шелл страницы ждёт эти хосты — без лечения
+ # они уходили голыми («не цель»), DPI их резал, страница «не до конца
+ # погружалась» (крутилка), хотя треки играли.
+ 'googleusercontent.com',
+ 'gstatic.com',
+ 'accounts.google.com',
+ 'waa-pa.clients6.google.com'])
 
 
 DISCORD_RUNTIME_DOMAINS = _unique(['dis.gd',

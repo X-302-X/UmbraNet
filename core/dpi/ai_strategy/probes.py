@@ -295,23 +295,39 @@ def websocket_hello_probe(host: str, path: str, timeout: float = DEFAULT_TIMEOUT
 
 
 def probe_youtube_basic(timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
-    """Базовая YouTube-проверка без браузерного воспроизведения."""
+    """Базовая YouTube-проверка без браузерного воспроизведения.
+
+    2026-10-06 (поле): YT Music «вис», хотя www.youtube.com работал. Поэтому
+    music.youtube.com и redirector.googlevideo.com — ОБЯЗАТЕЛЬНЫЕ проверки:
+    стратегия, которая ломает музыку или медиа-потоки, не должна сохраняться.
+    """
     started = _now_ms()
     checks = _run_parallel([
         lambda: https_probe("www.youtube.com", "/generate_204", "GET", timeout),
+        lambda: https_probe("music.youtube.com", "/", "GET", timeout),
+        lambda: https_probe("redirector.googlevideo.com", "/generate_204", "GET", timeout),
         lambda: https_probe("youtubei.googleapis.com", "/", "HEAD", timeout),
         lambda: https_probe("i.ytimg.com", "/", "HEAD", timeout),
         lambda: https_probe("redirector.googlevideo.com", "/", "HEAD", timeout),
     ])
+    # Индексы фиксированы порядком списка выше: music — 1, redirector /generate_204 — 2.
+    music = checks[1] if len(checks) > 1 else {}
+    media = checks[2] if len(checks) > 2 else {}
     ok_count = sum(1 for c in checks if c.get("ok"))
-    # googlevideo конкретный edge может меняться, поэтому для basic уровня не
-    # требуем 100%; реальный media probe появится отдельно.
-    ok = ok_count >= 3
+    music_ok = bool(music.get("ok"))
+    media_ok = bool(media.get("ok"))
+    # Обязательные: музыка (сайт YT Music) и медиа (googlevideo — треки).
+    # Без них стратегия «зелёная», а пользователь слышит вечную загрузку.
+    ok = ok_count >= 5 and music_ok and media_ok
     return {
         "service": "youtube",
         "level": "basic",
         "ok": ok,
         "score": round(ok_count / max(len(checks), 1) * 100),
+        "required": {
+            "music": music_ok,
+            "media": media_ok,
+        },
         "checks": checks,
         "parallel": True,
         "ms": round(_now_ms() - started, 1),
