@@ -8,7 +8,7 @@
 
 Замеры до правки:
 
-  • «💡 Где что находится» — пять строк текста при жёсткой высоте 110 px, а нужно
+  • «💡 Где что находится» — шесть строк текста при жёсткой высоте 110 px, а нужно
     214: две последние строки не показывались никогда.
   • Описание программы — нужно 56 px при 40.
   • Значение «Предстартовая проверка» — «Нет прав администратора: UmbraNet не
@@ -111,26 +111,74 @@ def test_no_label_is_cut(window, about_view):
     assert not problems, "подписи обрезаны: " + "; ".join(problems[:6])
 
 
+def help_label(view) -> QLabel:
+    """Подпись со списком «Где что находится» (одна на всю карточку)."""
+    for lbl in view.findChildren(QLabel):
+        if "Маршрутизация" in lbl.text() and "Настройки" in lbl.text():
+            return lbl
+    raise AssertionError("текст-список не найден")
+
+
 def test_help_list_is_fully_visible(window, about_view):
-    """Список «Где что находится» виден целиком — все пять пунктов.
+    """Список «Где что находится» виден целиком — все шесть пунктов.
 
     До правки под отведённые 110 px попадало три с половиной пункта: остальные
     обрезались, и до них нельзя было долистать (это не прокрутка содержимого, а
     именно отсечение по высоте).
     """
     set_width(window, 700)
-    lab = None
-    for lbl in about_view.findChildren(QLabel):
-        if "Маршрутизация</b>" in lbl.text() and "Настройки</b>" in lbl.text():
-            lab = lbl
-    assert lab is not None, "текст-список не найден"
+    lab = help_label(about_view)
     assert lab.wordWrap(), "список не переносится"
-    for entry in ("Маршрутизация", "Сеть и диагностика", "DNS-профили", "Логи", "Настройки"):
+    for entry in ("Маршрутизация", "Сеть и диагностика", "AI-стратегии", "DNS-профили", "Логи", "Настройки"):
         assert entry in lab.text(), f"в тексте пропал пункт «{entry}»"
     need = lab.heightForWidth(lab.width())
     assert lab.height() >= need - 1, (
         f"список обрезан: нужно {need} px, есть {lab.height()}"
     )
+
+
+def test_help_rows_use_emoji_and_blue_names(about_view):
+    """Вкладки в списке подсвечены голубым и со смайликами (мини-редизайн).
+
+    Имена вкладок набраны голубым (about._HELP_TAB_COLOR) и начинаются со
+    смайлика из бокового меню — список перестал быть «серой простынёй» и пункты
+    узнаются по тем же иконкам, что и вкладки.
+    """
+    from umbranet.views import about as about_mod
+
+    html = help_label(about_view).text()
+    assert about_mod._HELP_TAB_COLOR in html, "голубой цвет названий вкладок пропал"
+    for emoji, name in (
+        ("🔀", "Маршрутизация"),
+        ("🤖", "Сеть и диагностика"),
+        ("🧪", "AI-стратегии"),
+        ("🧩", "DNS-профили"),
+        ("📑", "Логи"),
+        ("⚙", "Настройки"),
+    ):
+        assert f"{emoji} {name}" in html, f"в списке нет смайлика у «{name}»"
+        assert (
+            f"<span style='color:{about_mod._HELP_TAB_COLOR};'>{emoji} {name}</span>"
+        ) in html, f"«{name}» не подсвечено голубым"
+
+
+def test_update_button_is_static_not_stretched(window, about_view):
+    """«Проверить обновления» — статичная кнопка по тексту, а не во всю карточку.
+
+    С политикой размера по умолчанию (Minimum) кнопка занимала всю строку и
+    «продлевалась бесконечно» при растягивании окна. Теперь ширина — sizeHint и
+    не меняется от ширины окна.
+    """
+    btn = about_view._check_release
+    widths = []
+    for width in (1280, 900, 700):
+        set_width(window, width)
+        widths.append(btn.width())
+        assert btn.width() <= btn.sizeHint().width() + 1, (
+            f"окно={width}: кнопка растянулась до {btn.width()} px "
+            f"при sizeHint {btn.sizeHint().width()} px"
+        )
+    assert widths[0] == widths[-1], f"кнопка «дышит» при ресайзе: {widths}"
 
 
 def test_hero_description_grows(window, about_view):

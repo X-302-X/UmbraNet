@@ -200,9 +200,9 @@ def test_checker_constructor_accepts_public_and_legacy_versions(version):
 def test_async_checker_handles_stable_r_tag(monkeypatch):
     from umbranet import __version__
     monkeypatch.setattr(uc, "threading", SimpleNamespace(Lock=threading.Lock, Thread=InlineThread))
-    monkeypatch.setattr(uc, "fetch_releases", lambda channel: [release("v26.0.1r")])
+    monkeypatch.setattr(uc, "fetch_releases", lambda channel: [release("v26.0.8r")])
     checker = uc.UpdateChecker(__version__)
     assert checker.check_async()
     assert not checker.busy
     assert checker.result.state == "available"
-    assert checker.result.version == "26.0.1r"
+    assert checker.result.version == "26.0.8r"

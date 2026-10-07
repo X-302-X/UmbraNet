@@ -85,7 +85,7 @@ def test_release_button_gets_layout_geometry_after_hidden_resize(view):
         assert left + button.width() <= body.width()
 
 
-@pytest.mark.parametrize("tag,display", [("v26.0.1r", "26.0.1r"), ("v26.0.2b", "26.0.2b")])
+@pytest.mark.parametrize("tag,display", [("v26.0.8r", "26.0.8r"), ("v26.0.9b", "26.0.9b")])
 def test_update_notice_keeps_short_version_label(view, tag, display):
     widget, checker = view
     checker._result = select_release([{"tag_name": tag}], __version__, include_prereleases=True)

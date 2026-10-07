@@ -57,7 +57,7 @@ def test_overlong_version_is_rejected():
 
 def test_current_version_keeps_public_spelling():
     parsed = parse_app_version(__version__)
-    assert __version__ == "26.0.1b"
+    assert __version__ == "26.0.7b"
     assert parsed.display == __version__
     assert parsed.value.is_prerelease
 
@@ -82,4 +82,4 @@ def test_network_report_uses_the_same_public_version(monkeypatch):
         monkeypatch.setattr(ea, name, lambda *a, _value=value, **k: _value)
     report = ea.full_diagnostics_report()
     assert f"version: {__version__}" in report.splitlines()
-    assert "26.0.1b0" not in report
+    assert "26.0.7b0" not in report
