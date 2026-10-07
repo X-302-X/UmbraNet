@@ -16,6 +16,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
 from umbranet import theme
+from umbranet.widgets.wheel_scroll import wheel_delta_px
 
 SB_PAD = 10      # отступ ползунка от правого края
 SB_W = 6         # толщина ползунка
@@ -154,7 +155,10 @@ class RowCanvas(QWidget):
     # ═════════════════ события мыши ════════════════════════════════════
 
     def wheelEvent(self, event):
-        self._scroll(-event.angleDelta().y() * 3 // 2)
+        # Одно деление колеса — 2 строки (шаг строки у каждого наследника свой:
+        # self.STRIDE). Было 180 px за щелчок — в логах и транспортах список
+        # проматывало мимо нужной строки.
+        self._scroll(wheel_delta_px(event.angleDelta().y(), self.STRIDE))
 
     def mousePressEvent(self, event):
         if event.button() != Qt.LeftButton:

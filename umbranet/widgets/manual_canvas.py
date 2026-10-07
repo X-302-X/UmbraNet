@@ -41,6 +41,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
 from umbranet import theme
+from umbranet.widgets.wheel_scroll import wheel_delta_px
 
 # ── геометрия ────────────────────────────────────────────────────────────────
 CARD_H = 36          # высота карточки
@@ -234,7 +235,9 @@ class ManualCanvas(QWidget):
         return QRect(self.width() - SB_PAD + 1, y, SB_W, thumb_h)
 
     def wheelEvent(self, event):
-        self._scroll(-event.angleDelta().y() * 3 // 2)
+        # Одно деление колеса — 2 карточки списка (см. wheel_scroll): было
+        # 180 px за щелчок ≈ 4.3 карточки, список проскакивал мимо нужной.
+        self._scroll(wheel_delta_px(event.angleDelta().y(), CARD_STRIDE))
 
     def sizeHint(self):
         return QSize(self.width() or 400, self.PREFERRED_H)

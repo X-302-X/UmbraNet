@@ -40,6 +40,7 @@ from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QLinearGradient,
 from PySide6.QtWidgets import QWidget
 
 from umbranet import theme
+from umbranet.widgets.wheel_scroll import wheel_delta_px
 
 # ── геометрия ────────────────────────────────────────────────────────────────
 HDR_H = 48          # заголовок секции (линия + название + чекбокс категории)
@@ -413,7 +414,10 @@ class ServiceCanvas(QWidget):
         return QRect(self.width() - SB_PAD + 1, y, SB_W, thumb_h)
 
     def wheelEvent(self, event):
-        self._scroll(-event.angleDelta().y() * 3 // 2)
+        # Одно деление колеса — 2 строки списка (см. wheel_scroll). Было
+        # `-angleDelta * 3 // 2`: 180 px за щелчок ≈ 5.6 строк — список
+        # проносило «на дофига» от малейшего движения колеса.
+        self._scroll(wheel_delta_px(event.angleDelta().y(), ROW_STRIDE))
 
     def sizeHint(self):
         """Предпочтительная высота списка (минимум задан отдельно и меньше)."""

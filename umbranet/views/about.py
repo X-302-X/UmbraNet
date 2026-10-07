@@ -40,6 +40,24 @@ _PACKAGE_NAMES = {
     "packaging": "packaging",
 }
 
+# Цвет названий вкладок в списке «Где что находится»: светлый голубой — тот же
+# синий акцент темы (theme.ACCENT2), но осветлённый, чтобы 12px-текст читался
+# на тёмной карточке и не сливался с фиолетовым интерфейсом.
+_HELP_TAB_COLOR = "#8cc4ff"
+
+
+def _help_row(emoji: str, name: str, text: str) -> str:
+    """Строка списка «Где что находится»: голубое имя вкладки со смайликом + описание.
+
+    Смайлики — те же, что в боковом меню (см. app.NAV_ITEMS), чтобы пункты
+    списка и вкладки узнавались одинаково.
+    """
+    return (
+        f"<div style='margin:4px 0;'>"
+        f"<b><span style='color:{_HELP_TAB_COLOR};'>{emoji} {name}</span></b> — {text}"
+        f"</div>"
+    )
+
 
 def _pkg_version(dist_name: str) -> str:
     try:
@@ -177,12 +195,14 @@ class AboutView(QWidget):
         self._prereleases.toggled.connect(self._set_update_channel)
         lay.addWidget(self._prereleases)
         # Separate rows keep the card usable at the minimum window width.
+        # Обе кнопки прижаты влево и не растягиваются по ширине карточки —
+        # статичные, как в обычном диалоге.
         self._check_release = self._small_btn("Проверить обновления", theme.ACCENT)
         self._check_release.clicked.connect(self._check_updates)
-        lay.addWidget(self._check_release)
+        lay.addWidget(self._check_release, 0, Qt.AlignLeft)
         self._open_release = self._small_btn("Открыть страницу релиза", theme.ACCENT)
         self._open_release.clicked.connect(self._open_update_release)
-        lay.addWidget(self._open_release)
+        lay.addWidget(self._open_release, 0, Qt.AlignLeft)
         note = _wrapped(QLabel("Файлы программы не скачиваются и не устанавливаются автоматически."), 32)
         note.setStyleSheet(f"color:{theme.SUBTEXT};font-size:12px;")
         lay.addWidget(note)
@@ -219,16 +239,24 @@ class AboutView(QWidget):
 
     def _build_help(self) -> QFrame:
         card, lay = _card("💡  Где что находится")
-        # Один QLabel вместо 5 — в 4× меньше heightForWidth пересчётов при ресайзе
+        # Один QLabel вместо 6 отдельных — в 4× меньше heightForWidth пересчётов при ресайзе
         rows = [
-            "<b>Маршрутизация</b> — Включайте сервисы и домены, которые должны идти через обход.",
-            "<b>Сеть и диагностика</b> — Проверяйте DNS, утечки, доступность сервисов и причину, почему сайт не открывается.",
-            "<b>DNS-профили</b> — Настраивайте провайдеров и защищённые транспорты: DoH, DoT, DoQ, DNSCrypt.",
-            "<b>Логи</b> — Смотрите живые DNS-запросы и системные логи, добавляйте домены в обход, blocklist или allowlist.",
-            "<b>Настройки</b> — Порт DNS, IPv6, кэш, bogus-IP и ручная DNS-фильтрация.",
+            _help_row("🔀", "Маршрутизация",
+                      "Включайте сервисы и домены, которые должны идти через обход."),
+            _help_row("🤖", "Сеть и диагностика",
+                      "Проверяйте DNS, утечки, доступность сервисов и причину, почему сайт не открывается."),
+            _help_row("🧪", "AI-стратегии",
+                      "Генерируйте и проверяйте стратегии обхода: библиотека Uz-профилей, "
+                      "оценка на живых сервисах (YouTube, голосовые функции Discord) и активация в один клик."),
+            _help_row("🧩", "DNS-профили",
+                      "Настраивайте провайдеров и защищённые транспорты: DoH, DoT, DoQ, DNSCrypt."),
+            _help_row("📑", "Логи",
+                      "Смотрите живые DNS-запросы и системные логи, добавляйте домены в обход, blocklist или allowlist."),
+            _help_row("⚙", "Настройки",
+                      "Порт DNS, IPv6, кэш, bogus-IP и ручная DNS-фильтрация."),
         ]
-        txt = "<br>".join(f"<div style='margin:4px 0;'>{r}</div>" for r in rows)
-        # Пять строк текста: раньше высота была жёстко 110 px, и видно было три с
+        txt = "".join(rows)
+        # Шесть строк текста: раньше высота была жёстко 110 px, и видно было три с
         # половиной — остальное обрезалось. Разметку оставляем одним QLabel
         # (меньше пересчётов при ресайзе), но высота теперь минимум.
         lab = QLabel(txt)
@@ -239,7 +267,7 @@ class AboutView(QWidget):
         return card
 
     def _build_tech(self) -> QFrame:
-        card, lay = _card("🛠  Техническая информация")
+        card, lay = _card("🔧  Техническая информация")
         self._tech_grid = QGridLayout()
         self._tech_grid.setHorizontalSpacing(14)
         self._tech_grid.setVerticalSpacing(8)
@@ -301,6 +329,11 @@ class AboutView(QWidget):
         b = QPushButton(text)
         b.setCursor(Qt.PointingHandCursor)
         b.setFixedHeight(34)
+        # Кнопка статичная: растёт только до своего текста (sizeHint), а не до
+        # ширины карточки. С политикой по умолчанию (Minimum) кнопка занимала
+        # всю строку — «Проверить обновления» тянулась во всю карточку и
+        # «продлевалась бесконечно» при растягивании окна.
+        b.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         b.setStyleSheet(
             f"QPushButton{{background:{bg};color:{fg or theme.WHITE};"
             "border:none;border-radius:9px;padding:0 14px;font-size:12px;font-weight:600;}"
