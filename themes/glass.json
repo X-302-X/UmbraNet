@@ -1,0 +1,23 @@
+{
+  "label": "Ледяное стекло",
+  "BG": "#dce8f3",
+  "SIDEBAR": "rgba(248, 252, 255, 0.70)",
+  "CARD": "rgba(255, 255, 255, 0.58)",
+  "CARD_TOP": "rgba(255, 255, 255, 0.86)",
+  "CARD_DARK": "rgba(234, 242, 248, 0.62)",
+  "ROW_BG": "rgba(255, 255, 255, 0.50)",
+  "BORDER": "rgba(61, 92, 123, 0.24)",
+  "INPUT_BG": "rgba(255, 255, 255, 0.74)",
+  "ACCENT": "#2f5f96",
+  "ACCENT2": "#286b90",
+  "ACCENT3": "#0e6b78",
+  "GREEN": "#216347",
+  "RED": "#a93647",
+  "YELLOW": "#7b4d00",
+  "ORANGE": "#924207",
+  "PINK": "#96385f",
+  "TEXT": "#1d2c3d",
+  "SUBTEXT": "#405568",
+  "MUTED": "#506579",
+  "WHITE": "#ffffff"
+}

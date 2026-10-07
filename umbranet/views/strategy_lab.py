@@ -71,113 +71,68 @@ def _card(title: str = "") -> tuple[QWidget, QVBoxLayout]:
     lay.setSpacing(12)
     if title:
         t = QLabel(title)
-        t.setStyleSheet(f"color:{theme.WHITE};font-size:15px;font-weight:800;background:transparent;border:none;")
+        t.setStyleSheet(f"color:{theme.TEXT};font-size:15px;font-weight:800;background:transparent;border:none;")
         lay.addWidget(t)
     return f, lay
 
 
-# Технические строки прогресса → понятные человеку подписи для верхней плашки.
-# Порядок важен: проверяем от частного к общему. Полный технический текст при
-# этом не теряется — он по-прежнему уходит в лог окна (там ему и место).
-#
-# Третий элемент — «текст важен человеку»: для таких строк в подпись добавляем
-# суть (что именно за предупреждение), а не только слово «Внимание».
-_STEP_RULES: tuple[tuple[str, str, bool], ...] = (
-    ("не остановился", "Готовим следующий вариант", False),
-    ("зачищены зависшие", "Уборка после проверки", False),
-    ("cleanup", "Уборка после проверки", False),
-    ("остановлен", "Готовим следующий вариант", False),
-    ("предупреждение", "Уборка после проверки", False),
-    ("внимание", "Внимание", True),
-    ("остановлена", "Остановлено", True),
-    ("отменена пользователем", "Отмена", False),
-    ("список истины", "Собираем список сайтов", False),
-    ("подготовлено вариантов", "Подготовка вариантов", False),
-    ("подготовлена", "Подготовка", False),
-    # Без перечисления сервисов: проверка меряет доступность сайтов, а какими
-    # сервисами пользуется человек — не наше дело диктовать в подписи.
-    ("probes youtube/discord", "Проверяем доступность сайтов", False),
-    ("проверка youtube", "Проверяем доступность сайтов", False),
-    ("winws запущен", "Запускаем обход", False),
-    ("запуск winws", "Запускаем обход", False),
-    ("winws.exe сообщает", "winws сообщает", True),
-    ("рабочий вариант не найден", "Итог: подходящего варианта нет", False),
-    ("пропущена", "Пропуск стратегии", True),
-    ("создана стратегия", "Готово", False),
+# Технические строки прогресса → короткий статус простым языком.
+# Полные диагностические сообщения остаются в журнале внизу окна.
+_STEP_RULES: tuple[tuple[str, str], ...] = (
+    ("probes youtube/discord", "Параллельно: YouTube + голосовые функции Discord"),
+    ("проверка youtube", "Проверяем YouTube"),
+    ("voice_readiness", "Проверяем голосовые функции Discord"),
+    ("запуск winws", "Запускаем тестовый обход"),
+    ("winws запущен", "Проверяем работу обхода"),
+    ("winws.exe сообщает", "Диагностируем запуск DPI-движка"),
+    ("зачищены зависшие", "Очищаем временный запуск"),
+    ("cleanup", "Очищаем временный запуск"),
+    ("не остановился", "Завершаем предыдущий запуск"),
+    ("остановлена до запуска", "Проверяем условия запуска"),
+    ("отменена пользователем", "Завершаем отмену"),
+    ("внимание", "Проверяем сетевое окружение"),
+    ("список истины", "Готовим список сайтов для проверки"),
+    ("подготовлено вариантов", "Подготовили варианты для теста"),
+    ("controlled session подготовлена", "Начинаем проверку вариантов"),
+    ("рабочий вариант не найден", "Сравниваем результаты проверки"),
+    ("пропущена", "Пропускаем этот вариант"),
+    ("создана стратегия", "Сохраняем новую стратегию"),
+    ("подготовлена", "Подготовка завершена"),
+    ("остановлен", "Готовим следующий вариант"),
 )
 
-# Служебные префиксы, которые в подписи не нужны: они и так понятны из окна.
-_STEP_PREFIXES = ("ai-генерация:", "проверка uz:", "ai генерация:")
-_STEP_PAYLOAD_MAX = 140
-
-# Плашка шага — фиксированной высоты в одну строку, длинный текст сокращаем.
-# Иначе перенос на вторую строку сдвигал шкалу прогресса вниз-вверх, и она
-# «прыгала» на каждом варианте (у одного варианта короткое имя, у другого длинное).
-_STEP_MAX_CHARS = 140
-
-
-def _step_payload(raw: str, marker: str) -> str:
-    """Суть строки после служебного префикса и слова-маркера.
-
-    «AI-генерация: внимание — рядом работает другая программа с winws.exe: PID 777»
-    → «рядом работает другая программа с winws.exe: PID 777».
-    """
-    body = raw
-    low = body.lower()
-    for prefix in _STEP_PREFIXES:
-        if low.startswith(prefix):
-            body = body[len(prefix):]
-            low = body.lower()
-            break
-    body = body.strip(" ·—-")
-    index = low.find(marker)
-    if index >= 0:
-        body = body[index + len(marker):]
-    body = body.strip(" ·—:-")
-    # Оставляем первое предложение: дальше обычно идут уточнения для лога.
-    for stop in (". ", "! ", "? "):
-        cut = body.find(stop)
-        if cut > 0:
-            body = body[:cut + 1]
-            break
-    body = body.strip()
-    if len(body) > _STEP_PAYLOAD_MAX:
-        body = body[:_STEP_PAYLOAD_MAX - 1].rstrip() + "…"
-    return body
+# Большой статус — короткий, чтобы не прыгала высота над шкалой прогресса.
+_STEP_MAX_CHARS = 72
 
 
 def human_step(text: str) -> str:
-    """Сокращает техническую строку прогресса до понятной подписи.
-
-    Полный текст не выбрасывается: вызывающий код кладёт его в лог окна.
-    Строка «AI-генерация: вариант 3/18 • seed=uz1 • mutation=split • mask=ttl»
-    превращается в «Вариант 3 из 18 · проверка обхода», а предупреждение —
-    в «Внимание: рядом работает другая программа с winws.exe» (со смыслом).
-    """
+    """Переводит техническую строку в короткое описание текущего действия."""
     import re
+
     raw = str(text or "").strip()
     if not raw:
         return ""
     low = raw.lower()
-    prefix = "Стратегия" if low.startswith("проверка uz") else "Вариант"
     pair = re.search(r"(\d+)\s*/\s*(\d+)", raw)
-    where = f"{prefix} {pair.group(1)} из {pair.group(2)}" if pair else ""
     score = re.search(r"score\s+(\d+)", raw, re.IGNORECASE)
-    human = ""
-    payload = ""
-    for marker, label, keep_payload in _STEP_RULES:
+
+    if pair and low.startswith("проверка uz"):
+        index, total = pair.groups()
+        if score:
+            return f"Результат проверки: score {score.group(1)}"
+        return f"Проверяем стратегию {index} из {total}"
+    if pair and "вариант" in low:
+        index, total = pair.groups()
+        if score:
+            return f"Результат варианта: score {score.group(1)}"
+        return f"Проверяем вариант {index} из {total}"
+
+    for marker, label in _STEP_RULES:
         if marker in low:
-            human = label
-            if keep_payload:
-                payload = _step_payload(raw, marker)
-            break
+            return label
     if score:
-        human = f"Готово · лучший результат {score.group(1)}"
-    if payload:
-        human = f"{human}: {payload}" if human else payload
-    if where and human:
-        return f"{where} · {human}"
-    return where or human or raw
+        return f"Оцениваем результат: score {score.group(1)}"
+    return "Выполняем проверку"
 
 
 class AiGenerationProgressDialog(QDialog):
@@ -191,8 +146,8 @@ class AiGenerationProgressDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(window_title)
         self.setModal(False)
-        self.resize(620, 470)
-        self.setMinimumSize(560, 420)
+        self.resize(680, 560)
+        self.setMinimumSize(600, 500)
         self._total = max(1, int(total_variants or 1))
         self._best_score = None
         # Состояние оценки времени: считаем сами по факту, а не берём из плана.
@@ -229,17 +184,15 @@ class AiGenerationProgressDialog(QDialog):
         title_box = QVBoxLayout()
         title_box.setSpacing(3)
         self._title = QLabel(title_text)
-        self._title.setStyleSheet(f"color:{theme.WHITE};font-size:18px;font-weight:900;background:transparent;border:none;")
+        self._title.setStyleSheet(f"color:{theme.TEXT};font-size:18px;font-weight:900;background:transparent;border:none;")
         # ВАЖНО: про «лимит сессии» здесь не пишем. В окне подтверждения уже
         # сказано «от 1 до 10 минут», и второй, другой лимит (180 сек) только
         # путал: пользователь видел два разных обещания по времени. Вместо этого
         # ниже живёт оценка «сколько примерно осталось» — она считается по факту.
         # Параметр time_limit оставлен для совместимости вызовов.
-        # Нейтральный текст без перечисления сервисов: «YouTube и Discord» —
-        # это лишь то, ЧТО МЕРЯЮТ проверки, а не то, для чего человек использует
-        # обход. Для пользователя с другими сервисами такая подпись выглядела
-        # как обещание, что обход только для них. Что именно проверяется,
-        # по-прежнему видно в логе окна (там строки «probes YouTube/Discord…»).
+        # Подзаголовок нейтральный: конкретные сервисы показываем только в
+        # статусе фактического этапа проверки, а не как обещание о назначении
+        # обхода. Полные подробности всегда остаются в журнале ниже.
         self._subtitle = QLabel(
             subtitle_text or "Пожалуйста, потерпите: идёт создание Uz"
         )
@@ -252,21 +205,17 @@ class AiGenerationProgressDialog(QDialog):
         top.addLayout(title_box, 1)
         lay.addLayout(top)
 
-        self._step = QLabel("Подготовка...")
-        # Ровно одна строка и фиксированная высота: если разрешить перенос, то у
-        # длинного шага плашка станет выше и шкала прогресса уедет вниз, а у
-        # короткого вернётся — визуально «шкала прыгает». Длинный текст
-        # сокращаем, полный остаётся в логе ниже.
+        # Главный статус текущего действия — крупный и цветовой:
+        # жёлтый в процессе, зелёный при успехе, красный при ошибке.
+        self._activity_state = "working"
+        self._step = QLabel()
+        self._step.setObjectName("activityStatus")
+        self._step.setAlignment(Qt.AlignCenter)
         self._step.setWordWrap(False)
         self._step.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self._step.setStyleSheet(
-            f"color:{theme.TEXT};background:{_rgba(theme.ACCENT, 14)};"
-            f"border:1px solid {_rgba(theme.ACCENT, 60)};border-radius:12px;"
-            "padding:9px 11px;font-size:12px;font-weight:800;"
-        )
-        step_metrics = QFontMetrics(self._step.font())
-        self._step.setFixedHeight(step_metrics.height() + 20)   # 9px паддинги сверху и снизу
+        self._step.setFixedHeight(66)
         lay.addWidget(self._step)
+        self._set_activity_status("Подготавливаем проверку", "working")
 
         self._progress = QProgressBar()
         self._progress.setRange(0, self._total)
@@ -295,14 +244,44 @@ class AiGenerationProgressDialog(QDialog):
         self._best.setStyleSheet(f"color:{theme.SUBTEXT};font-size:12px;background:transparent;border:none;")
         lay.addWidget(self._best)
 
+        # Журнал намеренно в нижней части окна: сначала видны действие,
+        # прогресс и ETA; технические подробности можно раскрыть/скопировать ниже.
+        log_header = QHBoxLayout()
+        log_header.setSpacing(8)
+        self._log_title = QLabel("Подробный журнал")
+        self._log_title.setStyleSheet(
+            f"color:{theme.SUBTEXT};font-size:11px;font-weight:800;background:transparent;border:none;"
+        )
+        log_header.addWidget(self._log_title)
+        log_header.addStretch(1)
+        self._btn_copy_logs = QPushButton("Копировать логи")
+        self._btn_copy_logs.setCursor(Qt.PointingHandCursor)
+        self._btn_copy_logs.setFixedHeight(28)
+        self._btn_copy_logs.setEnabled(False)
+        self._btn_copy_logs.setStyleSheet(
+            f"QPushButton{{background:{_rgba(theme.ACCENT, 12)};color:{theme.TEXT};"
+            f"border:1px solid {_rgba(theme.ACCENT, 70)};border-radius:9px;padding:0 11px;font-size:11px;font-weight:800;}}"
+            f"QPushButton:hover{{background:{_rgba(theme.ACCENT, 24)};border-color:{theme.ACCENT};}}"
+            f"QPushButton:disabled{{color:{theme.MUTED};background:{_rgba(theme.WHITE, 4)};border-color:{theme.BORDER};}}"
+        )
+        self._btn_copy_logs.clicked.connect(self._copy_logs)
+        log_header.addWidget(self._btn_copy_logs)
+        lay.addLayout(log_header)
+
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
+        self._log.setMinimumHeight(96)
         self._log.setStyleSheet(
             f"QPlainTextEdit{{background:{theme.INPUT_BG};color:{theme.TEXT};"
             f"border:1px solid {theme.BORDER};border-radius:12px;padding:10px;"
             "font-family:Consolas;font-size:11px;}" + theme.scrollbar_qss()
         )
         lay.addWidget(self._log, 1)
+
+        self._copy_feedback_timer = QTimer(self)
+        self._copy_feedback_timer.setSingleShot(True)
+        self._copy_feedback_timer.setInterval(1400)
+        self._copy_feedback_timer.timeout.connect(self._restore_copy_logs_button)
         root.addWidget(card, 1)
 
         buttons = QHBoxLayout()
@@ -313,7 +292,7 @@ class AiGenerationProgressDialog(QDialog):
         self._btn_cancel.setStyleSheet(
             f"QPushButton{{background:{_rgba(theme.RED, 18)};color:{theme.RED};"
             f"border:1px solid {_rgba(theme.RED, 90)};border-radius:11px;padding:0 18px;font-weight:800;}}"
-            f"QPushButton:hover{{background:{_rgba(theme.RED, 32)};color:{theme.WHITE};}}"
+            f"QPushButton:hover{{background:{_rgba(theme.RED, 32)};color:{theme.TEXT};}}"
             "QPushButton:disabled{color:#777;border-color:#444;background:rgba(255,255,255,0.05);}"
         )
         self._btn_cancel.clicked.connect(self._request_cancel)
@@ -324,17 +303,46 @@ class AiGenerationProgressDialog(QDialog):
         self._btn_close.setStyleSheet(
             f"QPushButton{{background:{_rgba(theme.WHITE, 8)};color:{theme.TEXT};"
             f"border:1px solid {theme.BORDER};border-radius:11px;padding:0 18px;font-weight:700;}}"
-            f"QPushButton:hover{{border-color:{theme.ACCENT};color:{theme.WHITE};}}"
+            f"QPushButton:hover{{border-color:{theme.ACCENT};color:{theme.TEXT};}}"
         )
         self._btn_close.clicked.connect(self.hide)
         buttons.addWidget(self._btn_close)
         root.addLayout(buttons)
 
+    def _set_activity_status(self, text: str, state: str = "working") -> None:
+        """Обновляет крупный статус и его цвет (running / success / error)."""
+        palette = {
+            "working": theme.YELLOW,
+            "success": theme.GREEN,
+            "error": theme.RED,
+            "cancelled": theme.YELLOW,
+        }
+        color = palette.get(state, theme.YELLOW)
+        self._activity_state = state
+        self._step_full_text = str(text or "")
+        self._step.setStyleSheet(
+            f"QLabel#activityStatus{{color:{color};background:{_rgba(color, 15)};"
+            f"border:1px solid {_rgba(color, 88)};border-radius:14px;"
+            "padding:9px 14px;font-size:18px;font-weight:900;}"
+        )
+        self._apply_step_text()
+
+    def _copy_logs(self) -> None:
+        text = self._log.toPlainText()
+        if not text:
+            return
+        QGuiApplication.clipboard().setText(text)
+        self._btn_copy_logs.setText("Скопировано")
+        self._copy_feedback_timer.start()
+
+    def _restore_copy_logs_button(self) -> None:
+        self._btn_copy_logs.setText("Копировать логи")
+
     def _request_cancel(self):
         self._btn_cancel.setEnabled(False)
         self._btn_cancel.setText("Отмена...")
-        self._step.setText("Запрошена отмена. Останавливаем WinWS и завершаем текущую проверку...")
         self.append("AI-генерация: пользователь запросил отмену")
+        self._set_activity_status("Отменяем и останавливаем текущую проверку", "cancelled")
         self.cancelRequested.emit()
 
     # ── Оценка времени до конца ──────────────────────────────────────────────
@@ -430,9 +438,8 @@ class AiGenerationProgressDialog(QDialog):
         text = str(text or "")
         if not text:
             return
-        # В плашке — короткая человеческая подпись, полный текст остаётся в логе.
-        self._step_full_text = human_step(text)
-        self._apply_step_text()
+        # Большой статус — простой и жёлтый во время работы; полный текст ниже в логе.
+        self._set_activity_status(human_step(text), "working")
         m = re.search(r"(?:вариант(?:а)?|стратегия)\s+(\d+)\s*/\s*(\d+)", text, re.IGNORECASE)
         if m:
             cur = int(m.group(1))
@@ -453,6 +460,7 @@ class AiGenerationProgressDialog(QDialog):
                 self._mark_item_done(int(m.group(1)))
         self._update_eta()
         self._log.appendPlainText(text)
+        self._btn_copy_logs.setEnabled(True)
         self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
 
     def finish(self, result: dict):
@@ -460,13 +468,30 @@ class AiGenerationProgressDialog(QDialog):
         best = result.get("best") if isinstance(result.get("best"), dict) else {}
         best_score = best.get("score", self._best_score if self._best_score is not None else "—")
         report_lines = [str(x) for x in (result.get("report_lines") or []) if str(x).strip()]
+        final_status = ""
+        final_state = "working"
+        final_eta = "Время выполнения: завершено"
+
         if result.get("stage") == "strategy_check":
-            self._title.setText("Проверка стратегий завершена" if ok else "Проверка стратегий остановлена")
+            if ok:
+                self._title.setText("Проверка стратегий завершена")
+                final_status = "Готово — проверка завершена"
+                final_state = "success"
+            elif result.get("cancelled"):
+                self._title.setText("Проверка отменена")
+                final_status = "Проверка отменена пользователем"
+                final_state = "cancelled"
+                final_eta = "Время выполнения: остановлено"
+            else:
+                self._title.setText("Не получилось проверить стратегии")
+                final_status = "Не получилось — проверка завершилась с ошибкой"
+                final_state = "error"
+                final_eta = "Время выполнения: без результата"
             self._subtitle.setText("Результаты проверки всех Uz-стратегий")
             self._subtitle_full = self._subtitle.text()
-            self._progress.setValue(self._total)
-            self._progress.setFormat(f"{self._total} / {self._total}")
-            best = result.get("best") if isinstance(result.get("best"), dict) else {}
+            if ok:
+                self._progress.setValue(self._total)
+                self._progress.setFormat(f"{self._total} / {self._total}")
             if best:
                 self._best.setText(f"Лучший результат: {best.get('strategy_id', '—')} • score {best.get('score', 0)}")
             if result.get("error"):
@@ -475,7 +500,6 @@ class AiGenerationProgressDialog(QDialog):
                 self.append("— Итоговый отчёт —")
                 for line in report_lines:
                     self.append(line)
-            self._step_full_text = "Готово. Проверьте отчёт и нажмите «Закрыть»."
         elif ok:
             sid = str(result.get("created_id", ""))
             self._title.setText("AI-генерация завершена")
@@ -489,13 +513,37 @@ class AiGenerationProgressDialog(QDialog):
                 self.append("— Итоговый отчёт —")
                 for line in report_lines:
                     self.append(line)
-            self._step_full_text = "Всё готово. Проверьте итоговый отчёт и нажмите «Закрыть»."
+            final_status = f"Готово — стратегия {sid or 'Uz'} создана"
+            final_state = "success"
         else:
             reason = str(result.get("reason_text") or result.get("error") or result.get("reason") or "рабочая стратегия не найдена")
+            preflight = result.get("preflight") if isinstance(result.get("preflight"), dict) else {}
             if result.get("cancelled"):
                 self._title.setText("AI-генерация отменена")
+                final_status = "Отменено пользователем — Uz не создана"
+                final_state = "cancelled"
+                final_eta = "Время выполнения: остановлено"
+            elif preflight.get("abort"):
+                self._title.setText("Генерация остановлена до запуска")
+                lower_reason = reason.lower()
+                if "порта 53" in lower_reason:
+                    final_status = "Не получилось — занят локальный порт 53"
+                elif "windivert" in lower_reason:
+                    final_status = "Не получилось — конфликт WinDivert"
+                else:
+                    final_status = "Не получилось начать генерацию"
+                final_state = "error"
+                final_eta = "Время выполнения: генерация не запущена"
+            elif result.get("reason") in ("below_threshold", "required_probes_failed", "no_variants"):
+                self._title.setText("Подходящая стратегия не найдена")
+                final_status = "Не получилось — варианты не прошли проверки"
+                final_state = "error"
+                final_eta = "Время выполнения: стратегия не создана"
             else:
-                self._title.setText("AI-генерация завершена")
+                self._title.setText("AI-генерация завершилась ошибкой")
+                final_status = "Не получилось — Uz не создана"
+                final_state = "error"
+                final_eta = "Время выполнения: стратегия не создана"
             self._subtitle.setText("Uz не создана")
             self._subtitle_full = self._subtitle.text()
             self._best.setText(f"Лучший результат: score {best_score}")
@@ -504,18 +552,14 @@ class AiGenerationProgressDialog(QDialog):
                 self.append("— Итоговый отчёт —")
                 for line in report_lines:
                     self.append(line)
-            self._step_full_text = "Готово. Проверьте итоговый отчёт и нажмите «Закрыть»."
+
         self._finished = True
-        # ВАЖНО (баг «ничего не отображается», 2026-10-06): append() пишет
-        # _step_full_text из каждой строки лога и перечитывает _subtitle_full.
-        # Итоговые тексты выставлены ВЫШЕ как _step_full_text/_subtitle_full —
-        # финальная элизия отрисует их, а не последнюю строку отчёта.
-        self._apply_step_text()
+        self._set_activity_status(final_status, final_state)
         try:
             self._eta_timer.stop()
         except Exception:
             pass
-        self._eta.setText("Осталось примерно: всё готово")
+        self._eta.setText(final_eta)
         self._btn_close.setText("Закрыть")
         if hasattr(self, "_btn_cancel"):
             self._btn_cancel.setEnabled(False)
@@ -528,8 +572,7 @@ class AiGenerationProgressDialog(QDialog):
         self.show()
         self.raise_()
         self.activateWindow()
-        # Отчёт теперь содержит важную диагностику; не закрываем окно автоматически,
-        # чтобы пользователь успел прочитать/скопировать детали.
+        # Отчёт остаётся открытым; при необходимости его можно быстро скопировать.
 
 
 class StrategyLabView(QWidget):
@@ -569,7 +612,7 @@ class StrategyLabView(QWidget):
         title_box = QVBoxLayout()
         title_box.setSpacing(3)
         title = QLabel("AI-стратегии")
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:24px;font-weight:900;background:transparent;border:none;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:24px;font-weight:900;background:transparent;border:none;")
         subtitle = QLabel("Библиотека Uz-профилей для DPI/Combo: выбери, настрой и активируй")
         # Перенос и разрешение сжиматься: без этого длинный текст задавал
         # минимальную ширину вкладки (~400 px только на одну эту строку), а
@@ -644,7 +687,7 @@ class StrategyLabView(QWidget):
         accent.setFixedSize(4, 28)
         accent.setStyleSheet(f"background:{theme.grad(theme.ACCENT, theme.ACCENT2, horizontal=False)};border-radius:2px;")
         list_title = QLabel("Библиотека Uz")
-        list_title.setStyleSheet(f"color:{theme.WHITE};font-size:16px;font-weight:900;background:transparent;border:none;")
+        list_title.setStyleSheet(f"color:{theme.TEXT};font-size:16px;font-weight:900;background:transparent;border:none;")
         self._list_summary = QLabel("—")
         self._list_summary.setStyleSheet(f"color:{theme.MUTED};font-size:12px;background:transparent;border:none;")
         self._selected_label = QLabel("Выбрано: —")
@@ -743,7 +786,7 @@ class StrategyLabView(QWidget):
         b.setStyleSheet(
             f"QPushButton{{background:{_rgba(theme.WHITE, 10)};color:{theme.TEXT};"
             f"border:1px solid {theme.BORDER};border-radius:12px;padding:0 14px;font-weight:700;}}"
-            f"QPushButton:hover{{background:{_rgba(theme.ACCENT, 22)};border-color:{_rgba(theme.ACCENT, 120)};color:{theme.WHITE};}}"
+            f"QPushButton:hover{{background:{_rgba(theme.ACCENT, 22)};border-color:{_rgba(theme.ACCENT, 120)};color:{theme.TEXT};}}"
             f"QPushButton:disabled{{color:{theme.MUTED};background:{_rgba(theme.WHITE, 5)};border-color:{theme.BORDER};}}"
         )
         b.clicked.connect(slot)
@@ -959,11 +1002,11 @@ class StrategyLabView(QWidget):
                     theme.ACCENT if args_count else theme.YELLOW
                 )
                 badge.setStyleSheet(
-                    f"background:{badge_bg};color:#090913;border-radius:14px;"
+                    f"background:{badge_bg};color:{theme.text_on_color(badge_bg)};border-radius:14px;"
                     "font-size:13px;font-weight:900;letter-spacing:0.4px;"
                 )
             if name:
-                name.setStyleSheet(f"color:{theme.WHITE};font-size:14px;font-weight:800;background:transparent;border:none;")
+                name.setStyleSheet(f"color:{theme.TEXT};font-size:14px;font-weight:800;background:transparent;border:none;")
             if id_chip:
                 id_chip.setStyleSheet(
                     f"color:{theme.MUTED};background:{_rgba(theme.WHITE, 9)};border:1px solid {theme.BORDER};"
@@ -1300,7 +1343,7 @@ class StrategyLabView(QWidget):
         title_box = QVBoxLayout()
         title_box.setSpacing(3)
         title = QLabel("Запустить AI-генерацию Uz?")
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:18px;font-weight:900;background:transparent;border:none;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:18px;font-weight:900;background:transparent;border:none;")
         subtitle = QLabel("UmbraNet подготовит controlled session для подбора стратегии.")
         subtitle.setStyleSheet(f"color:{theme.SUBTEXT};font-size:12px;font-weight:600;background:transparent;border:none;")
         title_box.addWidget(title)
@@ -1335,7 +1378,7 @@ class StrategyLabView(QWidget):
         no.setStyleSheet(
             f"QPushButton{{background:{_rgba(theme.WHITE, 8)};color:{theme.TEXT};"
             f"border:1px solid {theme.BORDER};border-radius:11px;padding:0 18px;font-weight:700;}}"
-            f"QPushButton:hover{{border-color:{theme.ACCENT};color:{theme.WHITE};}}"
+            f"QPushButton:hover{{border-color:{theme.ACCENT};color:{theme.TEXT};}}"
         )
         yes = QPushButton("Да, начать")
         yes.setCursor(Qt.PointingHandCursor)
@@ -1538,7 +1581,7 @@ class StrategyLabView(QWidget):
         icon.setStyleSheet(f"color:{theme.ACCENT2};font-size:34px;background:transparent;border:none;")
         title = QLabel("Стратегий пока нет")
         title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:16px;font-weight:900;background:transparent;border:none;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:16px;font-weight:900;background:transparent;border:none;")
         text = QLabel("Нажмите «Сгенерировать Uz», чтобы подготовить AI-подбор стратегии.")
         text.setAlignment(Qt.AlignCenter)
         text.setWordWrap(True)

@@ -2,11 +2,11 @@
 UmbraNet - «телеграмизация» списка сервисов (вариант Б, PySide6).
 
 Техника Telegram Desktop: ВЕСЬ список сервисов (избранное + категории +
-строки со звёздами и тумблерами + ползунок прокрутки) рисует ОДИН
+строки со звёздами и чекбоксами + ползунок прокрутки) рисует ОДИН
 paintEvent одного QWidget. Ни одного дочернего виджета на строку:
-фон hover, звёзды, эмодзи, имена, чип DNS/DPI, тумблеры и scrollbar рисуются кистью.
+фон hover, звёзды, эмодзи, имена, чип DNS/DPI, чекбоксы и scrollbar рисуются кистью.
 В DNS-only нельзя включить DPI-сервисы (и наоборот); Combo — всё можно.
-На заблокированном тумблере курсор — 🚫 (без белого фона), плюс подсказка сменить режим.
+На заблокированном чекбоксе курсор — 🚫 (без белого фона), плюс подсказка сменить режим.
 
 Зачем: раньше каждая строка была QFrame'ом с QPushButton + 2 QLabel +
 Toggle (~150 виджетов в области прокрутки) — при ресайзе окна Qt
@@ -17,7 +17,7 @@ Toggle (~150 виджетов в области прокрутки) — при �
 Взаимодействие с RoutingView — через три сигнала:
   serviceToggled(svc, on) / favoriteToggled(svc) / categoryToggled(cat, on)
 Состояния прилетают обратно через set_service_states() / set_favorites()
-(refresh() движка) — тумблеры анимируются только при реальном изменении.
+(refresh() движка); чекбоксы сервисов и категорий статичные.
 
 Автор: X-302-X / UmbraNet_Official
 Лицензия: GPLv3
@@ -42,15 +42,16 @@ from PySide6.QtWidgets import QWidget
 from umbranet import theme
 
 # ── геометрия ────────────────────────────────────────────────────────────────
-HDR_H = 48          # заголовок секции (линия + название + тумблер)
+HDR_H = 48          # заголовок секции (линия + название + чекбокс категории)
 ROW_H = 28          # высота строки сервиса (22 контент + поля 3+3)
 ROW_STRIDE = 32     # шаг строк (ROW_H + spacing 4)
 SEC_GAP = 12        # отступ между секциями
-TOGGLE_W, TOGGLE_H = 46, 26
+TOGGLE_W, TOGGLE_H = 46, 26    # hitbox сервисного чекбокса
+CATEGORY_CONTROL_W = 78         # подпись «ВСЕ» + отдельный чекбокс категории
 STAR_X, STAR_W = 8, 22          # зона звезды
 EMOJI_X, EMOJI_W = 37, 28       # зона эмодзи строки
 NAME_X = 72                     # начало имени
-TG_RIGHT = 6                    # правый отступ тумблера строки
+TG_RIGHT = 6                    # правый отступ сервисного чекбокса
 CHIP_W, CHIP_H = 34, 16         # чип «DNS» / «DPI»
 NAME_MARK_GAP = 6               # зазор имя ↔ чип (чип сразу после названия)
 SB_PAD, SB_W = 10, 6            # зона и толщина ползунка прокрутки
@@ -97,12 +98,11 @@ class ServiceCanvas(QWidget):
         self._dev_mode = False                  # настройки: снять блокировку DNS/DPI
         self._favorites: list[str] = []
         self._on: dict[str, bool] = {}          # svc -> включён
-        self._tpos: dict[str, float] = {}       # ключ тумблера -> позиция 0..1 (0.5 partial)
         self._search = ""
         self._hover = -1                        # индекс строки под курсором
         self._hover_star = False
         self._offset = 0
-        self._ban_cur: QCursor | None = None    # 🚫 на прозрачном фоне, только над тумблером
+        self._ban_cur: QCursor | None = None    # 🚫 на прозрачном фоне, только над чекбоксом
 
         # плоская модель + префикс-суммы
         self._rows: list[dict] = []
@@ -147,16 +147,16 @@ class ServiceCanvas(QWidget):
         self._rebuild()
 
     def set_service_states(self, states: dict[str, bool]):
-        """Обновить состояния тумблеров; анимируются только изменившиеся."""
+        """Обновить отмеченные сервисы; отдельные строки — без анимации."""
+        changed = False
         for svc, on in states.items():
-            self._on[svc] = bool(on)
-        # тумблеры строк
-        for i, r in enumerate(self._rows):
-            if r["kind"] == "row":
-                self._animate_toggle(r["svc"], 1.0 if self._on.get(r["svc"]) else 0.0)
-            elif r["kind"] == "header" and r.get("cat"):
-                self._animate_toggle("cat:" + r["cat"], self._cat_pos(r["cat"]))
-        self.update()
+            on = bool(on)
+            if self._on.get(svc, False) != on:
+                self._on[svc] = on
+                changed = True
+        if changed:
+            # Qt объединит повторные update() в один paintEvent.
+            self.update()
 
     def apply_search(self, text: str):
         q = (text or "").strip().lower()
@@ -200,7 +200,7 @@ class ServiceCanvas(QWidget):
         return b != "dns"
 
     def _elided_name(self, svc: str, content_w: int) -> str:
-        """Имя с обрезкой: справа оставляем место под чип и тумблер."""
+        """Имя с обрезкой: справа оставляем место под чип и чекбокс."""
         toggle_x = content_w - TOGGLE_W - TG_RIGHT
         cluster = NAME_MARK_GAP + CHIP_W
         avail = max(0, toggle_x - NAME_X - cluster - 8)
@@ -210,12 +210,12 @@ class ServiceCanvas(QWidget):
         return name
 
     def _chip_x(self, svc: str, content_w: int) -> int:
-        """x чипа — сразу после названия, не у тумблера."""
+        """x чипа — сразу после названия, не у чекбокса."""
         name_w = self._fm_name.horizontalAdvance(self._elided_name(svc, content_w))
         return NAME_X + name_w + NAME_MARK_GAP
 
     def _locked_tip(self, svc: str | None = None) -> str:
-        """Почему тумблер серый — человеку нужно сменить режим."""
+        """Почему чекбокс недоступен — человеку нужно сменить режим."""
         need = "DPI" if self._app_mode == "dns_only" else "DNS"
         other = "DPI или Combo" if self._app_mode == "dns_only" else "DNS или Combo"
         if svc:
@@ -316,7 +316,7 @@ class ServiceCanvas(QWidget):
         return []
 
     def _cat_pos(self, cat: str) -> float:
-        """Позиция тумблера категории: 1 вкл / 0.5 partial / 0 выкл."""
+        """Общий статус категории: 1 всё / 0.5 часть / 0 ничего отмечено."""
         states = [self._on.get(s, False) for s in self._cat_svcs(cat)]
         if states and all(states):
             return 1.0
@@ -427,7 +427,7 @@ class ServiceCanvas(QWidget):
     # ── мышь ──
 
     def _row_zone(self, i: int, x: float) -> str:
-        """star / chip / help / toggle / body для строки; для заголовка — toggle/body."""
+        """star / chip / checkbox / body для строки; в заголовке — checkbox категории."""
         r = self._rows[i]
         if r["kind"] == "row":
             if x < STAR_X + STAR_W + 6:
@@ -440,8 +440,8 @@ class ServiceCanvas(QWidget):
             if chip_x <= x < chip_x + CHIP_W + 3:
                 return "chip"
             return "body"
-        # заголовок: тумблер справа
-        if self._content_w() - x < TOGGLE_W + 10:
+        # заголовок категории: подпись «ВСЕ» и общий чекбокс справа.
+        if r.get("cat") and x >= self._content_w() - CATEGORY_CONTROL_W - 10:
             return "toggle"
         return "body"
 
@@ -473,15 +473,17 @@ class ServiceCanvas(QWidget):
                 if new and self._locked(r["svc"]):
                     return
                 self._on[r["svc"]] = new
-                self._animate_toggle(r["svc"], 1.0 if new else 0.0)
+                self.update(self._service_checkbox_rect(r["svc"]))
                 self.serviceToggled.emit(r["svc"], new)
         elif r["kind"] == "header":
             if zone == "toggle" and r.get("cat"):
-                pos_cat = self._cat_pos(r["cat"])
+                cat = r["cat"]
+                pos_cat = self._cat_pos(cat)
                 new = pos_cat != 1.0     # partial/off -> включить всё; on -> выключить
-                if new and not any(not self._locked(s) for s in self._cat_svcs(r["cat"])):
+                services = self._cat_svcs(cat)
+                if new and not any(not self._locked(svc) for svc in services):
                     return
-                self.categoryToggled.emit(r["cat"], new)
+                self.categoryToggled.emit(cat, new)
 
     def mouseMoveEvent(self, event):
         pos = event.position()
@@ -505,19 +507,26 @@ class ServiceCanvas(QWidget):
                 self.update(self._row_rect(old))
             if i >= 0:
                 self.update(self._row_rect(i))
-        # 🚫 и подсказка — только над самим тумблером, не над всей строкой
+        # 🚫 и подсказка — только над самим чекбоксом, не над всей строкой
         locked_toggle = False
         locked_tip = ""
+        action_tip = ""
         if i >= 0 and zone == "toggle":
             r = self._rows[i]
             if r["kind"] == "row" and self._locked(r["svc"]) and not self._on.get(r["svc"]):
                 locked_toggle = True
                 locked_tip = self._locked_tip(r["svc"])
-            elif (r["kind"] == "header" and r.get("cat")
-                  and self._cat_pos(r["cat"]) != 1.0
-                  and not any(not self._locked(s) for s in self._cat_svcs(r["cat"]))):
-                locked_toggle = True
-                locked_tip = self._locked_tip()
+            elif r["kind"] == "header" and r.get("cat"):
+                cat = r["cat"]
+                cat_pos = self._cat_pos(cat)
+                has_unlocked = any(not self._locked(s) for s in self._cat_svcs(cat))
+                if cat_pos != 1.0 and not has_unlocked:
+                    locked_toggle = True
+                    locked_tip = self._locked_tip()
+                elif cat_pos == 1.0:
+                    action_tip = "Снять выбор со всех сервисов категории"
+                else:
+                    action_tip = "Отметить все доступные сервисы категории"
         if star:
             self.setCursor(Qt.PointingHandCursor)
             r = self._rows[i]
@@ -533,7 +542,7 @@ class ServiceCanvas(QWidget):
                 self._sb_op > 0.05 and pos.x() >= self.width() - SB_PAD - 2
             )
             self.setCursor(Qt.PointingHandCursor if hand else Qt.ArrowCursor)
-            self.setToolTip("")
+            self.setToolTip(action_tip)
 
     def mouseReleaseEvent(self, event):
         if self._sb_drag:
@@ -548,37 +557,81 @@ class ServiceCanvas(QWidget):
         self.setCursor(Qt.ArrowCursor)
         self.setToolTip("")
 
-    # ── анимация тумблеров ──
+    # ── service + category checkboxes ──
 
-    def _animate_toggle(self, key: str, target: float):
-        cur = self._tpos.get(key)
-        if cur is None or abs(cur - target) < 0.01:
-            self._tpos[key] = target
-            return
-        anim = QVariantAnimation(self)
-        anim.setDuration(140)
-        anim.setStartValue(cur)
-        anim.setEndValue(target)
-        anim.setEasingCurve(QEasingCurve.InOutCubic)
+    def _paint_service_checkbox(self, p: QPainter, x: int, y: int,
+                                checked: bool, disabled: bool = False) -> None:
+        """Рисует заметный квадрат с галочкой; у сервисов нет сдвигаемой ручки."""
+        size = 20
+        rect = QRect(x + (TOGGLE_W - size) // 2,
+                     y + (TOGGLE_H - size) // 2, size, size)
+        if checked:
+            fill = qc(theme.ACCENT)
+            border = fill
+            mark = qc(theme.text_on_color(theme.ACCENT))
+        else:
+            fill = qc(theme.INPUT_BG)
+            border = qc(theme.MUTED if disabled else theme.SUBTEXT)
+            mark = None
 
-        def tick(v, k=key):
-            self._tpos[k] = float(v)
-            self.update(self._toggle_rect(k))
+        p.setPen(QPen(border, 1.5))
+        p.setBrush(fill)
+        p.drawRoundedRect(rect, 4, 4)
+        if mark is not None:
+            p.setPen(QPen(mark, 2))
+            p.drawLine(rect.left() + 4, rect.top() + 10,
+                       rect.left() + 8, rect.top() + 14)
+            p.drawLine(rect.left() + 8, rect.top() + 14,
+                       rect.left() + 16, rect.top() + 5)
 
-        anim.valueChanged.connect(tick)
-        anim.start(QVariantAnimation.DeleteWhenStopped)
-        self._tpos[key] = target   # логическое состояние сразу; рисуем по анимации
+    def _paint_category_checkbox(self, p: QPainter, x: int, y: int,
+                                 checked: bool, partial: bool = False,
+                                 disabled: bool = False) -> None:
+        """Чекбокс всей категории: чуть крупнее, в выделенной подписи «ВСЕ»."""
+        group = QRect(x, y, CATEGORY_CONTROL_W, 30)
+        accent = QColor(qc(theme.ACCENT))
+        accent.setAlpha(18 if not disabled else 8)
+        group_border = QColor(qc(theme.ACCENT))
+        group_border.setAlpha(76 if not disabled else 40)
+        p.setPen(QPen(group_border, 1))
+        p.setBrush(accent)
+        p.drawRoundedRect(group, 8, 8)
 
-    def _toggle_rect(self, key: str) -> QRect:
-        """Прямоугольник тумблера (для региональной перерисовки)."""
+        p.setFont(self._f_chip)
+        p.setPen(QPen(qc(theme.MUTED if disabled else theme.ACCENT)))
+        p.drawText(QRect(x + 3, y, 34, 30), Qt.AlignCenter, "ВСЕ")
+
+        size = 22
+        box = QRect(x + 43, y + (30 - size) // 2, size, size)
+        if checked or partial:
+            fill = qc(theme.ACCENT)
+            border = fill
+            mark = qc(theme.text_on_color(theme.ACCENT))
+        else:
+            fill = qc(theme.INPUT_BG)
+            border = qc(theme.MUTED if disabled else theme.ACCENT)
+            mark = None
+        p.setPen(QPen(border, 1.6))
+        p.setBrush(fill)
+        p.drawRoundedRect(box, 4, 4)
+        if checked and mark is not None:
+            p.setPen(QPen(mark, 2))
+            p.drawLine(box.left() + 4, box.top() + 11,
+                       box.left() + 9, box.top() + 16)
+            p.drawLine(box.left() + 9, box.top() + 16,
+                       box.left() + 18, box.top() + 6)
+        elif partial and mark is not None:
+            p.setPen(QPen(mark, 2))
+            p.drawLine(box.left() + 5, box.center().y(),
+                       box.right() - 5, box.center().y())
+
+    def _service_checkbox_rect(self, svc: str) -> QRect:
+        """Область перерисовки одного сервисного чекбокса."""
         for i, r in enumerate(self._rows):
-            rr = self._row_rect(i)
-            if r["kind"] == "row" and r["svc"] == key:
+            if r["kind"] == "row" and r["svc"] == svc:
+                rr = self._row_rect(i)
                 x = self._content_w() - TOGGLE_W - TG_RIGHT
                 return QRect(x, rr.y() + (ROW_H - TOGGLE_H) // 2, TOGGLE_W, TOGGLE_H)
-            if r["kind"] == "header" and key == "cat:" + str(r.get("cat")):
-                x = self._content_w() - TOGGLE_W - 10
-                return QRect(x, rr.y() + (HDR_H - TOGGLE_H) // 2, TOGGLE_W, TOGGLE_H)
         return QRect(0, 0, self.width(), self.height())
 
     # ══════════════════ отрисовка ═════════════════════════════════════════
@@ -630,14 +683,24 @@ class ServiceCanvas(QWidget):
         p.setFont(self._f_hdr_emoji)
         p.drawText(QRect(4, rect.y() + 16, 32, 22), Qt.AlignCenter, emoji)
         p.setFont(self._f_title)
-        p.drawText(QRect(44, rect.y() + 16, rect.width() - 44 - 130, 22),
+        title_w = max(1, rect.width() - 44 - CATEGORY_CONTROL_W - 10)
+        p.drawText(QRect(44, rect.y() + 16, title_w, 22),
                    Qt.AlignVCenter | Qt.AlignLeft, title.upper())
 
-        # тумблер категории (в «Избранном» его нет)
+        # Чуть выделенный групповой чекбокс: подпись «ВСЕ» + общий статус.
         if r.get("cat"):
-            pos = self._tpos.get("cat:" + r["cat"], self._cat_pos(r["cat"]))
-            x = rect.width() - TOGGLE_W - 10
-            self._paint_toggle(p, x, rect.y() + (HDR_H - TOGGLE_H) // 2, pos)
+            cat = r["cat"]
+            pos = self._cat_pos(cat)
+            services = self._cat_svcs(cat)
+            has_unlocked = any(not self._locked(svc) for svc in services)
+            disabled = pos != 1.0 and not has_unlocked
+            x = rect.width() - CATEGORY_CONTROL_W - 10
+            self._paint_category_checkbox(
+                p, x, rect.y() + (HDR_H - 30) // 2,
+                checked=pos == 1.0,
+                partial=0.0 < pos < 1.0,
+                disabled=disabled,
+            )
 
     def _paint_row(self, p: QPainter, r: dict, rect: QRect, hovered: bool = False):
         svc = r["svc"]
@@ -645,7 +708,7 @@ class ServiceCanvas(QWidget):
 
         if hovered:
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(255, 255, 255, 12))   # rgba(255,255,255,0.045)
+            p.setBrush(qc(theme.BORDER))
             p.drawRoundedRect(QRect(0, rect.y(), rect.width(), ROW_H), 8, 8)
 
         # звезда
@@ -663,7 +726,7 @@ class ServiceCanvas(QWidget):
         p.drawText(QRect(EMOJI_X, rect.y(), EMOJI_W, ROW_H), Qt.AlignCenter,
                    r.get("emoji") or self._svc_emoji(svc))
 
-        # имя + сразу за ним чип DNS/DPI (не столбиком у тумблера)
+        # имя + сразу за ним чип DNS/DPI (не столбиком у чекбокса)
         name = self._elided_name(svc, rect.width())
         name_w = self._fm_name.horizontalAdvance(name)
         p.setFont(self._f_name)
@@ -672,12 +735,13 @@ class ServiceCanvas(QWidget):
                    Qt.AlignVCenter | Qt.AlignLeft, name)
         self._paint_bypass_chip(p, svc, self._chip_x(svc, rect.width()), rect.y())
 
-        # тумблер (у заблокированных «выкл» рисуем серым)
+        # Чекбокс рядом с сервисом; заблокированный — приглушённый и некликабельный.
         on = bool(self._on.get(svc))
-        pos = self._tpos.get(svc, 1.0 if on else 0.0)
         x = rect.width() - TOGGLE_W - TG_RIGHT
-        self._paint_toggle(p, x, rect.y() + (ROW_H - TOGGLE_H) // 2, pos,
-                           disabled=self._locked(svc) and not on)
+        self._paint_service_checkbox(
+            p, x, rect.y() + (ROW_H - TOGGLE_H) // 2,
+            checked=on, disabled=self._locked(svc) and not on,
+        )
 
     def _paint_bypass_chip(self, p: QPainter, svc: str, x: int, row_y: int):
         bypass = self._bypass_of(svc)
@@ -692,31 +756,6 @@ class ServiceCanvas(QWidget):
         p.setPen(QPen(color))
         p.drawText(QRect(x, y, CHIP_W, CHIP_H), Qt.AlignCenter, label)
 
-    def _paint_toggle(self, p: QPainter, x: int, y: int, pos: float,
-                      disabled: bool = False):
-        """Пилюля как umbranet.widgets.Toggle: #4b4d75 -> GREEN, partial ORANGE."""
-        if disabled:
-            pos = 0.0
-            track = QColor("#3a3b55")
-        elif abs(pos - 0.5) < 0.01:
-            track = qc(theme.ORANGE)
-        else:
-            off = QColor("#4b4d75")
-            on = qc(theme.GREEN)
-            t = pos
-            track = QColor(
-                int(off.red() + (on.red() - off.red()) * t),
-                int(off.green() + (on.green() - off.green()) * t),
-                int(off.blue() + (on.blue() - off.blue()) * t),
-            )
-        p.setPen(Qt.NoPen)
-        p.setBrush(track)
-        p.drawRoundedRect(QRect(x, y, TOGGLE_W, TOGGLE_H), 13, 13)
-        d = TOGGLE_H - 4
-        kx = x + 2 + pos * (TOGGLE_W - d - 4)
-        p.setBrush(QColor("#ffffff"))
-        p.drawEllipse(QRect(int(kx), y + 2, d, d))
-
     def _paint_scrollbar(self, p: QPainter):
         if self._sb_op <= 0.01:
             return
@@ -725,7 +764,7 @@ class ServiceCanvas(QWidget):
             return
         c = (qc(theme.ACCENT) if self._sb_drag
              else qc(theme.SUBTEXT) if self._sb_hover
-             else QColor("#4b4d75"))
+             else qc(theme.MUTED))
         c = QColor(c)
         c.setAlpha(int(230 * self._sb_op))
         p.setPen(Qt.NoPen)

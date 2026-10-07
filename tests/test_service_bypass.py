@@ -131,6 +131,99 @@ def test_locked_service_cannot_be_enabled():
     canvas.deleteLater()
 
 
+def test_service_checkbox_changes_state_without_knob_animation():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    QtCore = pytest.importorskip("PySide6.QtCore")
+    QtTest = pytest.importorskip("PySide6.QtTest")
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    from umbranet.widgets.service_canvas import (
+        ROW_H,
+        TG_RIGHT,
+        TOGGLE_W,
+        ServiceCanvas,
+    )
+
+    canvas = ServiceCanvas(
+        [("Медиа", "🎬", "#4d8dff", "#22d3ee", [("YouTube", "▶️")])],
+        bypass_map={"YouTube": "dpi"},
+    )
+    canvas.resize(500, 160)
+    canvas.set_app_mode("combo")
+    row_i = next(i for i, row in enumerate(canvas._rows) if row.get("svc") == "YouTube")
+    x = canvas._content_w() - TOGGLE_W - TG_RIGHT + TOGGLE_W // 2
+    y = canvas._tops[row_i] + ROW_H // 2 - canvas._offset
+    changed = []
+    canvas.serviceToggled.connect(lambda svc, on: changed.append((svc, on)))
+
+    QtTest.QTest.mouseClick(
+        canvas, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+        QtCore.QPoint(int(x), int(y)),
+    )
+
+    assert changed == [("YouTube", True)]
+    assert canvas._on["YouTube"] is True
+    assert not canvas.findChildren(QtCore.QVariantAnimation), (
+        "Нажатие сервисного чекбокса не должно создавать анимацию движущейся ручки"
+    )
+    canvas.deleteLater()
+
+
+def test_category_checkbox_tristate_and_no_knob_animation():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    QtCore = pytest.importorskip("PySide6.QtCore")
+    QtTest = pytest.importorskip("PySide6.QtTest")
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    from umbranet.widgets.service_canvas import (
+        CATEGORY_CONTROL_W,
+        HDR_H,
+        ServiceCanvas,
+    )
+
+    canvas = ServiceCanvas(
+        [("Медиа", "🎬", "#4d8dff", "#22d3ee",
+          [("YouTube", "▶️"), ("Twitch", "🟣")])],
+        bypass_map={"YouTube": "dpi", "Twitch": "dns"},
+    )
+    canvas.resize(500, 160)
+    canvas.set_app_mode("combo")
+    canvas.set_service_states({"YouTube": True})
+    assert canvas._cat_pos("Медиа") == 0.5
+
+    header_i = next(i for i, row in enumerate(canvas._rows) if row.get("cat") == "Медиа")
+    x = canvas._content_w() - CATEGORY_CONTROL_W - 10 + CATEGORY_CONTROL_W // 2
+    y = canvas._tops[header_i] + HDR_H // 2 - canvas._offset
+    toggled = []
+
+    def apply_category(cat, on):
+        toggled.append((cat, on))
+        canvas.set_service_states({svc: on for svc in canvas._cat_svcs(cat)})
+
+    canvas.categoryToggled.connect(apply_category)
+
+    QtTest.QTest.mouseClick(
+        canvas, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+        QtCore.QPoint(int(x), int(y)),
+    )
+    assert toggled == [("Медиа", True)]
+    assert canvas._cat_pos("Медиа") == 1.0
+    assert canvas._on["YouTube"] is True and canvas._on["Twitch"] is True
+    assert not canvas.findChildren(QtCore.QVariantAnimation), (
+        "Нажатие группового чекбокса не должно создавать анимацию ручки"
+    )
+
+    QtTest.QTest.mouseClick(
+        canvas, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+        QtCore.QPoint(int(x), int(y)),
+    )
+    assert toggled[-1] == ("Медиа", False)
+    assert canvas._cat_pos("Медиа") == 0.0
+    canvas.deleteLater()
+
+
 def test_toggle_service_guard_in_routing():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     QtWidgets = pytest.importorskip("PySide6.QtWidgets")

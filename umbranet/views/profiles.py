@@ -161,7 +161,7 @@ class ProfilesView(QWidget):
         outer.setSpacing(14)
 
         title = QLabel("DNS-профили")
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:22px;font-weight:700;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:22px;font-weight:700;")
         outer.addWidget(title)
 
         body = QHBoxLayout()
@@ -204,7 +204,7 @@ class ProfilesView(QWidget):
         bcl.setContentsMargins(12, 10, 12, 10)
         bcl.setSpacing(6)
         bt = QLabel("🧩  Встроенные")
-        bt.setStyleSheet(f"color:{theme.WHITE};font-size:13px;font-weight:700;background:transparent;border:none;")
+        bt.setStyleSheet(f"color:{theme.TEXT};font-size:13px;font-weight:700;background:transparent;border:none;")
         bcl.addWidget(bt)
         self._builtin_rows = QVBoxLayout()
         self._builtin_rows.setSpacing(4)
@@ -217,7 +217,7 @@ class ProfilesView(QWidget):
         ucl.setContentsMargins(12, 10, 12, 10)
         ucl.setSpacing(6)
         ut = QLabel("🗂  Пользовательские")
-        ut.setStyleSheet(f"color:{theme.WHITE};font-size:13px;font-weight:700;background:transparent;border:none;")
+        ut.setStyleSheet(f"color:{theme.TEXT};font-size:13px;font-weight:700;background:transparent;border:none;")
         ucl.addWidget(ut)
         self._user_rows = QVBoxLayout()
         self._user_rows.setSpacing(4)
@@ -260,7 +260,7 @@ class ProfilesView(QWidget):
 
         self._editor_title = QLabel("⚙  Параметры профиля")
         self._editor_title.setStyleSheet(
-            f"color:{theme.WHITE};font-size:17px;font-weight:700;background:transparent;border:none;")
+            f"color:{theme.TEXT};font-size:17px;font-weight:700;background:transparent;border:none;")
         outer.addWidget(self._editor_title)
 
         self._editor_sub = QLabel("Галочка ☑ слева делает профиль активным")
@@ -432,8 +432,10 @@ class ProfilesView(QWidget):
         if faded:
             return (f"color:{color};font-size:10px;font-weight:700;font-family:Consolas;"
                     "background:transparent;border:none;")
-        # цветная пилюля
-        return ("color:#0e0e17;font-size:10px;font-weight:700;font-family:Consolas;"
+        # Цвет заливки меняется от яркого (тёмные темы) до тёмного (светлая тема),
+        # поэтому выбираем подпись с лучшим контрастом автоматически.
+        fg = theme.text_on_color(color)
+        return (f"color:{fg};font-size:10px;font-weight:700;font-family:Consolas;"
                 f"background:{color};border:none;border-radius:7px;padding:2px 8px;")
 
 
@@ -468,7 +470,7 @@ class ProfilesView(QWidget):
         name.setCursor(Qt.PointingHandCursor)
         name.setStyleSheet(
             f"QPushButton{{background:transparent;border:none;text-align:left;"
-            f"color:{theme.WHITE if is_selected else theme.TEXT};font-size:13px;}}")
+            f"color:{theme.ACCENT if is_selected else theme.TEXT};font-size:13px;}}")
         name.clicked.connect(lambda _=False, p=pid: self._select(p))
         rl.addWidget(name, 1)
 

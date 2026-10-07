@@ -2916,6 +2916,78 @@ def dpi_strategy_ai_cleanup_runtime() -> dict:
     return {"stopped": stopped, "errors": errors}
 
 
+def _dpi_local_port_conflicts(ports=(53,)) -> tuple[list[dict], str]:
+    """Возвращает локальные TCP LISTEN и UDP bind-сокеты на проверяемых портах.
+
+    Для генерации важен локальный DNS-порт 53. 443 проверять как «занятый
+    локальный порт» нельзя: пробы открывают исходящие HTTPS-соединения, а не
+    слушают этот порт. Ошибка обзора возвращается отдельно и не маскируется.
+    """
+    try:
+        import socket
+        import psutil
+
+        wanted = {int(port) for port in ports}
+        connections = psutil.net_connections(kind="inet")
+    except Exception as exc:
+        return [], str(exc)
+
+    found: list[dict] = []
+    seen: set[tuple] = set()
+    for conn in connections:
+        local = getattr(conn, "laddr", None)
+        if not local:
+            continue
+        try:
+            if hasattr(local, "port"):
+                port = int(local.port)
+                host = str(getattr(local, "ip", "") or "*")
+            else:
+                port = int(local[1])
+                host = str(local[0] or "*")
+        except (IndexError, TypeError, ValueError):
+            continue
+        if port not in wanted:
+            continue
+
+        sock_type = getattr(conn, "type", None)
+        if sock_type == socket.SOCK_STREAM:
+            if str(getattr(conn, "status", "")).upper() != str(psutil.CONN_LISTEN).upper():
+                continue
+            protocol = "TCP"
+        elif sock_type == socket.SOCK_DGRAM:
+            protocol = "UDP"
+        else:
+            continue
+
+        pid = getattr(conn, "pid", None)
+        try:
+            pid = int(pid) if pid is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        process_name = ""
+        if pid is not None:
+            try:
+                process_name = str(psutil.Process(pid).name() or "")
+            except Exception:
+                pass
+
+        key = (protocol, host, port, pid)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append({
+            "protocol": protocol,
+            "host": host,
+            "port": port,
+            "pid": pid,
+            "process_name": process_name,
+        })
+
+    found.sort(key=lambda item: (item["protocol"], item["host"], item["pid"] or 0))
+    return found, ""
+
+
 def _dpi_generation_preflight(winws, progress) -> dict:
     """Проверки ПЕРЕД подбором: чтобы не гонять 5 минут впустую.
 
@@ -2931,20 +3003,72 @@ def _dpi_generation_preflight(winws, progress) -> dict:
     """
     result = {"abort": False, "reason": "", "warnings": []}
 
-    # 1. Чужие winws.exe (другая копия UmbraNet / сторонние DPI-программы). WinDivert
-    #    занимается монопольно, поэтому нашему winws будет нечего показывать.
+    def abort_preflight(reason: str) -> dict:
+        result["abort"] = True
+        result["reason"] = reason
+        for note in result["warnings"]:
+            try:
+                progress(f"AI-генерация: внимание — {note}")
+            except Exception as exc:
+                log_recoverable(log, 'Не удалось передать предупреждение AI-генерации в UI', exc, level=logging.DEBUG)
+        try:
+            progress(f"AI-генерация: остановлена до запуска — {reason}")
+        except Exception as exc:
+            log_recoverable(log, 'Не удалось передать причину остановки AI-генерации в UI', exc, level=logging.DEBUG)
+        return result
+
+    # Проверяем настоящий локальный DNS-bind (TCP/UDP 53) и конкурирующий DPI.
+    # WinError 10054 сам по себе не доказывает занятый порт: это сброс уже
+    # установленного сетевого соединения. Zapret/WinWS может конфликтовать с
+    # UmbraNet через WinDivert, поэтому его проверяем отдельно от портов.
+    port_conflicts, port_scan_error = _dpi_local_port_conflicts((53,))
+    if port_scan_error:
+        result["warnings"].append(
+            f"Не удалось проверить занятость локального TCP/UDP-порта 53: {port_scan_error}"
+        )
+    if port_conflicts:
+        owners = []
+        for item in port_conflicts:
+            host = str(item.get("host") or "*")
+            address = f"[{host}]:{item.get('port')}" if ":" in host else f"{host}:{item.get('port')}"
+            process_name = str(item.get("process_name") or "")
+            pid = item.get("pid")
+            owner = process_name or (f"PID {pid}" if pid is not None else "процесс не определён")
+            if process_name and pid is not None:
+                owner += f" (PID {pid})"
+            owners.append(f"{item.get('protocol', '?')} {address} — {owner}")
+        reason = (
+            "Перед генерацией обнаружена занятость локального DNS-порта 53: "
+            + "; ".join(owners)
+            + ". Генерация остановлена до запуска. Освободите порт вручную и повторите."
+        )
+        result["port_conflicts"] = port_conflicts
+        return abort_preflight(reason)
+
+    # Zapret обычно конкурирует не за TCP/UDP-порт, а за драйвер WinDivert.
+    # На Windows он запускает winws.exe; проверяем и его, и другой e1-spike.exe.
     try:
         foreign = winws.foreign_processes() if hasattr(winws, "foreign_processes") else None
         if foreign:
-            names = ", ".join(f"PID {pid} ({path or 'путь неизвестен'})" for pid, path in foreign[:3])
+            names = ", ".join(
+                f"PID {pid} ({path or 'путь неизвестен'})" for pid, path in foreign[:5]
+            )
+            reason = (
+                "Перед генерацией обнаружен сторонний DPI-процесс (winws.exe/e1-spike.exe): "
+                f"{names}. Он может занимать WinDivert. Генерация остановлена до запуска. "
+                "Закройте процесс вручную и повторите; автоматическое завершение пока не выполняется."
+            )
+            result["dpi_processes"] = foreign
+            return abort_preflight(reason)
+        if foreign is None:
             result["warnings"].append(
-                f"рядом работает другая программа с winws.exe: {names}. "
-                "Она может держать WinDivert — тогда подбор будет пустым даже при верной стратегии."
+                "Не удалось проверить сторонние winws.exe/e1-spike.exe; проверка WinDivert неполная."
             )
     except Exception as exc:
-        log.debug("preflight: обзор чужих winws не удался: %s", exc)
+        log.debug("preflight: обзор чужих DPI-процессов не удался: %s", exc)
+        result["warnings"].append(f"Не удалось проверить сторонние DPI-процессы: {exc}")
 
-    # 2. Работает ли разрешение имён вообще. Это решающая проверка.
+    # Работает ли разрешение имён вообще. Это решающая проверка.
     try:
         from ai_strategy.probes import resolve_probe  # type: ignore
         dns = resolve_probe("www.youtube.com", timeout=3.0)

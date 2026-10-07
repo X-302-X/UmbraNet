@@ -400,7 +400,7 @@ class RoutingView(QWidget):
         title_host = QWidget()
         title_host.setStyleSheet("background:transparent;")
         title = QLabel("🚀  Сервисы")
-        title.setStyleSheet(f"color:{theme.WHITE}; font-size:16px; font-weight:700;")
+        title.setStyleSheet(f"color:{theme.TEXT}; font-size:16px; font-weight:700;")
         self._title_row_h = max(title.sizeHint().height(), 22)
         title_host.setFixedHeight(self._title_row_h)
         title_row = QHBoxLayout(title_host)
@@ -417,7 +417,7 @@ class RoutingView(QWidget):
             f"QPushButton{{background:{theme.INPUT_BG};color:{theme.TEXT};"
             f"border:1px solid {theme.BORDER};border-radius:7px;"
             "padding:0 10px;font-size:12px;font-weight:600;}"
-            f"QPushButton:hover{{border-color:{theme.ACCENT3};color:{theme.WHITE};}}"
+            f"QPushButton:hover{{border-color:{theme.ACCENT3};color:{theme.TEXT};}}"
         )
         self._narrow_toggle.clicked.connect(self.toggle_right_panel)
         self._narrow_toggle.setVisible(False)      # показывается только в узком окне
@@ -438,7 +438,18 @@ class RoutingView(QWidget):
         # ── телеграмизация: весь список сервисов рисует один paintEvent ──
         # (было: QScrollArea + ~150 дочерних виджетов, медленный ресайз)
         catalog = []
-        for cat, (emoji, c1, c2) in CATEGORIES.items():
+        category_colors = CATEGORIES
+        if theme.CURRENT_THEME == "glass":
+            # В исходном каталоге категории используют неоновые пастельные
+            # цвета для тёмного фона; для стеклянной темы берём читаемые тона.
+            category_colors = {
+                "AI": ("🤖", theme.ACCENT, theme.ACCENT2),
+                "Медиа": ("🎬", theme.ACCENT2, theme.ACCENT3),
+                "Игры": ("🎮", theme.ORANGE, theme.RED),
+                "Работа": ("💼", theme.GREEN, theme.ACCENT2),
+                "Разное": ("🧩", theme.PINK, theme.RED),
+            }
+        for cat, (emoji, c1, c2) in category_colors.items():
             catalog.append((cat, emoji, c1, c2,
                             [(svc, SERVICES[svc][1]) for svc in services_in_category(cat)]))
         self._canvas = ServiceCanvas(catalog, bypass_map=SERVICE_BYPASS)
@@ -521,7 +532,7 @@ class RoutingView(QWidget):
         add_btn.setCursor(Qt.PointingHandCursor)
         add_btn.setFixedHeight(36)
         add_btn.setStyleSheet(
-            f"QPushButton{{background:{theme.grad(theme.GREEN, '#10b981')};color:{theme.WHITE};"
+            f"QPushButton{{background:{theme.GREEN};color:{theme.text_on_color(theme.GREEN)};"
             "border:none;border-radius:8px;padding:0 14px;font-weight:600;font-size:13px;}"
             f"QPushButton:hover{{border-radius:8px;}}")
         add_btn.clicked.connect(self._add_typed)
@@ -667,7 +678,7 @@ class RoutingView(QWidget):
 
         # Заголовок карточки
         self._card_title = QLabel("🔌  Маршрут DNS")
-        self._card_title.setStyleSheet(f"color:{theme.WHITE};font-size:14px;font-weight:700;background:transparent;border:none;")
+        self._card_title.setStyleSheet(f"color:{theme.TEXT};font-size:14px;font-weight:700;background:transparent;border:none;")
         card_lay.addWidget(self._card_title)
 
         # Разделитель
@@ -696,7 +707,7 @@ class RoutingView(QWidget):
         dns_prof_lay.setSpacing(8)
 
         self._prof_title = QLabel("🛡  —")
-        self._prof_title.setStyleSheet(f"color:{theme.WHITE};font-size:14px;font-weight:700;background:transparent;border:none;")
+        self._prof_title.setStyleSheet(f"color:{theme.TEXT};font-size:14px;font-weight:700;background:transparent;border:none;")
         dns_prof_lay.addWidget(self._prof_title)
 
         self._prof_rows_host = QWidget()
@@ -1092,7 +1103,7 @@ class RoutingView(QWidget):
             "}"
             f"QPushButton:hover{{"
             f"  border-color: {theme.ACCENT3};"
-            f"  color: {theme.WHITE};"
+            f"  color: {theme.TEXT};"
             "}"
         )
         

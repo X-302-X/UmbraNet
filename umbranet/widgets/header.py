@@ -60,7 +60,8 @@ def _qss_label(color: str, size: int) -> str:
 
 def _power_qss(bg1: str, bg2: str,
                hover1: str, hover2: str,
-               pressed1: str, pressed2: str) -> str:
+               pressed1: str, pressed2: str,
+               fg: str | None = None) -> str:
     """
     QSS для кнопки btn_power.
 
@@ -78,7 +79,7 @@ def _power_qss(bg1: str, bg2: str,
     return (
         f"QPushButton{{"
         f"  background: {theme.grad(bg1, bg2)};"
-        f"  color: {theme.WHITE};"
+        f"  color: {fg or theme.text_on_color(bg1)};"
         "  border: none;"
         f"  border-radius: {r};"
         "  font-size: 13px;"
@@ -392,7 +393,8 @@ class ControlBar(QFrame):
         self.btn_restart.setFixedHeight(_BTN_H)
         self.btn_restart.setStyleSheet(
             f"QPushButton{{"
-            f"  background:{theme.grad(theme.ORANGE,'#f59e0b')};color:{theme.WHITE};"
+            f"  background:{theme.grad(theme.ORANGE, theme.YELLOW)};"
+            f"  color:{theme.text_on_color(theme.ORANGE)};"
             f"  border:none;border-radius:{r_r};"
             "  font-size:13px;font-weight:600;padding:0 12px;"
             "}"
@@ -677,9 +679,10 @@ class ControlBar(QFrame):
             self._power_text = "⏹  Стоп"
             self._render_power()
             self.btn_power.setStyleSheet(_power_qss(
-                bg1=theme.RED,      bg2="#f43f5e",
-                hover1="#ff6070",   hover2="#ff3050",
-                pressed1="#cc0020", pressed2="#cc2040",
+                bg1=theme.RED, bg2=theme.RED,
+                hover1=theme.PINK, hover2=theme.PINK,
+                pressed1=theme.RED, pressed2=theme.RED,
+                fg=theme.text_on_color(theme.RED),
             ))
             self.btn_restart.setEnabled(True)
             self.btn_power.setEnabled(True)
@@ -698,9 +701,10 @@ class ControlBar(QFrame):
             self._power_text = "▶  Старт"
             self._render_power()
             self.btn_power.setStyleSheet(_power_qss(
-                bg1=theme.GREEN,    bg2="#10b981",
-                hover1="#55ffaa",   hover2="#20d490",
-                pressed1="#1e8a55", pressed2="#0e7a45",
+                bg1=theme.GREEN, bg2=theme.GREEN,
+                hover1=theme.ACCENT3, hover2=theme.ACCENT3,
+                pressed1=theme.GREEN, pressed2=theme.GREEN,
+                fg=theme.text_on_color(theme.GREEN),
             ))
             self.btn_restart.setEnabled(False)
             self.btn_power.setEnabled(bool(can))

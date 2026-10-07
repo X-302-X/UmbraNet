@@ -71,7 +71,7 @@ def _section(title: str) -> tuple[QWidget, QVBoxLayout]:
     lay.setContentsMargins(16, 12, 16, 14)
     lay.setSpacing(10)
     t = QLabel(title)
-    t.setStyleSheet(f"color:{theme.WHITE};font-size:14px;font-weight:700;background:transparent;border:none;")
+    t.setStyleSheet(f"color:{theme.TEXT};font-size:14px;font-weight:700;background:transparent;border:none;")
     lay.addWidget(t)
     return f, lay
 
@@ -204,7 +204,7 @@ class SettingsView(QWidget):
 
         # заголовок + статус + кнопки (в узком окне кнопки уходят на вторую строку)
         title = QLabel("Настройки")
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:22px;font-weight:700;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:22px;font-weight:700;")
         self._status = QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(f"color:{theme.GREEN};font-size:12px;")

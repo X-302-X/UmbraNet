@@ -43,9 +43,14 @@ APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
 def make_dialog(total: int = 4, **kwargs):
-    dlg = lab.AiGenerationProgressDialog(None, total_variants=total, **kwargs)
-    dlg.resize(620, 470)
-    return dlg
+    # Сохраняем увеличенный размер окна по умолчанию (680×560).
+    return lab.AiGenerationProgressDialog(None, total_variants=total, **kwargs)
+
+
+def test_default_dialog_has_more_room_for_status_and_logs():
+    dlg = make_dialog()
+    assert dlg.size().width() == 680 and dlg.size().height() == 560
+    assert dlg.minimumSize().width() == 600 and dlg.minimumSize().height() == 500
 
 
 def all_visible_text(dlg) -> str:
@@ -163,39 +168,42 @@ def test_long_custom_subtitle_is_elided_not_clipped():
 
 
 def test_step_text_is_never_clipped_at_minimum_size():
-    """Та же проверка для плашки шага: длинный текст → многоточие, не обрез."""
+    """Длинный человекочитаемый статус сокращается многоточием, не обрезается."""
     dlg = make_dialog(total=18)
     dlg.setMinimumSize(560, 420)
     dlg.resize(560, 420)
     dlg.show()
     APP.processEvents()
-    dlg.append("AI-генерация: winws.exe сообщает: " + "windivert: failed to open " * 6)
+    dlg._set_activity_status(
+        "Выполняем предварительную проверку совместимости параметров сетевого "
+        "окружения перед началом основного этапа генерации стратегии",
+        "working",
+    )
     APP.processEvents()
     shown = dlg._step.text()
     needed = QFontMetrics(dlg._step.font()).horizontalAdvance(shown)
     assert shown.endswith("…"), f"нет многоточия: «{shown}»"
     assert needed <= dlg._step.width() - 20, f"подпись шире плашки: {needed}px"
-    assert dlg._step.height() == make_dialog()._step.height(), "высота плашки уехала"
+    assert dlg._step.height() == 66, "высота плашки уехала"
     dlg.close()
 
 
-def test_no_service_names_in_dialog_headlines():
-    """Сторож по исходнику: в ЗАГОЛОВКАХ и подписях окна сервисов быть не должно.
+def test_combined_probe_status_names_services_and_marks_parallel():
+    """Показываем реальные параллельные проверки, не изображая их очередью."""
+    dlg = make_dialog()
+    dlg.resize(600, 500)
+    dlg.show()
+    APP.processEvents()
+    raw = "AI-генерация: probes YouTube/Discord для variant_7"
+    dlg.append(raw)
+    APP.processEvents()
 
-    В логе окна они остаются (это факт измерения: какие проверки выполнялись),
-    поэтому проверяем именно тексты плашек — строки с `_title`/`_subtitle`/
-    `_STEP_RULES`, а не сообщения прогресса.
-    """
-    src = (ROOT / "umbranet" / "views" / "strategy_lab.py").read_text(encoding="utf-8")
-    head = src[:src.index("class StrategyLabView")]
-    for lineno, line in enumerate(head.splitlines(), start=1):
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue          # комментарии в интерфейс не попадают
-        if "YouTube" in line or "Discord" in line:
-            raise AssertionError(
-                f"строка {lineno} окна генерации называет сервис: {stripped}"
-            )
+    status = dlg._step.text()
+    assert "Параллельно" in status, status
+    assert "YouTube" in status and "Discord" in status, status
+    assert "variant_7" not in status, status
+    assert raw in dlg._log.toPlainText(), "полный технический этап должен остаться в логе"
+    dlg.close()
 
 
 # ── 2. Оценка времени до конца ──────────────────────────────────────────────
@@ -215,7 +223,9 @@ def test_finish_shows_verdict_not_report_lines():
     })
     assert "Uz не создана" in dlg._subtitle.text(), dlg._subtitle.text()
     assert "потерпите" not in dlg._subtitle.text().lower(), dlg._subtitle.text()
-    assert "Готово" in dlg._step.text(), dlg._step.text()
+    assert "Не получилось" in dlg._step.text(), dlg._step.text()
+    assert dlg._activity_state == "error"
+    assert lab.theme.RED in dlg._step.styleSheet()
     assert "music=FAIL" not in dlg._step.text(), dlg._step.text()
     log = dlg._log.toPlainText()
     assert "music=FAIL" in log, "отчёт должен быть в логе окна"
@@ -231,7 +241,50 @@ def test_finish_ok_shows_created_strategy():
     })
     assert "Создана стратегия uz2" in dlg._subtitle.text(), dlg._subtitle.text()
     assert "Готово" in dlg._step.text() or "готово" in dlg._step.text(), dlg._step.text()
+    assert dlg._activity_state == "success"
+    assert lab.theme.GREEN in dlg._step.styleSheet()
     assert "Список истины" not in dlg._step.text()
+
+
+def test_copy_logs_button_activates_and_copies_exact_text():
+    dlg = make_dialog(total=4)
+    assert dlg._activity_state == "working"
+    assert lab.theme.YELLOW in dlg._step.styleSheet()
+    assert not dlg._btn_copy_logs.isEnabled()
+
+    raw = "AI-генерация: probes YouTube/Discord для variant_7"
+    dlg.append(raw)
+    assert dlg._activity_state == "working"
+    assert lab.theme.YELLOW in dlg._step.styleSheet()
+    assert dlg._btn_copy_logs.isEnabled()
+    dlg._copy_logs()
+
+    assert APP.clipboard().text() == raw
+    assert dlg._btn_copy_logs.text() == "Скопировано"
+    dlg._restore_copy_logs_button()
+    assert dlg._btn_copy_logs.text() == "Копировать логи"
+
+
+def test_check_finish_uses_green_success_and_red_failure():
+    success = make_dialog(total=5, window_title="Проверка Uz")
+    success.finish({"ok": True, "stage": "strategy_check", "best": {"score": 91}})
+    assert success._activity_state == "success"
+    assert "Готово" in success._step.text()
+    assert lab.theme.GREEN in success._step.styleSheet()
+
+    failure = make_dialog(total=5, window_title="Проверка Uz")
+    failure.finish({"ok": False, "stage": "strategy_check", "error": "недоступны сайты"})
+    assert failure._activity_state == "error"
+    assert "Не получилось" in failure._step.text()
+    assert lab.theme.RED in failure._step.styleSheet()
+
+
+def test_cancelled_generation_is_not_marked_as_success():
+    dlg = make_dialog(total=4)
+    dlg.finish({"ok": False, "stage": "ai_generation", "cancelled": True})
+    assert dlg._activity_state == "cancelled"
+    assert "Отменено" in dlg._step.text()
+    assert lab.theme.YELLOW in dlg._step.styleSheet()
 
 
 def test_eta_asks_to_wait_before_first_result():
@@ -309,7 +362,8 @@ def test_eta_says_done_after_finish():
     dlg = make_dialog(total=4)
     dlg.append("AI-генерация: вариант 1/4")
     dlg.finish({"ok": False, "error": "не вышло", "best": {}})
-    assert "всё готово" in dlg._eta.text()
+    assert "завершено" in dlg._eta.text().lower(), dlg._eta.text()
+    assert "стратегия не создана" in dlg._eta.text().lower(), dlg._eta.text()
     assert not dlg._eta_timer.isActive(), "таймер оценки должен остановиться"
 
 
@@ -333,19 +387,19 @@ def test_eta_never_goes_negative():
     "raw, must_contain, must_not_contain",
     [
         ("AI-генерация: probes YouTube/Discord для variant_7",
-         "Проверяем доступность сайтов", "variant_7"),
+         "Параллельно: YouTube + голосовые функции Discord", "variant_7"),
         ("AI-генерация: запуск WinWS для variant_7 (12 args)",
-         "Запускаем обход", "variant_7"),
+         "Запускаем тестовый обход", "variant_7"),
         ("AI-генерация: вариант 3/18 • seed=uz1 • mutation=split_ttl • mask=seed_default",
-         "Вариант 3 из 18", "split_ttl"),
+         "Проверяем вариант 3 из 18", "split_ttl"),
         ("AI-генерация: вариант 3/18 score 82 raw 85 • youtube=90, discord=70",
-         "лучший результат 82", "youtube=90"),
+         "Результат варианта: score 82", "youtube=90"),
         ("Проверка Uz: стратегия 2/5 • uz2",
-         "Стратегия 2 из 5", "uz2"),
+         "Проверяем стратегию 2 из 5", "uz2"),
         ("AI-генерация: подготовлено вариантов: 18",
-         "Подготовка вариантов", ""),
+         "Подготовили варианты для теста", ""),
         ("AI-генерация: зачищены зависшие winws для variant_7",
-         "Уборка", "зависшие"),
+         "Очищаем временный запуск", "зависшие"),
     ],
 )
 def test_step_text_is_human(raw, must_contain, must_not_contain):
@@ -355,20 +409,14 @@ def test_step_text_is_human(raw, must_contain, must_not_contain):
         assert must_not_contain.lower() not in human.lower(), f"{raw!r} → {human!r}"
 
 
-def test_step_label_hides_services_but_log_stays_honest():
-    """Плашка — нейтральная, лог — точный: видно, что реально измерялось.
-
-    Это не косметика: подпись не должна обещать, что обход «для YouTube и
-    Discord», но диагностика обязана оставаться правдивой — если проверялись
-    именно эти сайты, в логе окна это будет написано.
-    """
+def test_voice_readiness_step_is_descriptive_and_keeps_log():
+    """Если приходит отдельный voice_readiness progress, подпись называет его ясно."""
     dlg = make_dialog(total=18)
-    raw = "AI-генерация: probes YouTube/Discord для variant_7"
+    raw = "AI-генерация: Discord voice_readiness: проверка голосовых регионов"
     dlg.append(raw)
 
-    assert "YouTube" not in dlg._step.text(), f"сервис просочился в плашку: {dlg._step.text()}"
-    assert "Проверяем доступность сайтов" in dlg._step.text(), dlg._step.text()
-    assert "YouTube" in dlg._log.toPlainText(), "лог должен остаться точным"
+    assert "голосовые функции discord" in dlg._step.text().lower(), dlg._step.text()
+    assert raw in dlg._log.toPlainText(), "полный технический текст должен остаться в логе"
 
 
 def test_step_label_shows_human_text_and_log_keeps_technical():
@@ -441,32 +489,31 @@ def test_progress_bar_geometry_is_stable_at_minimum_size():
     dlg.close()
 
 
-def test_long_step_is_elided_not_wrapped():
-    """Длинная подпись сокращается многоточием, а не переносится на 2-ю строку."""
+def test_technical_error_is_summarized_and_kept_in_log():
+    """Короткий статус остаётся человеческим; подробная причина доступна в логе."""
     dlg = make_dialog(total=18)
-    dlg.show()
-    APP.processEvents()
-    dlg.append("AI-генерация: winws.exe сообщает: " + "windivert: failed to open " * 12)
-    APP.processEvents()
+    raw = "AI-генерация: winws.exe сообщает: " + "windivert: failed to open " * 12
+    dlg.append(raw)
 
     shown = dlg._step.text()
-    assert "windivert" in shown, f"суть сообщения потерялась: {shown!r}"
-    assert len(shown) < 140, f"подпись не сокращена: {len(shown)} символов"
-    assert shown.endswith("…"), f"нет многоточия в конце: {shown!r}"
-    assert dlg._step.height() == dlg._step.height()   # высота стабильна
-    dlg.close()
+    assert "Диагностируем запуск DPI-движка" in shown, shown
+    assert "windivert" not in shown.lower(), f"техническая простыня попала в статус: {shown!r}"
+    assert raw in dlg._log.toPlainText(), "полная диагностика должна остаться в журнале"
+    assert dlg._step.height() == 66, "высота плашки шага изменилась"
 
 
-def test_warning_step_keeps_its_meaning():
-    """«Внимание» без сути бесполезно: пользователь должен прочитать, о чём оно."""
+def test_warning_details_are_kept_in_log():
+    """Предупреждение не теряет детали: короткий смысл в статусе, причина в логе."""
     dlg = make_dialog(total=18)
-    dlg.append(
+    raw = (
         "AI-генерация: внимание — рядом работает другая программа с winws.exe: "
         "PID 777 (C:/OtherApp/bin/winws.exe). Она может держать WinDivert."
     )
+    dlg.append(raw)
     step = dlg._step.text()
-    assert "Внимание" in step, step
-    assert "winws.exe" in step, f"потерялась суть предупреждения: {step}"
+    assert "Проверяем сетевое окружение" in step, step
+    assert "winws.exe" not in step, step
+    assert "PID 777" in dlg._log.toPlainText(), "детали предупреждения должны остаться в логе"
 
 
 # ── 5. Прежнее поведение окна не сломано ────────────────────────────────────
@@ -493,5 +540,5 @@ def test_check_session_uses_human_prefix():
                       title_text="Проверка стратегий запущена",
                       subtitle_text="Стратегии проверяются по очереди.")
     dlg.append("Проверка Uz: стратегия 2/5 • uz2")
-    assert "Стратегия 2 из 5" in dlg._step.text(), dlg._step.text()
+    assert "Проверяем стратегию 2 из 5" in dlg._step.text(), dlg._step.text()
     assert dlg._progress.value() == 2

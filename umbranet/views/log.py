@@ -378,7 +378,7 @@ class LogView(QWidget):
         # ── заголовок + LIVE ──
         head = QHBoxLayout()
         title = QLabel("Логи запросов")
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:22px;font-weight:700;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:22px;font-weight:700;")
         head.addWidget(title)
         self._live = QLabel("●  LIVE")
         self._live.setStyleSheet(f"color:{theme.GREEN};font-size:12px;font-weight:700;")

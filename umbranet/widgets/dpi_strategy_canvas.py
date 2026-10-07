@@ -34,7 +34,9 @@ class DpiStrategyCanvas(RowCanvas):
         base = self.font()
         self._f_dot = QFont(base); self._f_dot.setPixelSize(10)
         self._f_name = QFont(base); self._f_name.setPixelSize(12); self._f_name.setBold(True)
-        self._f_desc = QFont(base); self._f_desc.setPixelSize(10)
+        # Описания должны быть такими же читаемыми, как текст у DNS-маршрутов:
+        # 10 px на DPI-карточках выглядели слишком тонко и «мыльно» при масштабе Windows.
+        self._f_desc = QFont(base); self._f_desc.setPixelSize(11)
         self._fm_desc = QFontMetrics(self._f_desc)
 
     # ── API ──
@@ -86,7 +88,7 @@ class DpiStrategyCanvas(RowCanvas):
 
         # описание до 2 строк
         p.setFont(self._f_desc)
-        p.setPen(self._pen("#b2b3d6"))
+        p.setPen(self._pen(theme.SUBTEXT))
         lines = self._wrap2(it.get("desc", ""), self._fm_desc, w - 20)
         ty = y + 18
         for ln in lines[:2]:

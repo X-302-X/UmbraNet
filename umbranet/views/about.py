@@ -73,7 +73,7 @@ def _card(title: str = "") -> tuple[QWidget, QVBoxLayout]:
         # («🧩 Состояние компонентов») иначе обрезаются вместе с краем карточки.
         t.setWordWrap(True)
         t.setStyleSheet(
-            f"color:{theme.WHITE};font-size:15px;font-weight:700;"
+            f"color:{theme.TEXT};font-size:15px;font-weight:700;"
             "background:transparent;border:none;"
         )
         lay.addWidget(t)
@@ -91,7 +91,7 @@ class AboutView(QWidget):
 
         head = QHBoxLayout()
         title = QLabel("О программе")
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:22px;font-weight:700;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:22px;font-weight:700;")
         head.addWidget(title)
         head.addStretch()
         self._copy_btn = self._small_btn("📋 Скопировать отчёт", theme.ACCENT)
@@ -136,7 +136,7 @@ class AboutView(QWidget):
         logo = QLabel("Umbra<span style='color:%s;'>Net</span>" % theme.ACCENT2)
         logo.setTextFormat(Qt.RichText)
         logo.setStyleSheet(
-            f"color:{theme.WHITE};font-size:32px;font-weight:800;"
+            f"color:{theme.TEXT};font-size:32px;font-weight:800;"
             "background:transparent;border:none;"
         )
         top.addWidget(logo)

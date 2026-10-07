@@ -153,7 +153,7 @@ class NavButton(QFrame):
         self._render()
 
     def _render(self):
-        text_color = theme.WHITE if self._active else theme.SUBTEXT
+        text_color = theme.TEXT if self._active else theme.SUBTEXT
         weight = "600" if self._active else "500"
         self._icon.setStyleSheet(
             f"background:transparent;border:none;font-size:16px;color:{text_color};")
@@ -386,7 +386,7 @@ class Sidebar(QFrame):
         self._toggle_btn.setStyleSheet(
             f"QPushButton{{background:{theme.CARD};color:{theme.SUBTEXT};"
             f"border:1px solid {theme.BORDER};border-radius:10px;font-size:18px;font-weight:700;}}"
-            f"QPushButton:hover{{color:{theme.WHITE};border-color:{theme.ACCENT};}}"
+            f"QPushButton:hover{{color:{theme.TEXT};border-color:{theme.ACCENT};}}"
         )
         root.addWidget(self._toggle_btn)
 
@@ -645,7 +645,7 @@ class Sidebar(QFrame):
         # логотип
         if self._expanded:
             self._logo.setText(
-                f"<span style='font-size:23px;font-weight:800;color:{theme.WHITE};'>"
+                f"<span style='font-size:23px;font-weight:800;color:{theme.TEXT};'>"
                 f"Umbra<span style='color:{theme.ACCENT2};'>Net</span></span>"
             )
         else:

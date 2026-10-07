@@ -137,15 +137,26 @@ def theme_label(name: str | None = None) -> str:
 
 
 def theme_items() -> list[tuple[str, str]]:
-    return [(key, data.get("label", key)) for key, data in THEMES.items()]
+    """Стабильный алфавитный порядок тем в выпадающем списке."""
+    return sorted(
+        ((key, data.get("label", key)) for key, data in THEMES.items()),
+        key=lambda item: str(item[1]).casefold(),
+    )
 
 
 def _rebuild_modes() -> None:
     global MODES, BACKEND_TO_UI
+    combo_c1, combo_c2 = "#6366f1", "#a855f7"
+    dpi_c2 = "#f59e0b"
+    # На светлой стеклянной теме подписи активных режимов белые. Используем
+    # насыщенные палитровые оттенки вместо светлого фиолетового/янтарного.
+    if CURRENT_THEME == "glass":
+        combo_c1, combo_c2 = ACCENT, ACCENT2
+        dpi_c2 = ORANGE
     MODES = {
         "blue":  {"name": "DNS Only", "emoji": "⚙", "c1": ACCENT,   "c2": ACCENT2,   "backend": "off"},
-        "black": {"name": "Combo",    "emoji": "⚡", "c1": "#6366f1", "c2": "#a855f7", "backend": "combo"},
-        "red":   {"name": "DPI Only", "emoji": "🛡", "c1": RED,      "c2": "#f59e0b", "backend": "dpi_only"},
+        "black": {"name": "Combo",    "emoji": "⚡", "c1": combo_c1, "c2": combo_c2, "backend": "combo"},
+        "red":   {"name": "DPI Only", "emoji": "🛡", "c1": RED,      "c2": dpi_c2, "backend": "dpi_only"},
     }
     BACKEND_TO_UI = {v["backend"]: k for k, v in MODES.items()}
 
@@ -253,6 +264,38 @@ def qc(color: str) -> "QColor":
                 c = _QColor(r, g, b, int(a * 255))
     _QC_CACHE[color] = c
     return c
+
+
+def text_on_color(color: str) -> str:
+    """Возвращает почти чёрный или белый текст с лучшим контрастом на заливке.
+
+    Нужен для небольших цветных бейджей: в тёмных темах заливки часто светлые,
+    а в светлой «Ледяное стекло» — тёмные. Один фиксированный цвет текста
+    нечитабелен хотя бы в одном из этих случаев.
+    """
+    background = qc(color)
+    alpha = background.alphaF()
+    if alpha < 1.0:
+        base = qc(BG)
+        background = QColor(
+            round(background.red() * alpha + base.red() * (1.0 - alpha)),
+            round(background.green() * alpha + base.green() * (1.0 - alpha)),
+            round(background.blue() * alpha + base.blue() * (1.0 - alpha)),
+        )
+
+    def luminance(c: QColor) -> float:
+        channels = []
+        for value in (c.redF(), c.greenF(), c.blueF()):
+            channels.append(value / 12.92 if value <= 0.04045
+                            else ((value + 0.055) / 1.055) ** 2.4)
+        return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+    bg_lum = luminance(background)
+    white_lum = luminance(QColor(WHITE))
+    ink_lum = luminance(QColor("#111827"))
+    white_ratio = (max(bg_lum, white_lum) + 0.05) / (min(bg_lum, white_lum) + 0.05)
+    ink_ratio = (max(bg_lum, ink_lum) + 0.05) / (min(bg_lum, ink_lum) + 0.05)
+    return WHITE if white_ratio >= ink_ratio else "#111827"
 
 
 def glow(widget: QWidget, color: str, blur: int = 22, dy: int = 6, alpha: int = 150) -> QWidget:

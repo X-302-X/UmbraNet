@@ -364,13 +364,16 @@ class ManualCanvas(QWidget):
         p.end()
 
     def _paint_card(self, p: QPainter, it: dict, rect: QRect, hovered: bool):
-        # фон карточки: прозрачное стекло с рамкой; hover — фиолет
+        # фон карточки: прозрачная поверхность темы с заметным акцентным hover.
         if hovered:
-            bg = QColor(139, 109, 255, 26)      # rgba(139,109,255,0.10)
-            border = QColor(theme.ACCENT)
+            bg = qc_color(theme.ACCENT)
+            bg.setAlpha(26)
+            border = qc_color(theme.ACCENT)
         else:
-            bg = QColor(255, 255, 255, 9)       # rgba(255,255,255,0.035)
-            border = QColor(255, 255, 255, 20)  # theme.BORDER
+            # Сохраняем лёгкий блик исходных тёмных тем; рамка уже берётся
+            # из палитры и поэтому корректна и на светлом фоне.
+            bg = QColor(255, 255, 255, 9)
+            border = qc_color(theme.BORDER)
         p.setBrush(bg)
         p.setPen(QPen(border, 1))
         p.drawRoundedRect(QRect(rect.x(), rect.y() + 1, rect.width(), rect.height() - 2), 10, 10)
@@ -450,7 +453,7 @@ class ManualCanvas(QWidget):
             return
         c = (qc_color(theme.ACCENT) if self._sb_drag
              else qc_color(theme.SUBTEXT) if self._sb_hover
-             else QColor("#4b4d75"))
+             else qc_color(theme.MUTED))
         c = QColor(c)
         c.setAlpha(int(230 * self._sb_op))
         p.setPen(Qt.NoPen)

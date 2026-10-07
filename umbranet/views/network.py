@@ -126,7 +126,7 @@ def _card(title: str = "") -> tuple[QWidget, QVBoxLayout]:
         # требовало больше места, чем у карточки, и обрезалось бы вместе с краем.
         t.setWordWrap(True)
         t.setStyleSheet(
-            f"color:{theme.WHITE};font-size:15px;font-weight:700;"
+            f"color:{theme.TEXT};font-size:15px;font-weight:700;"
             "background:transparent;border:none;"
         )
         lay.addWidget(t)
@@ -272,7 +272,7 @@ class NetworkView(QWidget):
 
         head = QHBoxLayout()
         title = QLabel("Сеть и диагностика")
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:22px;font-weight:700;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:22px;font-weight:700;")
         head.addWidget(title)
         head.addStretch()
         outer.addLayout(head)

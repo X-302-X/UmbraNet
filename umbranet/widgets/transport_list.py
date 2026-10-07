@@ -138,8 +138,7 @@ class TransportList(QWidget):
                 if not avail:
                     return
 
-        if key != _AUTO and (not self._auto) and key == self._active:
-            return
+        already_active = key != _AUTO and (not self._auto) and key == self._active
         if key == _AUTO and self._auto:
             return
 
@@ -152,7 +151,9 @@ class TransportList(QWidget):
             self._restyle()
             return
 
-        if key == "dnscrypt" and not ea.active_has_dnscrypt_stamp():
+        if key == "dnscrypt":
+            # DNSCrypt — не только маршрут, но и настраиваемый резолвер. Поэтому
+            # окно выбора открываем при каждом клике, даже если маршрут уже активен.
             from umbranet.widgets.dialogs import DnsCryptResolverDialog
             dlg = DnsCryptResolverDialog(self)
             if not dlg.exec() or not dlg.result:
@@ -162,6 +163,19 @@ class TransportList(QWidget):
             if not ok:
                 self._restyle()
                 return
+
+            if not already_active:
+                ea.set_auto_transport(False)
+                self._auto = False
+                self._auto_timer.stop()
+                ea.set_transport(key)
+                self._active = key
+            self._restyle()
+            self.transportChanged.emit(key)
+            return
+
+        if already_active:
+            return
 
         ea.set_auto_transport(False)
         self._auto = False

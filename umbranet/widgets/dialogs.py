@@ -80,7 +80,7 @@ def _list_widget() -> QListWidget:
 
 def _title_label(text: str) -> QLabel:
     lbl = QLabel(text)
-    lbl.setStyleSheet(f"color:{theme.WHITE};font-size:16px;font-weight:700;background:transparent;")
+    lbl.setStyleSheet(f"color:{theme.TEXT};font-size:16px;font-weight:700;background:transparent;")
     return lbl
 
 
@@ -483,7 +483,7 @@ class TestDnsDialog(QDialog):
         pl.setContentsMargins(14, 12, 14, 12)
         pl.setSpacing(4)
         pt = QLabel("📡  Пинг DNS-серверов")
-        pt.setStyleSheet(f"color:{theme.WHITE};font-size:12px;font-weight:700;background:transparent;")
+        pt.setStyleSheet(f"color:{theme.TEXT};font-size:12px;font-weight:700;background:transparent;")
         pl.addWidget(pt)
         for name, ip, _ in _DnsTestWorker.SERVERS:
             row = QHBoxLayout()
@@ -819,7 +819,7 @@ class TransportHelpDialog(QDialog):
 
             head = QHBoxLayout()
             t = QLabel(title)
-            t.setStyleSheet(f"color:{theme.WHITE};font-size:14px;font-weight:700;background:transparent;border:none;")
+            t.setStyleSheet(f"color:{theme.TEXT};font-size:14px;font-weight:700;background:transparent;border:none;")
             head.addWidget(t)
             head.addStretch()
             badge = QLabel("● доступен" if avail else "● недоступен")
@@ -912,7 +912,7 @@ class DnsCryptResolverDialog(QDialog):
             cl.setContentsMargins(14, 10, 14, 10)
             cl.setSpacing(2)
             t = QLabel(res["name"])
-            t.setStyleSheet(f"color:{theme.WHITE};font-size:14px;font-weight:700;background:transparent;border:none;")
+            t.setStyleSheet(f"color:{theme.TEXT};font-size:14px;font-weight:700;background:transparent;border:none;")
             cl.addWidget(t)
             d = QLabel(res.get("desc", ""))
             d.setWordWrap(True)

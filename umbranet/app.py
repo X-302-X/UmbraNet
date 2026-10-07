@@ -293,11 +293,17 @@ class GlowContainer(QWidget):
             p.end()
             return pm
 
-        # Пурпурно-розовая туманность правого верхнего угла (возле «Старт»)
+        # Мягкий цветовой блик в правом верхнем углу (возле «Старт»).
+        # Цвета берём из темы: для Neon это прежний розово-лавандовый фон,
+        # а для «Ледяного стекла» — более холодное, приглушённое свечение.
         def nebula_tr(p, s):
             grad = QRadialGradient(s * 0.5, s * 0.5, 400)
-            grad.setColorAt(0, QColor(242, 89, 176, 12))     # розовый (PINK)
-            grad.setColorAt(0.5, QColor(139, 109, 255, 6))   # лавандовый
+            pink = QColor(theme.PINK)
+            pink.setAlpha(12)
+            accent = QColor(theme.ACCENT)
+            accent.setAlpha(6)
+            grad.setColorAt(0, pink)
+            grad.setColorAt(0.5, accent)
             grad.setColorAt(1, QColor(0, 0, 0, 0))
             p.setBrush(grad)
             p.setPen(Qt.NoPen)
@@ -657,11 +663,13 @@ class MainWindow(GlowContainer):
             return
 
         if severity == "error":
-            icon, color, bg = "⛔", theme.RED, "rgba(255, 100, 120, 0.12)"
+            icon, color = "⛔", theme.RED
             title = "UmbraNet не готов к запуску"
         else:
-            icon, color, bg = "⚠", theme.YELLOW, "rgba(251, 191, 36, 0.12)"
+            icon, color = "⚠", theme.YELLOW
             title = "Есть предупреждения"
+        color_rgb = QColor(color)
+        bg = f"rgba({color_rgb.red()}, {color_rgb.green()}, {color_rgb.blue()}, 0.12)"
 
         self.health_banner.setText(
             f"{icon} <b>{title}</b>: {self._format_health_details(self._last_startup_health)}"
