@@ -94,12 +94,15 @@ INVALID_HANDLE_VALUE = -1
 _scan_provider = None
 
 
+_DPI_EXE_NAMES = frozenset({"e1-spike.exe", "winws.exe"})
+
+
 def _scan_processes_winapi() -> list[tuple[int, str]] | None:
-    """[(pid, путь к exe)] для процессов с именем winws.exe. None — не смогли.
+    """[(pid, путь к exe)] для UmbraNet e1-spike.exe и Zapret winws.exe.
 
     None означает «посмотреть не получилось» (не Windows, нет прав, сбой
     ctypes) — вызывающий код обязан откатиться на старый путь через PowerShell.
-    Пустой список означает «смотрели и winws.exe нет»: PowerShell уже не нужен.
+    Пустой список означает «смотрели и DPI-процессов нет»: PowerShell не нужен.
     """
     if os.name != "nt":
         return None
@@ -140,7 +143,7 @@ def _scan_processes_winapi() -> list[tuple[int, str]] | None:
             entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
             ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
             while ok:
-                if str(entry.szExeFile).lower() == "e1-spike.exe":
+                if str(entry.szExeFile).lower() in _DPI_EXE_NAMES:
                     pid = int(entry.th32ProcessID)
                     path = ""
                     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
