@@ -24,6 +24,7 @@ def engine(tmp_path, monkeypatch):
     eng.cache = Mock()
     monkeypatch.setattr(dns, "save_config", lambda cfg: None)
     monkeypatch.setattr(dns, "_CORE_DIR", str(tmp_path))
+    monkeypatch.setenv("UMBRANET_ROLLBACK_ROOT", str(tmp_path / "recovery"))
     (tmp_path / "subscribed_domains_cache.json").write_text('["old.example"]')
     return eng
 
@@ -41,7 +42,9 @@ def test_real_subscription_refresh_updates_config_and_atomic_cache(engine, tmp_p
     assert engine.config["subscribed_domains_set"] == {"new.example", "other.example"}
     path = tmp_path / "subscribed_domains_cache.json"
     assert set(json.loads(path.read_text())) == {"new.example", "other.example"}
-    assert json.loads(path.with_suffix(".json.bak").read_text()) == ["old.example"]
+    backup_path = tmp_path / "recovery" / "network" / "subscribed_domains_cache.json.bak"
+    assert json.loads(backup_path.read_text()) == ["old.example"]
+    assert not path.with_suffix(".json.bak").exists()
     assert not list(tmp_path.glob("*.tmp"))
 
 

@@ -159,6 +159,11 @@ def test_heavy_pages_get_scroll_instead_of_blocking_resize(window):
     for _ in range(4):
         APP.processEvents()
 
+    # Pages are instantiated lazily so startup does not synchronously build
+    # every heavy widget tree.  Visit the relevant pages before asserting each
+    # page's permanent scroll-wrapper policy.
+    for key in ("strategy_lab", "network", "settings"):
+        window._show(key)
     holders = {key: page_holder(window, key) for key in window._pages}
     assert isinstance(holders["strategy_lab"], QScrollArea), (
         "библиотека AI-стратегий без прокрутки: узкое окно обрежет её справа"
@@ -1040,8 +1045,8 @@ def test_right_panel_is_clickable_in_wide_window(window):
     )
 
     # 2) Под точками внутри панели должен оказаться её собственный контент.
-    canvas = view._transport_list._canvas
-    assert canvas.isVisible(), "список маршрутов не показан в широком окне"
+    canvas = view._vpn_exit_list._canvas
+    assert canvas.isVisible(), "список VPN-выходов не показан в широком окне"
 
     clicks = []
     canvas.rowClicked.connect(clicks.append)
@@ -1258,6 +1263,8 @@ def test_only_one_background_nebula_remains(window):
 
 def test_small_pages_are_not_wrapped(window):
     """Вкладкам с собственной прокруткой лишняя обёртка не нужна."""
+    for key in ("network", "settings", "about"):
+        window._show(key)
     holders = {key: page_holder(window, key) for key in window._pages}
     for key in ("network", "settings", "about"):
         assert not isinstance(holders[key], QScrollArea), (

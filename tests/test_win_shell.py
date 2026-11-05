@@ -462,6 +462,9 @@ def test_monitor_set_dns_to_localhost_without_powershell(monitor, fake):
     assert any("ipv4 set dnsservers" in c and "127.0.0.1" in c for c in calls)
     assert any("1.1.1.1" in c for c in calls), "резервный DNS не прописан"
     assert any("ipv6 set dnsservers" in c and "::1" in c for c in calls)
+    assert fs.calls_of("ipconfig"), (
+        "после смены DNS через netsh кэш Windows обязан очищаться через ipconfig"
+    )
 
 
 def test_monitor_set_dns_profile_without_powershell(monitor, fake):

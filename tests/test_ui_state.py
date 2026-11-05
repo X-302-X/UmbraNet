@@ -48,6 +48,7 @@ def state_file(tmp_path, monkeypatch):
     """Своё состояние UI на каждый тест — рабочий файл проекта не трогаем."""
     path = tmp_path / "umbranet_ui.json"
     monkeypatch.setenv("UMBRANET_UI_STATE", str(path))
+    monkeypatch.setenv("UMBRANET_ROLLBACK_ROOT", str(tmp_path / "recovery"))
     ui_state.set_state_path(None)          # сбрасываем возможное переопределение
     yield path
     ui_state.set_state_path(None)
@@ -71,10 +72,22 @@ def leftover_temps(path: pathlib.Path) -> list[str]:
 
 
 def broken_files(path: pathlib.Path) -> list[str]:
-    return sorted(p.name for p in path.parent.iterdir() if ".broken-" in p.name)
+    directory = path.parent / "recovery" / "config"
+    if not directory.exists():
+        return []
+    return sorted(p.name for p in directory.iterdir() if ".broken-" in p.name)
 
 
 # ── 1. Один путь на все модули ──────────────────────────────────────────────
+
+def test_doctor_notifications_are_disabled_for_new_ui_state(state_file):
+    """Новый пользователь не получает фоновые уведомления без явного согласия."""
+    from umbranet.engine_adapter import get_doctor_notify
+
+    assert get_doctor_notify() is False
+    ui_state.update_state(doctor_notify=True)
+    assert get_doctor_notify() is True, "сохранённый ручной выбор должен остаться включённым"
+
 
 def test_all_modules_use_same_state_file(state_file, monkeypatch):
     """Путь к состоянию UI считается в одном месте.
@@ -271,7 +284,7 @@ def test_broken_file_is_quarantined(state_file, content, title):
     assert not state_file.exists(), "битый файл должен быть отложен, а не оставлен на месте"
     saved = broken_files(state_file)
     assert saved, f"{title}: копия не сохранена, следы потери настроек недоступны"
-    quarantined = state_file.parent / saved[0]
+    quarantined = state_file.parent / "recovery" / "config" / saved[0]
     assert quarantined.read_text(encoding="utf-8") == content
 
 

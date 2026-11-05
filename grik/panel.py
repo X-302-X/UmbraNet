@@ -20,7 +20,7 @@ UmbraNet — grik: панель графиков пинга (DNS + DPI).
 
 Запуск отдельно (посмотреть/настроить):  python -m grik
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations

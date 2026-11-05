@@ -32,7 +32,7 @@ def test_release_is_not_opened_automatically(view, monkeypatch):
     opened = Mock(return_value=True)
     monkeypatch.setattr(about.QDesktopServices, "openUrl", opened)
     checker._result = UpdateResult("available", "0.4.0",
-        "https://github.com/302XXX/UmbraNet/releases/tag/v0.4.0", "Доступна версия 0.4.0")
+        "https://github.com/X-302-X/UmbraNet/releases/tag/v0.4.0", "Доступна версия 0.4.0")
     widget._refresh_update_status()
     assert not widget._open_release.isHidden()
     assert "0.4.0" in widget._release_status.text()
@@ -73,7 +73,7 @@ def test_release_button_gets_layout_geometry_after_hidden_resize(view):
         APP.processEvents()
         assert widget._open_release.isHidden()
         checker._result = UpdateResult("available", "0.4.0",
-            "https://github.com/302XXX/UmbraNet/releases/tag/v0.4.0", "Доступна версия 0.4.0")
+            "https://github.com/X-302-X/UmbraNet/releases/tag/v0.4.0", "Доступна версия 0.4.0")
         widget._refresh_update_status()
         for _ in range(4):
             APP.processEvents()
@@ -85,7 +85,7 @@ def test_release_button_gets_layout_geometry_after_hidden_resize(view):
         assert left + button.width() <= body.width()
 
 
-@pytest.mark.parametrize("tag,display", [("v26.0.1r", "26.0.1r"), ("v26.0.2b", "26.0.2b")])
+@pytest.mark.parametrize("tag,display", [("v26.0.8r", "26.0.8r"), ("v26.0.9b", "26.0.9b")])
 def test_update_notice_keeps_short_version_label(view, tag, display):
     widget, checker = view
     checker._result = select_release([{"tag_name": tag}], __version__, include_prereleases=True)

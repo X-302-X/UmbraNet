@@ -1,5 +1,5 @@
 """
-Тесты версий схемы и миграций — M1/M2 (`core/config_utils.py`, `core/ui_state.py`,
+Тесты версий схемы и миграций — M1/M2/M3 (`core/config_utils.py`, `core/ui_state.py`,
 `core/schema_version.py`).
 ====================================================================================
 
@@ -173,6 +173,18 @@ def test_saved_config_carries_version(tmp_path):
     assert read_json(path)[CONFIG_VERSION_KEY] == CONFIG_VERSION
 
 
+def test_v8_migration_removes_the_retired_manual_route_selector():
+    cfg, report = apply_config_migrations({
+        "config_version": 8,
+        "routed_domains": ["manual.example", "second.example"],
+        "manual_domain_policies": {"manual.example": "vpn"},
+    })
+
+    assert cfg["config_version"] == CONFIG_VERSION
+    assert "manual_domain_policies" not in cfg
+    assert any("глобальному режиму" in note for note in report["notes"])
+
+
 def test_old_file_without_version_is_migrated(tmp_path, caplog):
     """Файл прошлой версии (без номера) обновляется при первом же чтении."""
     path = write_json(tmp_path / "config.json", {"listen_port": 5300, "tls_verify": False})
@@ -214,9 +226,15 @@ def test_legacy_field_is_removed_from_config(tmp_path):
     С `use_winws: false` в старом файле DPI после обновления молча не поднимался:
     в интерфейсе «включено», а трафик шёл без обхода. Ключ удаляется, чтобы
     поведение определялось только нынешним кодом.
+
+    Режим DPI в этом же старом файле задан прежним именем значения
+    (конфиг версии ≤ 2): миграция должна переименовать значение, сохранив выбор.
     """
+    import config_utils
+
     path = write_json(tmp_path / "config.json",
-                      {"use_winws": False, "dpi_mode": "zapret", "listen_port": 53})
+                      {"use_winws": False, "dpi_mode": config_utils._LEGACY_DPI_ONLY_NAME,
+                       "listen_port": 53})
     cfg = load_config_file(str(path))
 
     assert "use_winws" not in cfg, "устаревшее поле осталось в конфиге"
@@ -225,7 +243,19 @@ def test_legacy_field_is_removed_from_config(tmp_path):
     assert report["notes"] and "use_winws" in report["notes"][0], (
         "миграция устаревшего поля не оставила описания в отчёте"
     )
-    assert cfg["dpi_mode"] == "zapret", "миграция задела нужную настройку"
+    assert cfg["dpi_mode"] == "dpi_only", "миграция потеряла выбор режима"
+    assert cfg["routing_mode"] == "dpi", "старый конфиг без явного режима должен получить DPI по умолчанию"
+
+
+def test_v11_assigns_dpi_only_when_the_old_config_has_no_explicit_mode():
+    blank, _blank_report = apply_config_migrations({"config_version": 10, "routing_mode": ""})
+    vpn, _vpn_report = apply_config_migrations({"config_version": 10, "routing_mode": "vpn"})
+    combo, _combo_report = apply_config_migrations({"config_version": 10, "routing_mode": "combo"})
+
+    assert blank["routing_mode"] == "dpi"
+    assert blank["dpi_mode"] == "dpi_only"
+    assert vpn["routing_mode"] == "vpn"
+    assert combo["routing_mode"] == "combo"
 
 
 def test_map_home_fields_are_removed_from_config(tmp_path):
@@ -309,14 +339,20 @@ def test_apply_config_migrations_reports_what_it_did():
     assert "use_winws" not in cfg
 
 
-def test_broken_json_still_quarantined(tmp_path):
-    """Битый JSON по-прежнему откладывается в `.broken-*`, а не разбирается как версия."""
+def test_broken_json_is_quarantined_in_external_recovery_storage(tmp_path, monkeypatch):
+    """Битый JSON откладывается во внешний config-раздел, а не рядом с программой."""
+    rollback_root = tmp_path / "recovery"
+    monkeypatch.setenv("UMBRANET_ROLLBACK_ROOT", str(rollback_root))
     path = tmp_path / "config.json"
     path.write_text("{это не json", encoding="utf-8")
 
     cfg = load_config_file(str(path))
+
+    saved = sorted((rollback_root / "config").glob("config.json.broken-*"))
     assert cfg[CONFIG_VERSION_KEY] == CONFIG_VERSION
-    assert sorted(p.name for p in tmp_path.iterdir() if ".broken-" in p.name), "нет копии битого файла"
+    assert saved, "нет внешней копии битого файла"
+    assert saved[0].read_text(encoding="utf-8") == "{это не json"
+    assert not list(tmp_path.glob("*.broken-*"))
 
 
 def test_backup_from_old_version_is_migrated(tmp_path, monkeypatch, caplog):
@@ -346,6 +382,7 @@ def test_backup_from_old_version_is_migrated(tmp_path, monkeypatch, caplog):
 def state_file(tmp_path, monkeypatch):
     path = tmp_path / "umbranet_ui.json"
     monkeypatch.setenv("UMBRANET_UI_STATE", str(path))
+    monkeypatch.setenv("UMBRANET_ROLLBACK_ROOT", str(tmp_path / "recovery"))
     ui_state.set_state_path(None)
     yield path
     ui_state.set_state_path(None)

@@ -43,6 +43,13 @@ class _Cache:
         self.lock = threading.Lock()
         self.refreshing: set = set()
         self.stored: list = []
+        # Контракт настоящего DNSCache: refresh привязан к поколению,
+        # чтобы очистка кэша не могла быть отменена запоздалым ответом.
+        self._generation = 0
+
+    def generation(self) -> int:
+        with self.lock:
+            return self._generation
 
     @staticmethod
     def _key(request, routed):
@@ -63,6 +70,7 @@ class _Cache:
     def set(self, request, routed, response, **kwargs):
         with self.lock:
             self.stored.append(self._key(request, routed))
+        return True
 
     def get_with_state(self, request, routed):
         return None, "miss"

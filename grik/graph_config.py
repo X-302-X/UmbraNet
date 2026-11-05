@@ -4,7 +4,7 @@ UmbraNet — grik: окно настроек графика пинга.
 Частота обновления, вид графика, сетка, высота. Вынесено из главного
 меню вместе с графиком (см. grik/panel.py). Вид окна 1:1 с прежним.
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations

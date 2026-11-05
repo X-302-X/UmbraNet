@@ -1,18 +1,9 @@
 """
-Тесты возврата DNS пользователю (P0-1, P0-2, P0-3).
+Тесты legacy DNS-восстановления и watchdog-совместимости.
 
-Суть проблемы, которую закрывают эти тесты:
-
-  P0-1. На выходе программа БЕЗУСЛОВНО сбрасывала системный DNS. Достаточно
-        было открыть UmbraNet и закрыть — прописанные вручную DNS затирались
-        на «Авто (DHCP)» безвозвратно.
-
-  P0-2. Восстановление из снапшота было написано, но недоступно: функция
-        network_restore_latest() не вызывалась нигде. Пользователь не мог
-        вернуть свои настройки.
-
-  P0-3. Watchdog на опросе PID не срабатывал при переиспользовании PID —
-        у пользователя оставался мёртвый 127.0.0.1 и не было интернета.
+Современный VPN / Combo / DPI lifecycle не меняет системный DNS и не передаёт
+watchdog-команду его восстановления. Эти проверки сохраняют совместимость
+диагностики, ручного сетевого отката и исторических DNS-снимков.
 
 Запуск: python -m pytest tests/test_dns_restore.py
 """
@@ -33,121 +24,6 @@ CORE = ROOT / "core"
 for p in (str(CORE), str(CORE / "dns"), str(ROOT)):
     if p not in sys.path:
         sys.path.insert(0, p)
-
-
-# ── P0-1: не трогаем DNS, который мы не меняли ───────────────────────────────
-
-def test_hard_stop_does_not_touch_dns_if_we_never_changed_it():
-    """ГЛАВНЫЙ фикс P0-1: если мы не меняли DNS, выход не должен его трогать."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-
-    import umbranet.app as app_mod
-    from umbranet.app import MainWindow
-
-    win = MainWindow()
-    calls = []
-    try:
-        # Подменяем реальные опасные операции «шпионами».
-        app_mod.is_admin = lambda: True          # права есть, но DNS мы не меняли
-        win._dns_was_set_by_app = False          # ← ключевое: мы НЕ меняли DNS
-        app_mod.network_restore_latest = lambda: (calls.append("restore"), (True, ""))[1]
-        win._shutdown_watchdog = lambda command="CLEAN": calls.append(f"wd:{command}")
-        win._handoff_dns_restore_to_watchdog = lambda: calls.append("handoff") or True
-
-        win._hard_stop_runtime(reset_dns=True)
-
-        assert "restore" not in calls, (
-            "DNS НЕЛЬЗЯ восстанавливать/сбрасывать, если мы его не меняли — "
-            "иначе у пользователя затираются его собственные настройки"
-        )
-        assert "handoff" not in calls
-        assert "wd:CLEAN" in calls, "watchdog должен получить CLEAN и уйти без действий"
-    finally:
-        win.close()
-        win.deleteLater()
-        app.processEvents()
-
-
-def test_hard_stop_restores_dns_when_we_did_change_it():
-    """Обратная сторона: если DNS меняли — откат обязателен."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-
-    import umbranet.app as app_mod
-    from umbranet.app import MainWindow
-
-    win = MainWindow()
-    calls = []
-    try:
-        app_mod.is_admin = lambda: True
-        win._dns_was_set_by_app = True
-        win._handoff_dns_restore_to_watchdog = lambda: calls.append("handoff") or True
-
-        win._hard_stop_runtime(reset_dns=True)
-        assert "handoff" in calls, "при реально изменённом DNS откат должен происходить"
-        assert win._dns_was_set_by_app is False, "флаг должен сброситься"
-    finally:
-        win.close()
-        win.deleteLater()
-        app.processEvents()
-
-
-def test_hard_stop_falls_back_to_sync_restore_without_watchdog():
-    """Watchdog недоступен → откат делаем синхронно, чтобы не остаться без DNS.
-
-    Лучше задержка на закрытии окна, чем мёртвый 127.0.0.1 у пользователя.
-    """
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-
-    import umbranet.app as app_mod
-    from umbranet.app import MainWindow
-
-    win = MainWindow()
-    calls = []
-    try:
-        app_mod.is_admin = lambda: True
-        app_mod.network_restore_latest = lambda: (calls.append("restore"),
-                                                  (True, "Восстановлено: Ethernet"))[1]
-        win._dns_was_set_by_app = True
-        win._watchdog_proc = None        # watchdog не запущен/уже мёртв
-
-        win._hard_stop_runtime(reset_dns=True)
-
-        assert "restore" in calls, "без watchdog откат обязан выполниться синхронно"
-        assert win._dns_was_set_by_app is False
-    finally:
-        win.close()
-        win.deleteLater()
-        app.processEvents()
-
-
-def test_hard_stop_without_reset_flag_does_nothing():
-    """_hard_stop_runtime(reset_dns=False) — выходим в трей, DNS не трогаем."""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-
-    from umbranet.app import MainWindow
-
-    win = MainWindow()
-    calls = []
-    try:
-        win._dns_was_set_by_app = True
-        win._handoff_dns_restore_to_watchdog = lambda: calls.append("handoff") or True
-        win._shutdown_watchdog = lambda command="CLEAN": calls.append(f"wd:{command}")
-
-        win._hard_stop_runtime(reset_dns=False)
-        assert "handoff" not in calls
-        assert "wd:CLEAN" in calls
-    finally:
-        win.close()
-        win.deleteLater()
-        app.processEvents()
 
 
 # ── P0-2: снапшот как источник «как было» ────────────────────────────────────
@@ -487,11 +363,11 @@ def test_app_sends_hello_handshake():
     assert "stdin=subprocess.PIPE" in src, "watchdog надо запускать с pipe на stdin"
 
 
-def test_app_hands_dns_restore_to_watchdog():
-    """ГЛАВНЫЙ фикс P0-1/P0-2: условие отката требует _dns_was_set_by_app."""
+def test_app_never_hands_dns_restore_to_watchdog():
+    """Routing lifecycle owns PAC only; legacy DNS recovery stays outside it."""
     src = (ROOT / "umbranet" / "app.py").read_text(encoding="utf-8")
-    assert ("restore_needed = bool(reset_dns and self._dns_was_set_by_app and is_admin())"
-            in src), "откат DNS обязан проверять, что DNS меняли именно мы"
+    assert "_handoff_dns_restore_to_watchdog" not in src
+    assert 'b"RESTORE\n"' not in src
 
 
 @pytest.mark.parametrize("after_hello", [False, True], ids=["before-hello", "after-hello"])
@@ -527,3 +403,119 @@ def test_raw_fd_real_signals_and_transient_errors(monkeypatch, reads, expected):
     signal = wd.wait_for_parent(wd._FdStream(), sleep_fn=_no_sleep)
     assert wd.handle_signal(signal, restore_fn=restore) == expected
     assert restore.call_count == (1 if expected == "restore" else 0)
+
+
+# ── Отравленный снапшот: «Стоп нажат, а обход живёт» ─────────────────────────
+#
+# Механизм бага: repair_soft снимал снапшот DNS БЕЗ предохранителя
+# dns_already_localhost. Если автопочинка запускалась во время работы UmbraNet
+# (а она запускается автоматом после старта), в снапшот записывался НАШ
+# 127.0.0.1 как «DNS пользователя». При «Стоп» restore_user_dns восстанавливал
+# этот самый снапшот: движок выключен, а системный DNS оставался захваченным
+# (первым сервером мёртвый 127.0.0.1, вторым fallback-резолвер) — сайты
+# продолжали открываться, настройки были «заклинены», и повторные откаты
+# лишь закрепляли состояние.
+
+def test_repair_soft_does_not_poison_snapshot_when_dns_already_ours(tmp_path, monkeypatch):
+    """ГЛАВНЫЙ ФИКС: ремонт во время работы НЕ должен перезаписывать снапшот
+    состоянием с нашим 127.0.0.1 внутри."""
+    import network_repair as nr
+    import process_monitor
+
+    snapshots_taken = []
+
+    monkeypatch.setattr(nr, "IS_WINDOWS", True)
+    monkeypatch.setattr(nr, "dns_already_localhost", lambda cfg=None, dns_getter=None: True)
+    monkeypatch.setattr(nr, "snapshot_network",
+                        lambda *a, **k: snapshots_taken.append(1) or {"ok": True, "path": "/poison.json"})
+    monkeypatch.setattr(nr, "_dns_check", lambda *a, **k: {"status": "ok", "title": "OK", "dns_leak": False})
+    monkeypatch.setattr(nr, "_write_json", lambda *a, **k: None)
+    monkeypatch.setattr(process_monitor, "is_admin", lambda: True)
+    monkeypatch.setattr(process_monitor, "set_dns_to_localhost",
+                        lambda **k: (True, "ok", {}))
+    monkeypatch.setattr(process_monitor, "flush_dns_cache", lambda: True)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    report = nr.repair_soft({}, server_running=True)
+
+    assert snapshots_taken == [], (
+        "снапшот сняли при уже захваченном DNS — он бы стал «latest» и "
+        "вернулся при остановке вместо настроек пользователя"
+    )
+    assert report["snapshot"].get("skipped"), "в отчёте должен быть след пропуска снапшота"
+
+
+def test_repair_soft_snapshots_when_dns_is_clean(tmp_path, monkeypatch):
+    """Обратная сторона: если DNS ещё НЕ наш — снапшот обязателен (P0-2)."""
+    import network_repair as nr
+    import process_monitor
+
+    snapshots_taken = []
+
+    monkeypatch.setattr(nr, "IS_WINDOWS", True)
+    monkeypatch.setattr(nr, "dns_already_localhost", lambda cfg=None, dns_getter=None: False)
+    monkeypatch.setattr(nr, "snapshot_network",
+                        lambda *a, **k: snapshots_taken.append(1) or {"ok": True, "path": "/clean.json"})
+    monkeypatch.setattr(nr, "_dns_check", lambda *a, **k: {"status": "ok", "title": "OK", "dns_leak": False})
+    monkeypatch.setattr(nr, "_write_json", lambda *a, **k: None)
+    monkeypatch.setattr(process_monitor, "is_admin", lambda: True)
+    monkeypatch.setattr(process_monitor, "set_dns_to_localhost",
+                        lambda **k: (True, "ok", {}))
+    monkeypatch.setattr(process_monitor, "flush_dns_cache", lambda: True)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    report = nr.repair_soft({}, server_running=True)
+
+    assert snapshots_taken == [1], "чистое состояние обязано фиксироваться снапшотом"
+    assert report["snapshot"].get("path") == "/clean.json"
+
+
+def test_restore_user_dns_rejects_poisoned_snapshot(tmp_path, monkeypatch):
+    """Снапшот с НАШИМ DNS внутри восстанавливать нельзя — падаем на DHCP.
+
+    Это же лечит машины, где снапшот уже отравлен прошлыми версиями:
+    «откат» больше не закрепит захват, а вернёт «Авто».
+    """
+    import network_repair as nr
+    import process_monitor
+
+    snap = tmp_path / "network_snapshot_poisoned.json"
+    snap.write_text(json.dumps({
+        "ok": True,
+        "adapters": {"Ethernet": {"ipv4": ["127.0.0.1", "8.8.8.8"], "ipv6": []}},
+    }), encoding="utf-8")
+
+    called = {"restore": 0, "dhcp": 0}
+
+    def fake_restore(path=None, ps_runner=None):
+        called["restore"] += 1
+        return True, "не должно вызываться"
+
+    monkeypatch.setattr(nr, "IS_WINDOWS", True)
+    monkeypatch.setattr(nr, "latest_snapshot", lambda: snap)
+    monkeypatch.setattr(nr, "restore_snapshot", fake_restore)
+    monkeypatch.setattr(process_monitor, "reset_dns_to_auto",
+                        lambda: (called.__setitem__("dhcp", called["dhcp"] + 1), (True, "DNS сброшен на DHCP"))[1])
+
+    ok, msg = nr.restore_user_dns()
+
+    assert ok is True
+    assert called["restore"] == 0, "отравленный снапшот не должен восстанавливаться"
+    assert called["dhcp"] == 1, "обязателен фолбэк на DHCP — иначе пользователь без интернета"
+    assert "DHCP" in msg
+
+
+def test_snapshot_poison_detection():
+    """Детектор отравленного снапшота: ловит наш loopback в любом адаптере."""
+    import network_repair as nr
+
+    poisoned4 = {"Ethernet": {"ipv4": ["127.0.0.1", "8.8.8.8"], "ipv6": []}}
+    poisoned6 = {"Wi-Fi": {"ipv4": [], "ipv6": ["::1"]}}
+    clean = {"Ethernet": {"ipv4": ["1.1.1.1"], "ipv6": ["2001:4860:4860::8888"]}}
+    mixed = {"Ethernet": {"ipv4": ["1.1.1.1"]}, "vEthernet": {"ipv4": ["127.0.0.1"]}}
+
+    assert nr._snapshot_is_poisoned(poisoned4) is True
+    assert nr._snapshot_is_poisoned(poisoned6) is True
+    assert nr._snapshot_is_poisoned(mixed) is True
+    assert nr._snapshot_is_poisoned(clean) is False
+    assert nr._snapshot_is_poisoned({}) is False

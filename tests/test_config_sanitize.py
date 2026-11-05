@@ -105,7 +105,7 @@ def test_dns_mode_invalid_falls_back_to_doh():
 
 def test_dpi_mode_invalid_falls_back_to_off():
     """Неизвестный режим DPI → выключено: не запускаем движок наугад."""
-    cfg, warnings = _sanitize(dpi_mode="zapret-на-максимум")
+    cfg, warnings = _sanitize(dpi_mode="максимум-на-всё")
     assert cfg["dpi_mode"] == "off"
     assert _has_warning(warnings, "dpi_mode")
 
@@ -290,6 +290,16 @@ def test_domain_lists_wrong_type_fall_back():
         "сломанный routed_domains оставил программу без списка целей"
     )
     assert _has_warning(warnings, "routed_domains")
+
+
+def test_retired_manual_domain_policy_is_dropped_from_current_config():
+    cfg, _warnings = _sanitize(
+        routed_domains=["Example.com", "dpi.example"],
+        manual_domain_policies={"example.com": "vpn", "dpi.example": "dpi"},
+    )
+
+    assert "manual_domain_policies" not in cfg
+    assert cfg["routed_domains"] == ["example.com", "dpi.example"]
 
 
 def test_process_list_is_normalized():

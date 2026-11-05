@@ -5,14 +5,18 @@ UmbraNet — grik: фоновый замер пинга DNS и DPI.
 Логика замера 1:1 с прежней: DNS пингуется по активному профилю,
 DPI — коннектом на 443 порт обходящего домена.
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import QThread, Signal
 
-from umbranet.engine_adapter import probe_doh, probe_host
+from umbranet.engine_adapter import (
+    probe_doh_detail,
+    probe_host,
+    probe_profile_dns_endpoint,
+)
 
 
 class PingWorker(QThread):
@@ -31,12 +35,19 @@ class PingWorker(QThread):
         dns_ms = None
         dpi_ms = None
 
-        # 1. Замеряем DNS пинг
+        # 1. Замеряем DNS реальным запросом транспорта из активного профиля.
+        # У DNS-AI порт 53 закрыт намеренно, поэтому TCP-connect к нему не является
+        # проверкой доступности резолвера.
         if self.measure_dns:
-            if self.dns_mode == "doh" and self.profile.get("doh_url"):
-                ok, ms = probe_doh(self.profile["doh_url"])
+            if self.profile.get("doh_url"):
+                ok, ms, _detail = probe_doh_detail(
+                    self.profile["doh_url"],
+                    connect_ip=self.profile.get("ipv4_primary") or None,
+                )
             elif self.profile.get("ipv4_primary"):
-                ok, ms = probe_host(self.profile["ipv4_primary"])
+                ok, ms, _detail = probe_profile_dns_endpoint(
+                    self.profile, self.profile["ipv4_primary"]
+                )
             else:
                 ok, ms = False, None
             if ok:

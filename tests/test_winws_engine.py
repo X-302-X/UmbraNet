@@ -88,6 +88,7 @@ def make_engine(tmp_path) -> WinWSEngine:
     """
     eng = WinWSEngine()
     eng._exe_path = pathlib.Path(sys.executable)
+    eng._build_cmd = lambda args: [str(eng._exe_path)] + list(args)  # фейковый exe = python
     eng._bin_dir = tmp_path
     eng._log_path = tmp_path / "winws.log"
     eng.ps_calls_seen = []
@@ -149,13 +150,40 @@ def test_restart_does_not_shell_out(tmp_path):
     eng.stop()
 
 
+def test_engine_tees_structured_action_to_listener_and_full_technical_log(tmp_path):
+    """JSON stdout виден GUI-слушателю и без потери остаётся в e1-spike.log."""
+    eng = make_logged_engine(tmp_path)
+    seen = []
+    eng.subscribe_events(seen.append)
+    program = (
+        "import sys,time; "
+        "print('{\\\"t\\\":\\\"action\\\",\\\"act\\\":\\\"fake+split\\\",\\\"sni\\\":\\\"youtube.com\\\"}', flush=True); "
+        "print('technical diagnostic line', flush=True); "
+        "time.sleep(120)"
+    )
+
+    assert eng.start(["-c", program]) is True
+    deadline = time.time() + 1.0
+    while not seen and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(seen) == 1
+    assert seen[0].kind == "action"
+    assert seen[0].domain == "youtube.com"
+    assert seen[0].action == "fake+split"
+
+    assert eng.stop() is True
+    technical_log = eng.log_path.read_text(encoding="utf-8")
+    assert '"t":"action"' in technical_log
+    assert "technical diagnostic line" in technical_log
+
+
 # ── 2. Зачистка не трогает живой процесс ────────────────────────────────────
 
 def test_orphan_kill_command_excludes_kept_pid():
     """Команда зачистки обязана исключать живой PID движка."""
     cmd = build_orphan_kill_command("C:/U/bin/winws.exe", "C:/U/bin", keep_pid=4242)
     assert "-ne 4242" in cmd, f"нет исключения живого PID: {cmd}"
-    assert "winws.exe" in cmd
+    assert "e1-spike.exe" in cmd
     assert "Stop-Process" in cmd
 
 
@@ -189,7 +217,7 @@ def test_scan_excludes_keep_pid_and_splits_foreign(tmp_path):
     eng = make_logged_engine(tmp_path)
     ours = str(eng.exe_path)
     in_bin = str(tmp_path / "bin" / "winws.exe")
-    foreign = "C:/OtherZapret/bin/winws.exe"
+    foreign = "C:/OtherApp/bin/winws.exe"
     eng.scan_result = [(101, ours), (102, in_bin), (103, foreign), (104, "")]
     eng.scan_ok = True
 
@@ -296,7 +324,7 @@ def test_cleanup_orphans_hard_mode_kills_own_live_process(tmp_path, monkeypatch)
     # Жёсткий режим бывает раз за запуск, поэтому здесь дополнительно остаётся
     # страховка по маске пути: она видит и то, чего не видит обзор по exe.
     assert eng.ps_calls == 1, "страховка по маске пути на выходе должна остаться"
-    assert "winws.exe" in eng.ps_calls_seen[-1]
+    assert "e1-spike.exe" in eng.ps_calls_seen[-1]
 
 
 # ── 3. Эскалация: PowerShell только когда процесс не умер ────────────────────
@@ -308,7 +336,7 @@ def test_stop_escalates_via_pid_when_terminate_fails(tmp_path, monkeypatch):
     pid = eng.process.pid
 
     # Имитируем ситуацию «процесс не отдал управление»: terminate/kill не сработали.
-    monkeypatch.setattr(eng, "_terminate", lambda proc: False)
+    monkeypatch.setattr(eng, "_terminate", lambda proc, reset_connections=True: False)
     # Нативное TerminateProcess в тесте не используем: на Windows оно реально
     # убивает процесс, и PowerShell-ветка эскалации (то, что проверяем) не
     # выполняется. На Linux нативного убийства и так нет.
@@ -338,7 +366,7 @@ def test_stop_reports_failure_when_process_survives(tmp_path, monkeypatch):
     assert eng.start(SLEEP_ARGS) is True
     proc = eng.process
 
-    monkeypatch.setattr(eng, "_terminate", lambda p: False)
+    monkeypatch.setattr(eng, "_terminate", lambda p, reset_connections=True: False)
 
     class Immortal:
         """Процесс, который «не умирает» с точки зрения проверок."""
@@ -361,6 +389,42 @@ def test_stop_without_process_is_ok(tmp_path):
     eng = make_logged_engine(tmp_path)
     assert eng.stop() is True
     assert eng.ps_calls == 0
+
+
+def test_stop_sweeps_orphan_when_popen_lost(tmp_path, monkeypatch):
+    """ГЛАВНОЕ: «Стоп» добивает сироту, если Popen потерян.
+
+    Симптом бага: пользователь жмёт «Стоп», движок отвечает «ок», а winws.exe
+    из нашей bin/ продолжает держать WinDivert и обрабатывать трафик — обход
+    формально выключен, а по факту работает. Раньше stop() при proc=None сразу
+    возвращал успех, не глядя по сторонам.
+    """
+    import winws_engine as mod
+
+    eng = make_logged_engine(tmp_path)
+    assert eng.start(SLEEP_ARGS) is True
+    victim = eng.process
+    eng.process = None                     # «потеряли» Popen-объект, процесс жив
+    assert process_alive(victim), "подготовка теста: процесс должен быть жив"
+
+    eng.scan_result = [(victim.pid, str(eng.exe_path))]
+    eng.scan_ok = True
+
+    def real_kill(pid):
+        import os as _os
+        try:
+            _os.kill(int(pid), HARD_KILL_SIGNAL)
+            return True
+        except Exception:
+            return False
+
+    monkeypatch.setattr(mod, "_kill_pid_native", real_kill)
+
+    ok = eng.stop()
+
+    assert ok is True, "stop() обязан доложить успех только после зачистки"
+    victim.wait(timeout=5)
+    assert not process_alive(victim), "сирота выжил после stop() — обход продолжил бы работать"
 
 
 # ── 4. restart атомарен относительно других потоков ─────────────────────────

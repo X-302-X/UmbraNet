@@ -64,9 +64,10 @@ def test_parse_remote_json_non_strict_allows_tiny():
     out_ips, out_subs = _parse_remote_json(tiny, strict=False)
     assert out_ips == ["1.2.3.4"]
 
-def test_save_cache_backup_atomic():
+def test_save_cache_backup_atomic(tmp_path, monkeypatch):
     from bogus_updater import _save_cache, _cache_path
     import json
+    monkeypatch.setenv("UMBRANET_ROLLBACK_ROOT", str(tmp_path / "recovery"))
     with tempfile.TemporaryDirectory() as tmpdir:
         # первая запись
         _save_cache(tmpdir, ["1.1.1.1"], ["10.0.0.0/24"])
@@ -75,10 +76,11 @@ def test_save_cache_backup_atomic():
         with open(path, "r", encoding="utf-8") as f:
             obj = json.load(f)
         assert obj["bogus_ips"] == ["1.1.1.1"]
-        # вторая запись — должен появиться .bak
+        # Вторая запись сохраняет прежнюю версию только во внешнем recovery-разделе.
         _save_cache(tmpdir, ["2.2.2.2"], [])
-        bak = path + ".bak"
-        assert os.path.exists(bak)
+        bak = tmp_path / "recovery" / "network" / "bogus_ips_cache.json.bak"
+        assert bak.exists()
+        assert not os.path.exists(path + ".bak")
         with open(bak, "r", encoding="utf-8") as f:
             bak_obj = json.load(f)
         assert bak_obj["bogus_ips"] == ["1.1.1.1"]
