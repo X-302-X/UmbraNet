@@ -16,8 +16,8 @@ from core.app_version import parse_app_version
 from core.diagnostics import log_recoverable
 
 log = logging.getLogger("UmbraNet.UpdateChecker")
-RELEASES_API = "https://api.github.com/repos/302XXX/UmbraNet/releases"
-RELEASES_PAGE = "https://github.com/302XXX/UmbraNet/releases"
+RELEASES_API = "https://api.github.com/repos/X-302-X/UmbraNet/releases"
+RELEASES_PAGE = "https://github.com/X-302-X/UmbraNet/releases"
 CHECK_INTERVAL = 86_400
 RETRY_INTERVAL = 3_600
 MAX_RESPONSE = 2 * 1024 * 1024

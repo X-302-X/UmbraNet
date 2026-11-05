@@ -8,14 +8,14 @@ UmbraNet - DPI Engine (Локальный обход блокировок)
   - fake       : Отправка фейкового TLS-пакета с TTL ≤ hop-count до DPI перед
                  реальным пакетом. DPI видит мусор и сбрасывает состояние,
                  реальный пакет доходит до сервера.
-  - split+fake : Комбинация обоих методов (режим combo/zapret).
+  - split+fake : Комбинация обоих методов (режим combo/dpi_only).
   - disorder   : Отправка второго сегмента раньше первого; сервер собирает по seq,
                  stateful DPI не успевает восстановить порядок.
 
 Режимы запуска (mode):
   'off'    — DPI-движок не активен (режим DNS Only, синий)
   'combo'  — split + fake (режим Combo, чёрный)
-  'zapret' — split + fake + disorder (режим DPI Only, красный)
+  'dpi_only' — split + fake + disorder (режим DPI Only, красный)
 """
 
 from __future__ import annotations
@@ -477,7 +477,7 @@ class DPIEngine:
           'fake'   — только фейк-пакет (без сплита)
           'split'  — только сплит (фрагментация по порядку, без фейков)
           'combo'  — фейк-пакет + сплит (сбалансированная стратегия)
-          'zapret' — фейк-пакет + сплит + дисордер (агрессивный zapret обход)
+          'dpi_only' — фейк-пакет + сплит + дисордер (агрессивный обход)
         """
         payload = packet.payload
         if not payload:
@@ -490,13 +490,13 @@ class DPIEngine:
 
         # Получаем выбранную пользователем стратегию DPI из конфига (с фолбеком на self._mode)
         strategy = self.engine.config.get("dpi_strategy", self._mode)
-        if strategy not in ("fake", "split", "combo", "zapret"):
-            strategy = "zapret"
+        if strategy not in ("fake", "split", "combo", "dpi_only"):
+            strategy = "dpi_only"
 
         log.debug("DPI Engine: Применение HTTPS стратегии: %s (режим %s)", strategy, self._mode)
 
         # Шаг 2: Отправка фейкового пакета с низким TTL для десинхронизации DPI
-        if strategy in ("fake", "combo", "zapret"):
+        if strategy in ("fake", "combo", "dpi_only"):
             try:
                 fake_pkt = packet.copy()
                 sni_info = _find_sni_offset(payload)
@@ -549,11 +549,11 @@ class DPIEngine:
                 packet.payload = mutated_payload
                 packet.send()
 
-        elif strategy == "zapret":
+        elif strategy == "dpi_only":
             # Дисордер сплит (второй сегмент ПЕРВЫМ, а первый ВТОРЫМ)
             if len(mutated_payload) >= MIN_PAYLOAD_LEN:
                 log.debug(
-                    "DPI Engine (Zapret): Отправка out-of-order сегментов: %d байт → [%d:] первым, [:%d] вторым",
+                    "DPI Engine (dpi_only): Отправка out-of-order сегментов: %d байт → [%d:] первым, [:%d] вторым",
                     len(mutated_payload), split_pos, split_pos
                 )
                 try:
@@ -571,7 +571,7 @@ class DPIEngine:
                     pkt1.payload = mutated_payload[:split_pos]
                     pkt1.send()
                 except Exception as exc:
-                    log.error("DPI Engine (Zapret): Сбой disorder, отправляем исходный пакет: %s", exc)
+                    log.error("DPI Engine (dpi_only): Сбой disorder, отправляем исходный пакет: %s", exc)
                     try:
                         packet.payload = mutated_payload
                         packet.send()
@@ -596,7 +596,7 @@ class DPIEngine:
             packet.send()
             return
             
-        if self._mode in ("combo", "zapret"):
+        if self._mode in ("combo", "dpi_only"):
             try:
                 # Создаем фейковый UDP-пакет
                 fake = packet.copy()
@@ -660,7 +660,7 @@ class DPIEngine:
         """
         Запускает DPI-движок в указанном режиме.
 
-        mode: 'combo' (Combo, чёрный) | 'zapret' (DPI Only, красный)
+        mode: 'combo' (Combo, чёрный) | 'dpi_only' (DPI Only, красный)
 
         Возвращает True при успешном запуске, False при ошибке
         (WinDivert недоступен, нет прав администратора и т.д.).

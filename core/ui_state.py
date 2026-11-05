@@ -25,8 +25,7 @@
     через `os.replace()` — читатель видит либо старую, либо новую версию,
     но никогда обрезанную;
   • битый или пустой файл не «съедается» молча: он откладывается в
-    `umbranet_ui.json.broken-<дата-время>` (как это уже делает config.json),
-    а причина пишется в лог.
+    во внешнее recovery-хранилище в разделе `config/`, а причина пишется в лог.
 
 Про межпроцессный случай: приложение однопроцессное (`single_instance`), поэтому
 блокировка внутрипроцессная. Атомарная замена всё равно гарантирует ЦЕЛОСТНОСТЬ
@@ -40,10 +39,12 @@ import copy
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 
 import schema_version
+from rollback_paths import rollback_file
 
 log = logging.getLogger("UmbraNet.ui_state")
 
@@ -102,13 +103,15 @@ def set_state_path(path: str | None) -> str:
 
 
 def _quarantine(path: str) -> str | None:
-    """Откладывает битый файл рядом, чтобы не потерять следы проблемы."""
+    """Переносит битое состояние во внешний раздел recovery-конфига."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    broken_path = f"{path}.broken-{stamp}"
+    filename = f"{os.path.basename(path)}.broken-{stamp}"
     try:
-        os.replace(path, broken_path)
-        return broken_path
-    except OSError as exc:
+        destination = rollback_file("config", filename)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(path, destination)
+        return str(destination)
+    except Exception as exc:
         log.error("Состояние UI повреждено, не удалось сохранить копию: %s", exc)
         return None
 

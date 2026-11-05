@@ -26,11 +26,15 @@ UmbraNet — Watchdog Process
 
 Протокол (родитель → watchdog, по строке в stdin)
 -------------------------------------------------
-    HELLO\\n    — рукопожатие сразу после запуска: «я жив, pipe рабочий»
-    CLEAN\\n    — штатный выход: родитель сам всё вернул, ничего не делаем
-    RESTORE\\n  — «верни DNS, как было до UmbraNet»; делаем это сами, чтобы
-                 не морозить UI родителя на время работы PowerShell
-    <EOF>      — родитель УПАЛ, никто ничего не вернул: спасаем интернет
+    HELLO\\n          — рукопожатие сразу после запуска: «я жив, pipe рабочий»
+    ARM_PROXY\\n      — текущая сессия владеет только PAC/proxy: при EOF вернуть
+                       именно сохранённые proxy-настройки, DNS не трогать
+    ARM_BOTH\\n       — legacy-сессия владеет DNS и PAC
+    CLEAN\\n          — штатный выход: родитель сам всё вернул, ничего не делаем
+    RESTORE\\n        — legacy: вернуть DNS, как было до UmbraNet
+    RESTORE_PROXY\\n  — вернуть только сохранённые PAC/manual proxy-настройки
+    RESTORE_ALL\\n    — вернуть DNS и proxy
+    <EOF>            — родитель УПАЛ: вернуть только ресурсы, указанные ARM
 
 Почему HELLO обязателен
 -----------------------
@@ -54,9 +58,10 @@ UmbraNet — Watchdog Process
 
 Вывод идёт через _say(), потому что под pythonw.exe print() уронил бы watchdog.
 
-Лицензия: GPLv3 · UmbraNet_Official / 302XXX
+Лицензия: GPLv3 · UmbraNet_Official / X-302-X
 """
 
+from dataclasses import dataclass
 import os
 import subprocess
 import sys
@@ -66,6 +71,19 @@ import time
 SIGNAL_HELLO = "HELLO"
 SIGNAL_CLEAN = "CLEAN"
 SIGNAL_RESTORE = "RESTORE"
+SIGNAL_RESTORE_PROXY = "RESTORE_PROXY"
+SIGNAL_RESTORE_ALL = "RESTORE_ALL"
+SIGNAL_ARM_PROXY = "ARM_PROXY"
+SIGNAL_ARM_BOTH = "ARM_BOTH"
+
+
+@dataclass(frozen=True)
+class WatchdogSession:
+    """Final pipe result and resources that must be restored on parent death."""
+
+    signal: str
+    restore_dns: bool = True
+    restore_proxy: bool = False
 
 # Сколько раз и как долго ждать рабочий pipe, прежде чем сдаться.
 # Если родитель жив, но канал почему-то не читается — лучше ничего не делать,
@@ -180,6 +198,10 @@ def _classify(line: str) -> str:
         return SIGNAL_HELLO
     if line.startswith(SIGNAL_CLEAN):
         return SIGNAL_CLEAN
+    if line.startswith(SIGNAL_RESTORE_PROXY):
+        return SIGNAL_RESTORE_PROXY
+    if line.startswith(SIGNAL_RESTORE_ALL):
+        return SIGNAL_RESTORE_ALL
     if line.startswith(SIGNAL_RESTORE):
         return SIGNAL_RESTORE
     return ""
@@ -196,22 +218,16 @@ def read_parent_signal(stream=None) -> str:
     return _classify(line)
 
 
-def wait_for_parent(stream=None, sleep_fn=None) -> str:
-    """Ждёт HELLO, затем финальную команду. Возвращает CLEAN / RESTORE / "".
+def wait_for_parent_session(stream=None, sleep_fn=None) -> WatchdogSession:
+    """Wait for HELLO and return a resource-aware final watchdog session.
 
-    "" = родитель умер (нормальный сценарий спасения интернета).
-    Бросает UnmonitoredError, если канал так и не заработал — тогда watchdog
-    обязан выйти, НИЧЕГО не трогая: мы не можем доказать смерть родителя,
-    а сброс DNS работающей программы отключил бы пользователю интернет.
+    A legacy parent that sends only ``HELLO`` keeps the historic DNS-only
+    recovery behaviour.  A transport-only parent sends ``ARM_PROXY`` after
+    HELLO, making a later EOF restore the PAC snapshot without touching DNS.
     """
     sleep = sleep_fn or time.sleep
     reader = LineReader(stream if stream is not None else _default_stream())
 
-    # Фаза 1: рукопожатие — доказательство, что родитель жив и канал рабочий.
-    # ВАЖНО: raise живёт в else — он срабатывает только если цикл НЕ сделал break.
-    # Вынести его наружу нельзя: тогда он убил бы и удачное рукопожатие,
-    # и вся вторая фаза стала бы недостижимой (ловушка, на которой я уже
-    # один раз тут споткнулся).
     for attempt in range(READ_RETRY_LIMIT):
         line, failed = reader.read_line()
         if line.startswith(SIGNAL_HELLO):
@@ -221,25 +237,37 @@ def wait_for_parent(stream=None, sleep_fn=None) -> str:
             sleep(READ_RETRY_SLEEP)
             continue
         if line == "":
-            # Чистый EOF сразу после старта: родитель умер, не успев поздороваться.
-            # Ровно тот случай, ради которого watchdog и существует.
             _say("UmbraNet watchdog: родитель завершился сразу после старта")
-            return ""
-        # Не HELLO и не EOF: непонятный протокол. Это НЕ доказательство смерти
-        # родителя, поэтому ждём дальше, а потом просто выйдем ничего не тронув.
+            return WatchdogSession("")
         _say(f"UmbraNet watchdog: неожиданная строка от родителя: {line[:40]!r}")
         sleep(READ_RETRY_SLEEP)
     else:
         raise UnmonitoredError("родитель не прислал HELLO")
 
-    # Фаза 2: ждём CLEAN / RESTORE / смерти родителя.
+    restore_dns, restore_proxy = True, False
     for _attempt in range(READ_RETRY_LIMIT):
         line, failed = reader.read_line()
         if failed:
             sleep(READ_RETRY_SLEEP)
             continue
-        return _classify(line)
+        if line == SIGNAL_ARM_PROXY:
+            restore_dns, restore_proxy = False, True
+            continue
+        if line == SIGNAL_ARM_BOTH:
+            restore_dns, restore_proxy = True, True
+            continue
+        signal = _classify(line)
+        if signal == SIGNAL_RESTORE_PROXY:
+            return WatchdogSession(signal, restore_dns=False, restore_proxy=True)
+        if signal == SIGNAL_RESTORE_ALL:
+            return WatchdogSession(signal, restore_dns=True, restore_proxy=True)
+        return WatchdogSession(signal, restore_dns=restore_dns, restore_proxy=restore_proxy)
     raise UnmonitoredError("канал связи с родителем перестал читаться")
+
+
+def wait_for_parent(stream=None, sleep_fn=None) -> str:
+    """Compatibility wrapper returning only the final signal string."""
+    return wait_for_parent_session(stream, sleep_fn=sleep_fn).signal
 
 
 def restore_user_dns() -> bool:
@@ -269,45 +297,72 @@ def restore_user_dns() -> bool:
         return False
 
 
-def handle_signal(signal: str, restore_fn=None) -> str:
-    """Реакция на сигнал. Возвращает название действия (для логов и тестов).
+def restore_user_proxy() -> bool:
+    """Return the prior PAC/manual proxy state from the transport snapshot."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        from vpn.system_proxy import restore_proxy_snapshot
+        ok, message = restore_proxy_snapshot()
+        _say(f"UmbraNet watchdog: восстановление proxy -> {ok} ({message})")
+        return bool(ok)
+    except Exception as exc:
+        _say(f"UmbraNet watchdog: восстановление proxy не удалось: {exc}")
+        return False
 
-    CLEAN   -> "skip"    родитель сам вернул DNS, не вмешиваемся
-    RESTORE -> "restore" просьба вернуть DNS
-    ""      -> "restore" родитель упал — спасаем интернет
-    """
-    if signal == SIGNAL_CLEAN:
+
+def handle_session(session: WatchdogSession, *, restore_dns_fn=None,
+                   restore_proxy_fn=None, admin_fn=None) -> str:
+    """Restore exactly the resources armed for a crashed parent session."""
+    if session.signal == SIGNAL_CLEAN:
         return "skip"
-    (restore_fn or restore_user_dns)()
-    return "restore"
+    actions: list[str] = []
+    if session.restore_dns:
+        can_restore_dns = (admin_fn or is_admin)()
+        if can_restore_dns:
+            (restore_dns_fn or restore_user_dns)()
+            actions.append("dns")
+        else:
+            _say("UmbraNet watchdog: нет прав администратора для возврата DNS")
+    if session.restore_proxy:
+        (restore_proxy_fn or restore_user_proxy)()
+        actions.append("proxy")
+    return "restore" if actions else "skip"
+
+
+def handle_signal(signal: str, restore_fn=None) -> str:
+    """Compatibility handler for the established DNS-only watchdog protocol."""
+    return handle_session(
+        WatchdogSession(signal, restore_dns=True, restore_proxy=False),
+        restore_dns_fn=restore_fn,
+        admin_fn=lambda: True,
+    )
 
 
 def main() -> None:
-    # Отладочный режим: ждём сигнал и печатаем, что бы сделали, НЕ трогая DNS.
+    # Отладочный режим: ждём сигнал и печатаем, что бы сделали, не меняя систему.
     # Проверка протокола руками: printf 'HELLO\nCLEAN\n' | python core/watchdog.py --check
     if len(sys.argv) > 1 and sys.argv[1] in ("--check", "--signal-test"):
         try:
-            sig = wait_for_parent()
+            session = wait_for_parent_session()
         except UnmonitoredError as exc:
             _say(f"unmonitored: {exc}")
             return
-        _say(f"signal={sig!r} action={'skip' if sig == SIGNAL_CLEAN else 'restore'}")
+        action = "skip" if session.signal == SIGNAL_CLEAN else "restore"
+        _say(f"signal={session.signal!r} action={action}")
         return
 
-    if not is_admin():
-        _say("UmbraNet watchdog: нет прав администратора — выходим")
-        sys.exit(1)  # Без админа DNS всё равно не поменять
-
     try:
-        signal = wait_for_parent()
+        session = wait_for_parent_session()
     except UnmonitoredError as exc:
-        # Не смогли доказать смерть родителя → НЕ трогаем DNS живой программы.
-        _say(f"UmbraNet watchdog: {exc} — выходим, DNS не трогаем")
+        # Не смогли доказать смерть родителя → не трогаем ресурсы живой программы.
+        _say(f"UmbraNet watchdog: {exc} — выходим без восстановления")
         return
 
-    _say(f"UmbraNet watchdog: родитель завершился (signal={signal or 'EOF'})")
+    _say(f"UmbraNet watchdog: родитель завершился (signal={session.signal or 'EOF'})")
     try:
-        handle_signal(signal)
+        handle_session(session)
     except Exception as exc:                    # последний предохранитель
         _say(f"UmbraNet watchdog: неожиданная ошибка: {exc}")
 

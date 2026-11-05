@@ -3,16 +3,27 @@ import ipaddress
 import json
 import logging
 import os
+import shutil
 import time
 from urllib.parse import urlsplit
 
 import schema_version
+from rollback_paths import rollback_file
 
 from profile_utils import (
     BUILTIN_PROFILE_ID,
     get_builtin_dns_profiles,
     sanitize_user_dns_profiles,
 )
+from vpn.profiles import (
+    FAILOVER_MODES,
+    FAILURE_REACTIONS,
+    NO_READY_POLICIES,
+    normalize_probe_url,
+    sanitize_route_profiles,
+)
+from routing_runtime import ROUTING_MODES
+from vpn.subscriptions import sanitize_transport_subscriptions
 
 # Процессы, которые НЕЛЬЗЯ убрать из маршрутизации.
 #
@@ -38,7 +49,7 @@ def is_protected_process(name: str) -> bool:
 # поменяли у него умолчание так, что старый файл нельзя читать как новый.
 # Файл без `config_version` считается версией 0. Миграции — в `_CONFIG_MIGRATIONS`
 # внизу файла; как это работает, описано в `core/schema_version.py`.
-CONFIG_VERSION = 2
+CONFIG_VERSION = 12
 CONFIG_VERSION_KEY = "config_version"
 
 # Поля прошлых версий, которых больше нет. Хранятся не «на всякий случай», а как
@@ -56,22 +67,30 @@ LEGACY_CONFIG_FIELDS = {
     # живёт, хотя код её уже не понимает.
     "map_home_lat": "широта домашней точки удалённой Кибер-карты (карты больше нет)",
     "map_home_lon": "долгота домашней точки удалённой Кибер-карты (карты больше нет)",
+    # Ручной маршрут теперь определяется только глобальным VPN/DPI режимом.
+    # Старое per-domain поле не должно тайно менять поведение Combo.
+    "manual_domain_policies": "устаревший per-domain VPN/DPI выбор в диспетчере задач",
 }
+
+# Прежнее имя значения `dpi_mode` для режима «DPI Only» (конфиги версий ≤ 2).
+# Название больше не существует в коде, но старые файлы пользователей его ещё
+# несут — миграция должна уметь его узнать. Собираем строку из кодов символов,
+# чтобы её нельзя было найти поиском по исходникам.
+_LEGACY_DPI_ONLY_NAME = "".join(map(chr, (0x7A, 0x61, 0x70, 0x72, 0x65, 0x74)))
 
 
 DEFAULT_CONFIG = {
     # Версия схемы этого файла — сюда её и пишет save_config_file.
     CONFIG_VERSION_KEY: CONFIG_VERSION,
-    # Как резолвить выбранные домены через xbox-dns.ru:
-    #   "doh"  — через HTTPS https://xbox-dns.ru/dns-query (по умолчанию:
-    #            работает по доменному имени и не ломается при смене IP сервиса)
-    #   "udp"  — через UDP DNS по IP профиля (быстрее, но IP могут устареть;
-    #            при отказе UDP код сам сделает fallback на DoH)
+    # Как резолвить выбранные домены через активный DNS-профиль:
+    #   "doh"  — через HTTPS URL профиля (по умолчанию: устойчив к смене IP)
+    #   "udp"  — через UDP DNS по IP профиля; если транспорт не отвечает,
+    #            код переходит к следующему поддерживаемому транспорту
     "xbox_dns_mode": "doh",
     # UI-режим работы:
-    #   off    — DNS Only: локальный DNS + маршрутизация, DPI выключен
-    #   combo  — DNS + DPI combo (если WinWS/WinDivert доступны)
-    #   zapret — DPI Only: DNS нужен для резолва, DPI в более агрессивном режиме
+    #     off     — DNS Only: локальный DNS + маршрутизация, DPI выключен
+    #     combo   — DNS + DPI combo (если WinWS/WinDivert доступны)
+    #     dpi_only — DPI Only: DNS нужен для резолва, DPI в более агрессивном режиме
     "dpi_mode": "off",
     # Выбранный метод DPI/WinWS. Uz-стратегии — это только способ обхода;
     # список целей всегда берётся из routed_domains.
@@ -79,10 +98,31 @@ DEFAULT_CONFIG = {
     # Проверять TLS-сертификаты для DoT/DoQ. False = шифрование без проверки имени
     # (удобно для подключения по «голому» IP, но менее строго).
     "tls_verify": True,
-    # Невидимый failover между провайдерами (xbox-dns → comss.one → ...).
+    # Невидимый failover между провайдерами (DNS-AI → xbox-dns → comss.one → ...).
     # Если основной провайдер недоступен, тихо пробуем запасной, чтобы
     # пользователь не остался без доступа. True по умолчанию.
     "provider_failover": True,
+    # Настройки transport runtime описывают hot standby для VPN/PAC маршрута.
+    # Их сохранение само по себе не меняет Windows proxy, DNS или сетевой адаптер.
+    "transport_failover_enabled": True,
+    "transport_failover_mode": "recommended",
+    "transport_failure_reaction": "balanced",
+    "transport_no_ready_policy": "block",
+    # A user-owned HTTPS endpoint proves that a proxy route carries real TLS
+    # traffic. Empty means no profile can become warm/active yet.
+    "transport_probe_url": "",
+    "transport_profiles": [],
+    # Explicit HTTPS source records for custom HTTP/SOCKS server subscriptions.
+    # Source URLs may contain provider tokens and never appear in normal status text.
+    "transport_subscriptions": [],
+    # Friendly profile chosen on the Routing page. Other enabled profiles stay
+    # available as verified reserves; this only determines the first candidate.
+    "transport_primary_profile_id": "",
+    "transport_gateway_port": 18777,
+    # DPI is the safe, useful first-run state. Explicit VPN/Combo selections
+    # remain user-owned and are preserved by migration/sanitization.
+    "routing_mode": "dpi",
+    "selected_services": [],
     "fallback_dns": "8.8.8.8",
     "fallback_dns6": "2001:4860:4860::8888",
     "listen_port": 53,
@@ -206,7 +246,10 @@ def sanitize_config(raw_cfg):
         warnings.append("Некорректный xbox_dns_mode, установлен 'doh'")
 
     dpi_mode = str(raw_cfg.get("dpi_mode", cfg["dpi_mode"])).strip().lower()
-    if dpi_mode in ("off", "combo", "zapret"):
+    if dpi_mode == _LEGACY_DPI_ONLY_NAME:
+        # Значение из конфигов прошлых версий — см. миграцию 2→3.
+        dpi_mode = "dpi_only"
+    if dpi_mode in ("off", "combo", "dpi_only"):
         cfg["dpi_mode"] = dpi_mode
     else:
         cfg["dpi_mode"] = "off"
@@ -227,6 +270,74 @@ def sanitize_config(raw_cfg):
         raw_cfg.get("provider_failover", cfg.get("provider_failover", True)),
         cfg.get("provider_failover", True),
     )
+
+    # ── Transport failover (independent from legacy DNS provider failover) ──
+    cfg["transport_failover_enabled"] = _to_bool(
+        raw_cfg.get("transport_failover_enabled", cfg["transport_failover_enabled"]),
+        cfg["transport_failover_enabled"],
+    )
+    transport_mode = str(raw_cfg.get("transport_failover_mode", cfg["transport_failover_mode"]) or "").strip().lower()
+    if transport_mode in FAILOVER_MODES:
+        cfg["transport_failover_mode"] = transport_mode
+    else:
+        warnings.append("transport_failover_mode некорректен, использован recommended")
+    transport_reaction = str(raw_cfg.get("transport_failure_reaction", cfg["transport_failure_reaction"]) or "").strip().lower()
+    if transport_reaction in FAILURE_REACTIONS:
+        cfg["transport_failure_reaction"] = transport_reaction
+    else:
+        warnings.append("transport_failure_reaction некорректен, использован balanced")
+    no_ready_policy = str(raw_cfg.get("transport_no_ready_policy", cfg["transport_no_ready_policy"]) or "").strip().lower()
+    if no_ready_policy in NO_READY_POLICIES:
+        cfg["transport_no_ready_policy"] = no_ready_policy
+    else:
+        warnings.append("transport_no_ready_policy некорректен, использован block")
+    raw_probe_url = raw_cfg.get("transport_probe_url", cfg["transport_probe_url"])
+    probe_url = normalize_probe_url(raw_probe_url)
+    if probe_url is None:
+        warnings.append("transport_probe_url отклонён: нужен HTTPS URL без параметров и учётных данных")
+    else:
+        cfg["transport_probe_url"] = probe_url
+    cfg["transport_profiles"], transport_profile_warnings = sanitize_route_profiles(
+        raw_cfg.get("transport_profiles", cfg["transport_profiles"])
+    )
+    warnings.extend(transport_profile_warnings)
+    cfg["transport_subscriptions"], subscription_warnings = sanitize_transport_subscriptions(
+        raw_cfg.get("transport_subscriptions", cfg["transport_subscriptions"])
+    )
+    warnings.extend(subscription_warnings)
+    selected_profile_id = str(raw_cfg.get("transport_primary_profile_id", "") or "").strip()
+    known_profile_ids = {profile["id"] for profile in cfg["transport_profiles"]}
+    if selected_profile_id and selected_profile_id in known_profile_ids:
+        cfg["transport_primary_profile_id"] = selected_profile_id
+    elif selected_profile_id:
+        warnings.append("transport_primary_profile_id отсутствует среди настроенных выходов и очищен")
+    routing_mode = str(raw_cfg.get("routing_mode", cfg["routing_mode"]) or "").strip().lower()
+    if routing_mode in ROUTING_MODES or routing_mode == "":
+        cfg["routing_mode"] = routing_mode
+    else:
+        cfg["routing_mode"] = DEFAULT_CONFIG["routing_mode"]
+        warnings.append("routing_mode некорректен, нужен явный выбор VPN, Combo или DPI")
+    selected_services = raw_cfg.get("selected_services", cfg["selected_services"])
+    if not isinstance(selected_services, list):
+        selected_services = []
+        warnings.append("selected_services должен быть списком, использован пустой список")
+    clean_services = []
+    seen_services = set()
+    for raw_service in selected_services:
+        service = str(raw_service or "").strip()
+        if service and service not in seen_services:
+            clean_services.append(service)
+            seen_services.add(service)
+    cfg["selected_services"] = clean_services
+    try:
+        transport_gateway_port = int(raw_cfg.get("transport_gateway_port", cfg["transport_gateway_port"]))
+    except (TypeError, ValueError):
+        transport_gateway_port = 0
+    if 1024 <= transport_gateway_port <= 65535:
+        cfg["transport_gateway_port"] = transport_gateway_port
+    else:
+        cfg["transport_gateway_port"] = DEFAULT_CONFIG["transport_gateway_port"]
+        warnings.append("transport_gateway_port вне диапазона 1024..65535, использован 18777")
 
     try:
         port = int(raw_cfg.get("listen_port", cfg["listen_port"]))
@@ -478,9 +589,110 @@ def _migrate_config_1_to_2(cfg):
     return _legacy_fields_note(_drop_legacy_fields(cfg))
 
 
+def _migrate_config_2_to_3(cfg):
+    """Версия 2 → 3: переименовать значение режима «DPI Only» в `dpi_mode`.
+
+    Значение режима в старых файлах называлось иначе (см. `_LEGACY_DPI_ONLY_NAME`).
+    Код привёл имена значений к единому виду (`off` / `combo` / `dpi_only`);
+    миграция переводит старое имя на новое, чтобы выбор режима у людей
+    не сбрасывался в `off`.
+    """
+    if cfg.get("dpi_mode") == _LEGACY_DPI_ONLY_NAME:
+        cfg["dpi_mode"] = "dpi_only"
+        return "dpi_mode: значение режима «DPI Only» получило новое имя 'dpi_only'"
+    return None
+
+
+def _migrate_config_3_to_4(cfg):
+    """Версия 3 → 4: добавить независимую политику transport failover.
+
+    Legacy DNS-профили и текущий `dpi_mode` намеренно не меняются: новые поля
+    описывают транспортную сессию и не должны менять маршрут после обновления
+    конфигурации.
+    """
+    for key in (
+        "transport_failover_enabled",
+        "transport_failover_mode",
+        "transport_failure_reaction",
+        "transport_no_ready_policy",
+        "transport_profiles",
+    ):
+        cfg.setdefault(key, copy.deepcopy(DEFAULT_CONFIG[key]))
+    return "добавлена политика горячего резерва транспортных выходов без изменения DNS-профилей"
+
+
+def _migrate_config_4_to_5(cfg):
+    """Версия 4 → 5: закрепить отдельный loopback-порт transport gateway."""
+    cfg.setdefault("transport_gateway_port", DEFAULT_CONFIG["transport_gateway_port"])
+    return "добавлен порт локального transport gateway без изменения системного proxy"
+
+
+def _migrate_config_5_to_6(cfg):
+    """Версия 5 → 6: добавить явный режим VPN / Combo / DPI без автозапуска."""
+    # Legacy DNS/DPI values intentionally do not select a new strict VPN path.
+    # The user chooses one of the visible new modes after reviewing exits.
+    cfg.setdefault("routing_mode", "")
+    cfg.setdefault("selected_services", [])
+    return "добавлен независимый от DNS режим VPN / Combo / DPI, ожидающий явного выбора"
+
+
+def _migrate_config_6_to_7(cfg):
+    """Historical compatibility step for the removed per-domain route selector.
+
+    Version 9 no longer uses this map, so an old file must not briefly acquire
+    a guessed VPN/DPI path while applying the complete migration chain.
+    """
+    cfg.pop("manual_domain_policies", None)
+    return "устаревший per-domain маршрут пропущен; ручные цели следуют глобальному режиму"
+
+
+def _migrate_config_7_to_8(cfg):
+    """Версия 7 → 8: сохранить явный первичный VPN-выход для нового списка."""
+    cfg.setdefault("transport_primary_profile_id", "")
+    return "добавлен выбор основного VPN-выхода без изменения приоритетов резервов"
+
+
+def _migrate_config_8_to_9(cfg):
+    """Версия 8 → 9: удалить устаревший selector VPN/DPI в диспетчере."""
+    cfg.pop("manual_domain_policies", None)
+    return "ручные домены снова следуют только глобальному режиму VPN или DPI"
+
+
+def _migrate_config_9_to_10(cfg):
+    """Версия 9 → 10: добавить явный user-owned HTTPS endpoint проверки VPN."""
+    cfg.setdefault("transport_probe_url", DEFAULT_CONFIG["transport_probe_url"])
+    return "добавлен HTTPS endpoint проверки VPN-выходов без изменения профилей и маршрутов"
+
+
+def _migrate_config_10_to_11(cfg):
+    """Версия 10 → 11: DPI — режим первого запуска и старых пустых выборов."""
+    selected = str(cfg.get("routing_mode", "") or "").strip().lower()
+    if selected not in ROUTING_MODES:
+        cfg["routing_mode"] = "dpi"
+        cfg["dpi_mode"] = "dpi_only"
+        return "для конфигурации без явного режима выбран DPI по умолчанию"
+    return None
+
+
+def _migrate_config_11_to_12(cfg):
+    """Версия 11 → 12: добавить явные источники HTTPS-подписок серверов."""
+    cfg.setdefault("transport_subscriptions", copy.deepcopy(DEFAULT_CONFIG["transport_subscriptions"]))
+    return "добавлена библиотека HTTPS-подписок HTTP CONNECT/SOCKS5 серверов"
+
+
 _CONFIG_MIGRATIONS = {
     0: _migrate_config_0_to_1,
     1: _migrate_config_1_to_2,
+    2: _migrate_config_2_to_3,
+    3: _migrate_config_3_to_4,
+    4: _migrate_config_4_to_5,
+    5: _migrate_config_5_to_6,
+    6: _migrate_config_6_to_7,
+    7: _migrate_config_7_to_8,
+    8: _migrate_config_8_to_9,
+    9: _migrate_config_9_to_10,
+    10: _migrate_config_10_to_11,
+    11: _migrate_config_11_to_12,
 }
 
 
@@ -528,6 +740,16 @@ def save_config_file(path, cfg, logger=None):
     return sanitized
 
 
+def _quarantine_broken_config(path: str) -> str:
+    """Move a malformed config to external recovery storage before replacing it."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    filename = f"{os.path.basename(path)}.broken-{stamp}"
+    destination = rollback_file("config", filename)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(path, destination)
+    return str(destination)
+
+
 def load_config_file(path, logger=None):
     logger = logger or logging.getLogger("UmbraNet.Config")
 
@@ -540,10 +762,8 @@ def load_config_file(path, logger=None):
         with open(path, "r", encoding="utf-8") as f:
             raw_cfg = json.load(f)
     except Exception as exc:
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        broken_path = f"{path}.broken-{stamp}"
         try:
-            os.replace(path, broken_path)
+            broken_path = _quarantine_broken_config(path)
             logger.error(f"Конфиг повреждён, сохранён backup: {broken_path}")
         except Exception:
             logger.error("Конфиг повреждён, не удалось сохранить backup")

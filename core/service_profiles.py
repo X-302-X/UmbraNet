@@ -53,7 +53,14 @@ YOUTUBE_RUNTIME_DOMAINS = _unique(['youtube.com',
  'yt4.ggpht.com',
  'yt3.googleusercontent.com',
  'jnn-pa.googleapis.com',
- 'play.google.com'])
+ 'play.google.com',
+ # YT Music (2026-10-06): шелл страницы ждёт эти хосты — без лечения
+ # они уходили голыми («не цель»), DPI их резал, страница «не до конца
+ # погружалась» (крутилка), хотя треки играли.
+ 'googleusercontent.com',
+ 'gstatic.com',
+ 'accounts.google.com',
+ 'waa-pa.clients6.google.com'])
 
 
 DISCORD_RUNTIME_DOMAINS = _unique(['dis.gd',
@@ -266,10 +273,9 @@ UI_SERVICE_PROFILES: dict[str, dict[str, Any]] = {
 }
 
 
-# Какой обход нужен сервису в главном меню.
-#   dns — хватает DNS-режима (xbox-dns и т.п.): ChatGPT и большинство AI/SaaS
-#   dpi — нужен DPI/WinWS (SNI/QUIC). В режиме «только DNS» не откроется:
-#         YouTube, Discord, стриминг, игры.
+# Какой путь нужен сервису в главном меню.
+#   vpn — PAC + проверенный пользовательский выход: AI и SaaS
+#   dpi — e1-spike/WinDivert для SNI/QUIC: YouTube, Discord, стриминг, игры
 # Поле можно переопределить в самом профиле ключом "bypass".
 _DPI_UI_SERVICES = {
     "YouTube",
@@ -284,7 +290,7 @@ _DPI_UI_SERVICES = {
 }
 
 for _name, _prof in UI_SERVICE_PROFILES.items():
-    _prof.setdefault("bypass", "dpi" if _name in _DPI_UI_SERVICES else "dns")
+    _prof.setdefault("bypass", "dpi" if _name in _DPI_UI_SERVICES else "vpn")
 
 
 SERVICE_PROFILES: dict[str, dict[str, Any]] = {
@@ -348,30 +354,31 @@ def ui_services() -> dict[str, tuple[str, str, list[str]]]:
 
 
 def service_bypass(name: str) -> str:
-    """Какой обход нужен сервису в главном меню: 'dns' или 'dpi'."""
+    """Какой путь нужен сервису: ``vpn`` или ``dpi``."""
     prof = UI_SERVICE_PROFILES.get(str(name or "").strip()) or {}
-    mode = str(prof.get("bypass") or "dns").strip().lower()
-    return mode if mode in ("dns", "dpi") else "dns"
+    mode = str(prof.get("bypass") or "vpn").strip().lower()
+    # ``dns`` existed in historical imported profile data. Interpret it as the
+    # new strict foreign-exit route instead of silently keeping DNS routing.
+    if mode == "dns":
+        mode = "vpn"
+    return mode if mode in ("vpn", "dpi") else "vpn"
 
 
 def service_bypass_map() -> dict[str, str]:
-    """Имя сервиса → 'dns' | 'dpi' (для чипов в списке главного меню)."""
+    """Имя сервиса → 'vpn' | 'dpi' (для чипов в списке главного меню)."""
     return {name: service_bypass(name) for name in UI_SERVICE_PROFILES}
 
 
 def service_allowed_in_mode(name: str, app_mode: str) -> bool:
-    """Можно ли включить сервис в текущем режиме окна.
-
-    combo — всё можно. dns_only не включает DPI-сервисы, dpi_only — DNS-сервисы.
-    """
-    mode = str(app_mode or "").strip().lower()
+    """Whether a service can be selected in the explicit VPN / Combo / DPI mode."""
+    mode = {"dns_only": "vpn", "dpi_only": "dpi"}.get(str(app_mode or "").strip().lower(),
+                                                            str(app_mode or "").strip().lower())
     if mode == "combo":
         return True
     bypass = service_bypass(name)
-    if mode == "dpi_only":
+    if mode == "dpi":
         return bypass == "dpi"
-    # dns_only и всё неизвестное
-    return bypass == "dns"
+    return bypass == "vpn"
 
 
 def preset_domains() -> set[str]:

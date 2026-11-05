@@ -1,51 +1,29 @@
 """
-UmbraNet - WinWS Engine
+Обёртка DPI-движка UmbraNet: исполняет bin/e1-spike.exe (собственное ядро).
 
-Обёртка над bin/winws.exe:
-  • ищет bin/ рядом с программой;
-  • запускает winws.exe с выбранной стратегией;
-  • пишет stdout/stderr WinWS в отдельный лог, чтобы не было «молча упал»;
-  • хранит last_error/last_args для диагностики UI.
+Модуль сохраняет историческое имя `winws_engine` ради совместимости импортов
+(dns_server / engine_adapter / network / тесты), но выполняет он НЕ winws, а
+наш движок e1-spike.exe. Принцип «отвёртки»: движок получает список целей и
+Uz (аргументы StrategyManager.get_args) и ТОЛЬКО исполняет их.
 
-Потокобезопасность (переписано 15.09.2026)
-------------------------------------------
-WinWS дёргают из разных потоков: рабочий поток кнопки «Старт», AI-генерация
-(QThread), фоновые таймеры health, кнопка «Стоп», закрытие программы. До
-правки гонка выражалась в двух симптомах:
-
-  1. «DPI включён, а его нет». stop() в своём finally БЕЗУСЛОВНО звал
-     _kill_orphan_processes(), а тот убивает winws.exe ПО МАСКЕ ПУТИ. Если в
-     этот момент другой поток как раз запустил новый WinWS (или restart() уже
-     дошёл до start()), свежий процесс убивался. Признак в UI: профиль
-     считается запущенным, а обхода нет.
-
-  2. Лишние процессы PowerShell. PowerShell звался на каждом stop() и ещё раз
-     на каждом cleanup_orphans(), а AI-генерация делает это для каждого из
-     12-30 вариантов — то есть десятки запусков powershell.exe за прогон,
-     каждый до 5 секунд ожидания.
-
-Что сделано:
-  • self._lock (RLock) сериализует ВСЕ переходы состояния: start / stop /
-    restart / cleanup_orphans. restart стал атомарным: между его stop() и
-    start() больше не может вклиниться чужой stop.
-  • На нормальном пути PowerShell НЕ вызывается вообще: terminate/kill
-    достаточно. PowerShell — только эскалация, когда процесс не умер.
-  • Любая зачистка получает keep_pid и НЕ трогает живой процесс движка.
-  • Эскалация бьёт точно по PID (Stop-Process -Id), а не по маске пути.
-  • самоубийство по маске осталось только как последний рубеж (cleanup_orphans
-    при выходе из программы), где оно и нужно.
-  • is_running()/status() читают состояние БЕЗ блокировки: это запросы статуса,
-    и они не должны ждать PowerShell (иначе UI морозился бы на секунды).
-
-Тест на регресс: tests/test_winws_engine.py
+Контракт запуска:  e1-spike.exe protect --json --strategy=<args.json>
+Штатный стоп:      перевод строки в stdin (как «⏹ Стоп» в Engine Lab).
+Тест на регресс:   tests/test_winws_engine.py
 """
 import logging
+import json
 import os
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+
+try:  # Normal package layout.
+    from core.dpi.engine_events import DpiEngineEvent, parse_engine_event
+except ImportError:  # Historical direct import used by focused tests.
+    from engine_events import DpiEngineEvent, parse_engine_event
 
 
 def _win_shell():
@@ -76,7 +54,7 @@ def build_orphan_kill_command(exe_path, bin_dir, keep_pid=None) -> str:
     """Готовит PowerShell-команду зачистки winws.exe текущей установки.
 
     Убиваем только процессы, связанные с НАШЕЙ папкой bin, чтобы не трогать
-    чужие установки zapret/winws. keep_pid — PID, который трогать нельзя
+    посторонние копии winws. keep_pid — PID, который трогать нельзя
     (живой WinWS движка): без этого ограничения зачистка убивает свежий запуск.
     """
     exe_ps = str(exe_path).replace("'", "''")
@@ -87,7 +65,7 @@ def build_orphan_kill_command(exe_path, bin_dir, keep_pid=None) -> str:
     return (
         f"$exe='{exe_ps}'; $bin='{bin_ps}'; "
         "Get-CimInstance Win32_Process | "
-        "Where-Object { $_.Name -ieq 'winws.exe' -and ("
+        "Where-Object { $_.Name -ieq 'e1-spike.exe' -and ("
         " ($_.ExecutablePath -and $_.ExecutablePath -ieq $exe) -or "
         " ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($bin, [System.StringComparison]::OrdinalIgnoreCase)) -or "
         " ($_.CommandLine -and $_.CommandLine.Contains($bin))"
@@ -122,12 +100,15 @@ INVALID_HANDLE_VALUE = -1
 _scan_provider = None
 
 
+_DPI_EXE_NAMES = frozenset({"e1-spike.exe", "winws.exe"})
+
+
 def _scan_processes_winapi() -> list[tuple[int, str]] | None:
-    """[(pid, путь к exe)] для процессов с именем winws.exe. None — не смогли.
+    """[(pid, путь к exe)] для UmbraNet e1-spike.exe и Zapret winws.exe.
 
     None означает «посмотреть не получилось» (не Windows, нет прав, сбой
     ctypes) — вызывающий код обязан откатиться на старый путь через PowerShell.
-    Пустой список означает «смотрели и winws.exe нет»: PowerShell уже не нужен.
+    Пустой список означает «смотрели и DPI-процессов нет»: PowerShell не нужен.
     """
     if os.name != "nt":
         return None
@@ -168,7 +149,7 @@ def _scan_processes_winapi() -> list[tuple[int, str]] | None:
             entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
             ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
             while ok:
-                if str(entry.szExeFile).lower() == "winws.exe":
+                if str(entry.szExeFile).lower() in _DPI_EXE_NAMES:
                     pid = int(entry.th32ProcessID)
                     path = ""
                     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
@@ -237,13 +218,44 @@ def _kill_pid_native(pid: int) -> bool:
         return False
 
 
+def remove_legacy_root_logs(project_root=None):
+    """Убирает старые логи из КОРНЯ проекта (когда они писались не в logs\).
+
+    Программа туда больше не пишет; хвосты только путают («почему umbranet.log
+    вне папки logs?» — пожелание 2026-10-05). Удаляется только известный
+    набор файлов в корне; содержимое logs\ не трогается.
+    """
+    if project_root is None:
+        project_root = Path(__file__).resolve().parents[2]
+    for name in ("umbranet.log", "e1-spike.log", "e1spike_args.json"):
+        try:
+            legacy = Path(project_root) / name
+            if legacy.is_file():
+                legacy.unlink()
+        except OSError:
+            pass  # файл занят другим процессом — не мешаем запуску
+
+
 class WinWSEngine:
     def __init__(self):
         self.process = None
         self._log_handle = None
+        # stdout is drained by one tee worker: the complete raw technical log
+        # stays in logs/e1-spike.log, while a whitelisted JSON subset can reach
+        # the structured in-app journal without a second WinDivert observer.
+        self._output_thread: threading.Thread | None = None
+        self._output_process = None
+        self._output_lock = threading.Lock()
+        self._event_lock = threading.Lock()
+        self._event_listeners: list[Callable[[DpiEngineEvent], None]] = []
         self._bin_dir = self._find_bin_dir()
-        self._exe_path = self._bin_dir / "winws.exe"
-        self._log_path = self._bin_dir.parent / "winws.log"
+        self._exe_path = self._bin_dir / "e1-spike.exe"
+        # Все логи — в одной папке logs\ рядом с bin\ (пожелание 2026-10-05:
+        # «сделать так, чтобы все логи были там»).
+        logs_dir = self._bin_dir.parent / "logs"
+        self._log_path = logs_dir / "e1-spike.log"
+        self._args_path = logs_dir / "e1spike_args.json"
+        remove_legacy_root_logs(self._bin_dir.parent)
         self.last_error = ""
         self.last_args = []
         self.last_cmd = []
@@ -325,13 +337,119 @@ class WinWSEngine:
             return ""
         return ""
 
-    def _close_log_handle(self):
-        if self._log_handle is not None:
+    def subscribe_events(self, callback: Callable[[DpiEngineEvent], None]) -> None:
+        """Subscribe to safe structured e1-spike events.
+
+        The callback receives only records parsed by ``engine_events``.  It is
+        never invoked under an engine lifecycle lock, so a slow/broken GUI log
+        subscriber cannot stall start, stop or packet handling.
+        """
+        if not callable(callback):
+            return
+        with self._event_lock:
+            if callback not in self._event_listeners:
+                self._event_listeners.append(callback)
+
+    def unsubscribe_events(self, callback: Callable[[DpiEngineEvent], None]) -> None:
+        with self._event_lock:
             try:
-                self._log_handle.close()
+                self._event_listeners.remove(callback)
+            except ValueError:
+                pass
+
+    def _publish_engine_event(self, event: DpiEngineEvent) -> None:
+        with self._event_lock:
+            listeners = list(self._event_listeners)
+        for callback in listeners:
+            try:
+                callback(event)
+            except Exception as exc:
+                log.debug("DPI activity listener raised: %s", exc)
+
+    def _write_engine_log(self, text: str) -> None:
+        with self._output_lock:
+            handle = self._log_handle
+            if handle is None:
+                return
+            try:
+                handle.write(text)
+                handle.flush()
+            except Exception as exc:
+                log.debug("Could not write e1-spike output: %s", exc)
+
+    def _pump_engine_output(self, proc) -> None:
+        """Drain one child stdout stream into file + structured event bridge."""
+        stream = getattr(proc, "stdout", None)
+        if stream is None:
+            return
+        try:
+            while True:
+                raw = stream.readline()
+                if not raw:
+                    break
+                text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+                self._write_engine_log(text)
+                event = parse_engine_event(text)
+                if event is not None:
+                    self._publish_engine_event(event)
+        except Exception as exc:
+            # The child log must never decide DPI availability.  A technical
+            # trace keeps this diagnosable without exposing exception text in
+            # the user journal.
+            log.debug("e1-spike output reader stopped: %s", exc)
+        finally:
+            try:
+                stream.close()
             except Exception:
                 pass
-            self._log_handle = None
+
+    def _start_output_reader(self, proc) -> None:
+        reader = threading.Thread(
+            target=self._pump_engine_output,
+            args=(proc,),
+            name="UmbraNetDpiOutput",
+            daemon=True,
+        )
+        self._output_process = proc
+        self._output_thread = reader
+        reader.start()
+
+    def _drain_output_reader(self, proc=None, timeout: float = 1.0) -> bool:
+        """Wait briefly for the child-output tee to finish; never block UI forever."""
+        reader = self._output_thread
+        if reader is None:
+            return True
+        if proc is not None and self._output_process is not proc:
+            return True
+        if reader is not threading.current_thread():
+            reader.join(timeout=max(0.0, float(timeout)))
+        if reader.is_alive():
+            return False
+        if self._output_thread is reader:
+            self._output_thread = None
+            self._output_process = None
+        return True
+
+    def _close_log_handle(self):
+        with self._output_lock:
+            if self._log_handle is not None:
+                try:
+                    self._log_handle.close()
+                except Exception:
+                    pass
+                self._log_handle = None
+
+    def _build_cmd(self, args):
+        """Команда запуска движка (выделена для тестов с фейковым exe).
+
+        Контракт «отвёртки»: аргументы Uz (список целей + приёмы обхода) из
+        StrategyManager.get_args пишутся в JSON-стратегию, и движок получает
+        e1-spike.exe protect --json --strategy=<файл> — ничего своего он не
+        подмешивает.
+        """
+        payload = {"id": "umbra", "name": "UmbraNet", "args": [str(a) for a in args]}
+        self._args_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return [str(self._exe_path), "protect", "--json", f"--strategy={self._args_path}"]
 
     def start(self, args):
         with self._lock:
@@ -344,27 +462,34 @@ class WinWSEngine:
         self.last_cmd = []
 
         if not self.is_available():
-            self.last_error = f"winws.exe не найден: {self._exe_path}"
+            self.last_error = f"e1-spike.exe не найден: {self._exe_path}"
             log.error(self.last_error)
             return False
         if not args:
-            self.last_error = "Пустые аргументы WinWS: стратегия не найдена или повреждена"
+            self.last_error = "Пустые аргументы движка: стратегия не найдена или повреждена"
             log.error(self.last_error)
             return False
         if self.is_running():
-            self.stop()
+            self.stop(reset_connections=False)
 
-        cmd = [str(self._exe_path)] + list(args)
+        cmd = self._build_cmd(args)
         self.last_cmd = cmd
         try:
-            log.info("Запуск WinWS: %s", " ".join(cmd))
+            log.info("Запуск движка: %s", " ".join(self.last_cmd))
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            # A prior child may have just exited: consume its final JSON/error
+            # lines before reusing the same technical-log handle.
+            if not self._drain_output_reader(timeout=1.0):
+                self.last_error = "Предыдущий поток вывода DPI-движка не завершился"
+                log.error(self.last_error)
+                return False
             self._close_log_handle()
-            self._log_handle = open(self._log_path, "a", encoding="utf-8", errors="replace")
-            self._log_handle.write("\n" + "=" * 80 + "\n")
-            self._log_handle.write(time.strftime("%Y-%m-%d %H:%M:%S") + " WinWS start\n")
-            self._log_handle.write("CMD: " + " ".join(cmd) + "\n")
-            self._log_handle.flush()
+            self._log_handle = open(
+                self._log_path, "a", encoding="utf-8", errors="replace", buffering=1
+            )
+            self._write_engine_log("\n" + "=" * 80 + "\n")
+            self._write_engine_log(time.strftime("%Y-%m-%d %H:%M:%S") + " e1-spike start\n")
+            self._write_engine_log("CMD: " + " ".join(cmd) + "\n")
 
             env = os.environ.copy()
             # Чтобы WinWS точно видел WinDivert.dll/cygwin1.dll рядом с собой.
@@ -373,27 +498,32 @@ class WinWSEngine:
             self.process = subprocess.Popen(
                 cmd,
                 cwd=str(self._bin_dir),
-                stdout=self._log_handle,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 env=env,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
             )
+            self._start_output_reader(self.process)
             time.sleep(0.8)
             if self.process.poll() is not None:
-                self.last_exit_code = self.process.returncode
+                failed_process = self.process
+                self.last_exit_code = failed_process.returncode
+                # Wait for the tee to commit the child’s final error before
+                # deriving a human diagnostic from the technical log.
+                self._drain_output_reader(failed_process, timeout=1.0)
                 tail = self._tail_log()
-                self.last_error = f"WinWS упал при старте (код {self.last_exit_code})"
+                self.last_error = f"Движок упал при старте (код {self.last_exit_code})"
                 if tail:
                     self.last_error += f": {tail[-500:]}"
                 log.error(self.last_error)
                 self.process = None
                 self._close_log_handle()
                 return False
-            log.info("WinWS запущен (PID %s), лог: %s", self.process.pid, self._log_path)
+            log.info("Движок запущен (PID %s), лог: %s", self.process.pid, self._log_path)
             return True
         except Exception as exc:
-            self.last_error = f"Ошибка запуска WinWS: {exc}"
+            self.last_error = f"Ошибка запуска движка: {exc}"
             log.error(self.last_error)
             self.process = None
             self._close_log_handle()
@@ -401,7 +531,7 @@ class WinWSEngine:
 
     # ── Запуск PowerShell: единственная точка в модуле ────────────────────────
 
-    def _run_ps(self, ps_cmd: str, timeout: float = PS_TIMEOUT) -> bool:
+    def _run_ps(self, ps_cmd: str, timeout: float = PS_TIMEOUT, quiet: bool = False) -> bool:
         """Выполняет PowerShell и считает вызовы в self.ps_calls.
 
         Счётчик нужен, чтобы регресс «PowerShell на каждом stop()» ловился
@@ -423,8 +553,13 @@ class WinWSEngine:
         shell = _win_shell()
         res = shell.run_ps(ps_cmd, timeout=timeout)
         if not res.ok:
-            self.last_error = res.human_error or "PowerShell не сработал"
-            log.debug("%s (команда: %s)", self.last_error, ps_cmd[:60])
+            # quiet: добровольные/страховочные шаги (например, остановка
+            # службы WinDivert) не должны засорять last_error — её отсутствие
+            # или отказ штатной остановки не ошибка (поле 2026-10-04:
+            # «last_error: Stop-Service…» в отчёте выглядел пугающе).
+            if not quiet:
+                self.last_error = res.human_error or "PowerShell не сработал"
+            log.debug("%s (команда: %s)", res.human_error or "PowerShell не сработал", ps_cmd[:60])
         return res.ok
 
     def _kill_orphan_processes(self, keep_pid=None) -> bool:
@@ -465,7 +600,7 @@ class WinWSEngine:
         """Свои winws.exe: список (pid, путь) и признак «посмотреть удалось».
 
         «Свои» — запущенные из нашего exe или из нашей папки bin. Чужие
-        установки zapret/winws не трогаем. keep_pid — наоборот, исключаем: это
+        копии winws не трогаем. keep_pid — наоборот, исключаем: это
         живой WinWS движка, убивать его нельзя.
         """
         scanned = _scan_processes()
@@ -487,7 +622,7 @@ class WinWSEngine:
         """winws.exe, НЕ относящиеся к нашей установке — «похожие программы».
 
         Нужны для понятной диагностики: если WinDivert занят чужой программой
-        (GoodbyeDPI/zapret/другая копия), наш winws.exe не сможет захватить
+        (сторонняя DPI-программа или другая копия), наш winws.exe не сможет захватить
         драйвер, и ни один вариант не покажет результат. Об этом лучше сказать
         прямо, чем показывать «стратегия не найдена».
         """
@@ -527,7 +662,7 @@ class WinWSEngine:
             ok = _kill_pid_native(pid)
             if ok:
                 killed.append(pid)
-                log.warning("Убит зависший winws.exe (PID %s): %s", pid, path)
+                log.warning("Убит зависший движок (PID %s): %s", pid, path)
             else:
                 left.append(pid)
         if left:
@@ -588,10 +723,15 @@ class WinWSEngine:
             "  Stop-Service -Name $s -Force -ErrorAction SilentlyContinue "
             "}"
         )
-        self._run_ps(ps)
+        self._run_ps(ps, quiet=True)
 
-    def stop(self) -> bool:
+    def stop(self, reset_connections: bool = True) -> bool:
         """Останавливает WinWS. True = процесс гарантированно мёртв.
+
+        reset_connections=True (кнопка «Стоп»): движку шлётся "rst" — он
+        сбрасывает «тёплые» соединения целей RST (иначе браузер продолжает
+        грузить по уже открытым каналам). False (перезапуск при смене
+        галочек) — тихий стоп без сброса.
 
         На нормальном пути PowerShell НЕ вызывается: terminate/kill достаточно.
         Это и убирает лишние powershell.exe, и не даёт зачистке по маске пути
@@ -601,20 +741,36 @@ class WinWSEngine:
             proc = self.process
             self.process = None
             if proc is None:
-                self._close_log_handle()
-                return True
+                if self._drain_output_reader(timeout=1.0):
+                    self._close_log_handle()
+                # Popen мог потеряться (restart из другого потока, сбой), а сирота
+                # из нашей bin/ всё ещё держит WinDivert и ПРОДОЛЖАЕТ обход —
+                # как раз случай «Стоп нажат, а трафик всё ещё обрабатывается».
+                # Обычный путь остановки такой процесс не видит, поэтому здесь
+                # быстрая зачистка только СВОИХ процессов, без PowerShell.
+                sweep = self.sweep_stale(keep_pid=None)
+                if sweep.get("killed") or sweep.get("left"):
+                    log.warning(
+                        "stop(): привязка к процессу потеряна, но нашлись движки нашей установки — "
+                        "убито %s, осталось %s",
+                        sweep.get("killed"), sweep.get("left"),
+                    )
+                return not bool(sweep.get("left"))
 
             pid = getattr(proc, "pid", None)
-            dead = self._terminate(proc)
-            self._close_log_handle()
+            dead = self._terminate(proc, reset_connections)
+            # ``_terminate`` waits for normal termination; draining after it
+            # preserves the final e1-spike JSON/error lines in both logs.
+            if self._drain_output_reader(proc, timeout=1.0):
+                self._close_log_handle()
 
             if dead:
-                log.info("WinWS остановлен (код %s)", self.last_exit_code)
+                log.info("Движок остановлен (код %s)", self.last_exit_code)
                 return True
 
             # Эскалация: процесс не отдал управление.
             # Бьём ТОЧНО по PID — маска пути могла бы задеть свежий запуск.
-            log.warning("WinWS (PID %s) не завершился штатно — добиваю", pid)
+            log.warning("Движок (PID %s) не завершился штатно — добиваю", pid)
             if pid:
                 # Сначала напрямую через WinAPI (десятки миллисекунд), и только
                 # если не вышло — PowerShell. На Windows это убирает ещё один
@@ -628,16 +784,36 @@ class WinWSEngine:
                 self._kill_orphan_processes(keep_pid=None)
                 dead = not process_alive(proc)
             if not dead:
-                self.last_error = f"WinWS (PID {pid}) не удалось остановить"
+                self.last_error = f"Движок (PID {pid}) не удалось остановить"
                 log.error(self.last_error)
+            elif self._drain_output_reader(proc, timeout=1.0):
+                self._close_log_handle()
             return dead
 
-    def _terminate(self, proc) -> bool:
+    def _terminate(self, proc, reset_connections: bool = True) -> bool:
         """terminate → wait → kill → wait. True, если процесс умер."""
         try:
             if proc.poll() is not None:
                 self.last_exit_code = proc.returncode
                 return True
+            # Штатный стоп: движок закрывается по строке в stdin (как
+            # «⏹ Стоп» в Engine Lab) — без kill и без обрыва статистики.
+            # "rst" — стоп И сброс соединений RST (кнопка Стоп); пустая
+            # строка — тихий стоп (перезапуск при смене галочек).
+            try:
+                if proc.stdin:
+                    proc.stdin.write(b"rst\n" if reset_connections else b"\n")
+                    proc.stdin.flush()
+                    # Живой движок выходит за ~100 мс; ждём до секунды,
+                    # дальше — штатная эскалация terminate/kill.
+                    deadline = time.time() + 1.0
+                    while time.time() < deadline:
+                        if proc.poll() is not None:
+                            self.last_exit_code = proc.returncode
+                            return True
+                        time.sleep(0.05)
+            except Exception:
+                pass
             proc.terminate()
             try:
                 proc.wait(timeout=STOP_TIMEOUT)
@@ -661,7 +837,7 @@ class WinWSEngine:
         """
         with self._lock:
             log.info("Перезапуск WinWS...")
-            self.stop()
+            self.stop(reset_connections=False)
             time.sleep(RESTART_SETTLE)
             return self._start_locked(args)
 

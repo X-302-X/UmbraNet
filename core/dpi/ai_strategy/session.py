@@ -1,14 +1,18 @@
 """
 Controlled AI generation session model.
 
-Это пока не исполнитель, а безопасный скелет будущей полноценной генерации.
-Полноценная сессия должна:
-  1. запросить подтверждение пользователя в UI;
-  2. остановить UmbraNet так же, как кнопка Stop;
-  3. тестировать временные варианты из mutations.py в изоляции;
-  4. выбрать лучший через scoring.py;
-  5. сохранить только финальную Uz, если score достаточный;
-  6. восстановить предыдущее состояние в finally.
+Модель контролируемой генерации: политику (лимиты времени/вариантов, порог
+score) и план (`plan_generation_session`) считает этот модуль; исполнение
+делегирует в общий controlled runner (`umbranet/engine_adapter.py` →
+`dpi_strategy_ai_run_controlled`).
+
+Полный цикл сессии:
+  1. запросить подтверждение пользователя в UI (цепочка UI);
+  2. остановить UmbraNet так же, как кнопка Stop (цепочка UI);
+  3. тестировать временные варианты из mutations.py в изоляции (runner);
+  4. выбрать лучший через scoring.py (runner);
+  5. сохранить только финальную Uz, если score достаточный (runner);
+  6. восстановить предыдущее состояние (dpi_strategy_ai_cleanup_runtime).
 """
 
 from __future__ import annotations
@@ -74,10 +78,18 @@ def plan_generation_session(config: dict[str, Any] | None = None,
 
 
 class ControlledGenerationSession:
-    """Заготовка будущего исполнителя генерации.
+    """Сессия контролируемой генерации: политика + делегирование runner.
 
-    Сейчас intentionally dry-run: чтобы не останавливать процессы и не менять
-    сеть, пока UI/engine lifecycle не будут подключены явно.
+    `dry_run()` возвращает план, ничего не запуская. `run()` исполняет генерацию
+    через общий controlled runner engine_adapter: winws.exe гоняется на
+    временных вариантах, пробы YouTube/Discord считаются через scoring, лучший
+    Uz сохраняется при score ≥ порога. Политика (включая `min_score_to_save`)
+    внутри runner берётся из `session_policy(self.mode)` — тот же расчёт,
+    что показывает `dry_run()`.
+
+    Контракт как у runner: основной UmbraNet должен быть остановлен вызывающей
+    цепочкой (UI делает это до вызова), иначе временные варианты будут мешать
+    боевому движку.
     """
 
     def __init__(self, config: dict[str, Any] | None = None, mode: str = "quick"):
@@ -89,8 +101,23 @@ class ControlledGenerationSession:
     def dry_run(self) -> dict[str, Any]:
         return plan_generation_session(self.config, self.mode)
 
-    def run(self) -> dict[str, Any]:
-        raise NotImplementedError(
-            "ControlledGenerationSession.run будет подключён после реализации "
-            "безопасного stop/start lifecycle и временного запуска вариантов."
+    def run(self, on_progress=None, should_cancel=None) -> dict[str, Any]:
+        """Исполняет контролируемую генерацию через общий runner.
+
+        Локальный импорт: на этапе импорта модуля core не зависит от слоя UI.
+        Прогресс и отмена — те же callback'и, что у
+        `engine_adapter.dpi_strategy_ai_run_controlled`.
+        """
+        try:
+            from umbranet.engine_adapter import dpi_strategy_ai_run_controlled
+        except ImportError as exc:
+            raise RuntimeError(
+                "ControlledGenerationSession.run требует слой UI (umbranet.engine_adapter): "
+                "запускайте из состава UmbraNet или вызывайте dry_run()."
+            ) from exc
+
+        return dpi_strategy_ai_run_controlled(
+            mode=self.mode,
+            on_progress=on_progress,
+            should_cancel=should_cancel,
         )

@@ -2,44 +2,65 @@ import ipaddress
 import time
 from urllib.parse import urlsplit
 
-BUILTIN_PROFILE_ID = "builtin-xbox-dns"
+DNS_AI_PROFILE_ID = "builtin-dns-ai"
+XBOX_PROFILE_ID = "builtin-xbox-dns"
+# BUILTIN_PROFILE_ID — совместимое имя для основного встроенного профиля.
+BUILTIN_PROFILE_ID = DNS_AI_PROFILE_ID
 MAX_USER_DNS_PROFILES = 10
 MAX_PROFILE_NAME_LEN = 20  # имя профиля: от 1 до 20 символов
-
-# ── ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ для адресов xbox-dns.ru ──────────────────────────
-# Все остальные модули (dns_server, process_monitor, ui/common, config_utils)
-# ДОЛЖНЫ импортировать эти константы, а не дублировать IP у себя.
-#
-# Важно: статические IP сервиса периодически меняются. Поэтому:
-#   • рекомендуемый режим по умолчанию — DoH по доменному ИМЕНИ
-#     (XBOX_DOH_URL), которое не зависит от конкретного IP;
-#   • IP ниже нужны только для UDP-режима и как fallback. Если они устареют —
-#     DoH продолжит работать. Обновлять их следует здесь, в одном месте.
-#
-# primary  = текущий A-адрес xbox-dns.ru
-# secondary= официально рекомендованные сервисом резервные IPv4
-XBOX_DNS_IPV4_PRIMARY   = "111.88.96.55"
-XBOX_DNS_IPV4_SECONDARY = "176.99.11.77"
-XBOX_DNS_IPV4_TERTIARY  = "80.78.247.254"
-XBOX_DNS_IPV6_PRIMARY   = "2a00:ab00:1233:26::50"
-XBOX_DNS_IPV6_SECONDARY = "2a00:ab00:1233:26::51"
-XBOX_DOH_URL            = "https://xbox-dns.ru/dns-query"
-
-# DoT/DoQ для xbox-dns.ru обслуживаются по доменному имени на порту 853.
-XBOX_DOT_HOST = "xbox-dns.ru"
-XBOX_DOQ_HOST = "xbox-dns.ru"
 DOT_DEFAULT_PORT = 853
 DOQ_DEFAULT_PORT = 853
 
-BUILTIN_DNS_PROFILE = {
-    "id": BUILTIN_PROFILE_ID,
+# ── Основной встроенный провайдер: DNS-AI ───────────────────────────────────
+# DNS-AI не обслуживает обычный DNS на порту 53: используются только DoH, DoT
+# и DoQ. Имя обязательно для SNI и проверки TLS-сертификата при подключении по IP.
+DNS_AI_DNS_IPV4_PRIMARY = "194.87.196.13"
+DNS_AI_DNS_IPV4_SECONDARY = "186.246.49.127"
+DNS_AI_DNS_IPV6_PRIMARY = "2a00:b700:5::3:62"
+DNS_AI_DNS_IPV6_SECONDARY = "2a0a:2b41:0:500d::53"
+DNS_AI_DOH_URL = "https://dns.dns-ai.ru/dns-query"
+DNS_AI_HOST = "dns.dns-ai.ru"
+
+DNS_AI_DNS_PROFILE = {
+    "id": DNS_AI_PROFILE_ID,
+    "name": "DNS-AI",
+    "ipv4_primary": DNS_AI_DNS_IPV4_PRIMARY,
+    "ipv4_secondary": DNS_AI_DNS_IPV4_SECONDARY,
+    "ipv6_primary": DNS_AI_DNS_IPV6_PRIMARY,
+    "ipv6_secondary": DNS_AI_DNS_IPV6_SECONDARY,
+    "doh_url": DNS_AI_DOH_URL,
+    "dot_host": DNS_AI_HOST,
+    "dot_ip": DNS_AI_DNS_IPV4_PRIMARY,
+    "dot_port": DOT_DEFAULT_PORT,
+    "doq_host": DNS_AI_HOST,
+    "doq_ip": DNS_AI_DNS_IPV4_PRIMARY,
+    "doq_port": DOQ_DEFAULT_PORT,
+    "builtin": True,
+}
+
+# В коде резолвера это имя означает «основной встроенный профиль».
+BUILTIN_DNS_PROFILE = DNS_AI_DNS_PROFILE
+
+# ── Встроенный провайдер: xbox-dns.ru ───────────────────────────────────────
+# IP адреса обновляются здесь, а предпочтительный транспорт использует DoH URL
+# по доменному имени, поэтому не зависит от смены IP сервиса.
+XBOX_DNS_IPV4_PRIMARY = "111.88.96.55"
+XBOX_DNS_IPV4_SECONDARY = "176.99.11.77"
+XBOX_DNS_IPV4_TERTIARY = "80.78.247.254"
+XBOX_DNS_IPV6_PRIMARY = "2a00:ab00:1233:26::50"
+XBOX_DNS_IPV6_SECONDARY = "2a00:ab00:1233:26::51"
+XBOX_DOH_URL = "https://xbox-dns.ru/dns-query"
+XBOX_DOT_HOST = "xbox-dns.ru"
+XBOX_DOQ_HOST = "xbox-dns.ru"
+
+XBOX_DNS_PROFILE = {
+    "id": XBOX_PROFILE_ID,
     "name": "xbox-dns.ru",
     "ipv4_primary": XBOX_DNS_IPV4_PRIMARY,
     "ipv4_secondary": XBOX_DNS_IPV4_SECONDARY,
     "ipv6_primary": XBOX_DNS_IPV6_PRIMARY,
     "ipv6_secondary": XBOX_DNS_IPV6_SECONDARY,
     "doh_url": XBOX_DOH_URL,
-    # DoT (DNS-over-TLS) и DoQ (DNS-over-QUIC):
     "dot_host": XBOX_DOT_HOST,
     "dot_ip": XBOX_DNS_IPV4_PRIMARY,
     "dot_port": DOT_DEFAULT_PORT,
@@ -189,7 +210,12 @@ def sanitize_user_dns_profiles(raw_profiles):
 
 
 def get_builtin_dns_profiles():
-    return [dict(BUILTIN_DNS_PROFILE), dict(COMSS_DNS_PROFILE)]
+    """Встроенные профили в порядке, в котором они показываются и фейловерятся."""
+    return [
+        dict(DNS_AI_DNS_PROFILE),
+        dict(XBOX_DNS_PROFILE),
+        dict(COMSS_DNS_PROFILE),
+    ]
 
 
 def get_failover_providers(config):

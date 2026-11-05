@@ -33,6 +33,7 @@ import ipaddress
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 import urllib.error
@@ -41,6 +42,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from core.diagnostics import log_recoverable
+from rollback_paths import rollback_file
 from urllib.parse import urlsplit
 
 log = logging.getLogger("UmbraNet.BogusUpdater")
@@ -50,7 +52,7 @@ log = logging.getLogger("UmbraNet.BogusUpdater")
 # URL удалённого списка: raw-файл прямо из репозитория UmbraNet на GitHub.
 # Меняем только этот URL, если репо переедет.
 REMOTE_URL = (
-    "https://raw.githubusercontent.com/302XXX/UmbraNet/main/bogus_ips_remote.json"
+    "https://raw.githubusercontent.com/X-302-X/UmbraNet/main/bogus_ips_remote.json"
 )
 
 # Локальный бандл: файл bogus_ips_remote.json поставляется вместе с программой
@@ -166,15 +168,14 @@ def _save_cache(config_dir: str, ips: list[str], subnets: list[str]) -> bool:
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
-            # H1: бэкап предыдущего кэша перед атомарной заменой
+            # Сохраняем предыдущий кэш вне дерева программы перед заменой.
             if os.path.exists(path):
                 try:
-                    bak = f"{path}.bak"
-                    # копия, не move — сохраняем предыдущий кэш на случай битья нового
-                    import shutil
-                    shutil.copy2(path, bak)
+                    backup_path = rollback_file("network", f"{os.path.basename(path)}.bak")
+                    backup_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, backup_path)
                 except Exception as exc:
-                    log.debug("Не удалось создать bak кэша: %s", exc)
+                    log.debug("Не удалось создать recovery-копию кэша: %s", exc)
             os.replace(tmp, path)  # атомарная замена файла
         finally:
             try:

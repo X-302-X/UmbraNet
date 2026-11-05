@@ -371,6 +371,18 @@ def set_dns_native(adapters, ipv4=None, ipv6=None, reset: bool = False,
             ok_names.append(name)
         else:
             err_names.append(f"{name}: {res.human_error or 'не сработало'}")
+    if ok_names:
+        # PowerShell-путь очищает кэш внутри своего скрипта. Здесь PowerShell
+        # уже недоступен, поэтому явно идём через win_shell → ipconfig /flushdns.
+        # Иначе Windows может продолжить отдавать запись прежнего DNS-сервера.
+        invalidate_dns_cache()
+        cache_res = shell.flush_dns_cache()
+        if not cache_res.ok:
+            log.warning("DNS изменён через netsh, но кэш Windows не очищен: %s",
+                        cache_res.human_error)
+        elif cache_res.note:
+            log.info("DNS-кэш после netsh очищен через %s (%s)",
+                     cache_res.via, cache_res.note)
     return ok_names, err_names
 
 
@@ -392,6 +404,16 @@ def get_active_adapters() -> list:
 
 # Stage 2: кэш текущих DNS на 5 сек — health_score + leak check дергают часто
 _DNS_CACHE = {"ts": 0.0, "data": {}}
+
+
+def invalidate_dns_cache() -> None:
+    """Сбросить кэш get_current_dns после ЛЮБОЙ смены DNS.
+
+    Иначе аудит после Стопа читает старое значение «127.0.0.1» и ложно
+    ругается «системный DNS всё ещё указывает на UmbraNet» (поле 2026-10-06).
+    """
+    _DNS_CACHE["ts"] = 0.0
+    _DNS_CACHE["data"] = {}
 _DNS_CACHE_TTL = 5.0
 
 def get_current_dns(use_cache: bool = True) -> dict:
@@ -565,6 +587,7 @@ def set_dns_profile(ipv4_primary: str, ipv4_secondary: str = "",
         msg = f"{profile_name} на: {', '.join(ok_adapters)}"
         if err_adapters:
             msg += f"\nОшибки: {'; '.join(err_adapters)}"
+        invalidate_dns_cache()  # смена DNS — кэш чтения больше не наш
         return True, msg, ok_adapters
 
     # PowerShell не сработал — ставим DNS через netsh (пункт H4). Для этого нужен
@@ -581,6 +604,7 @@ def set_dns_profile(ipv4_primary: str, ipv4_secondary: str = "",
             if native_err:
                 msg += f"\nОшибки: {'; '.join(native_err)}"
             log.info("set_dns_profile выполнен через netsh: %s", native_ok)
+            invalidate_dns_cache()  # смена DNS — кэш чтения больше не наш
             return True, msg, native_ok
 
     if not adapters:
@@ -821,6 +845,7 @@ def set_dns_to_localhost(fallback_ipv4: str = '1.1.1.1',
         )
         if err_adapters:
             msg += f"\nОшибки: {'; '.join(err_adapters)}"
+        invalidate_dns_cache()  # смена DNS — кэш чтения больше не наш
         return True, msg, ok_adapters
 
     # Ни один адаптер не настроен. Покажем человекочитаемую причину:

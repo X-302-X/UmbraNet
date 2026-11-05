@@ -3,9 +3,9 @@ import os
 import time
 
 from config_utils import apply_config_migrations, sanitize_config
+from rollback_paths import rollback_subdir
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-BACKUP_DIR = os.path.join(BASE_DIR, "backups")
+BACKUP_DIR = str(rollback_subdir("config"))
 
 
 

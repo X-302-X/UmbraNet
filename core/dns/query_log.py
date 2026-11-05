@@ -2,18 +2,20 @@
 UmbraNet — Query Log
 =====================
 
-Структурированный журнал DNS-запросов. В отличие от обычного umbranet.log
-(который текстовый и предназначен для разработчика), Query Log хранит
-DNS-события как объекты с полями и предназначен для отображения в GUI
-и экспорта.
+Структурированный журнал DNS- и DPI-активности. В отличие от обычного
+``umbranet.log`` и полного ``logs/e1-spike.log`` (они текстовые и нужны для
+диагностики), Query Log хранит безопасные пользовательские события как объекты
+с полями и предназначен для отображения в GUI и экспорта.
 
 Архитектура:
   - `QueryLog` — потокобезопасный ring-buffer записей фиксированного размера.
   - Подписчики (`subscribe(callback)`) — GUI просто подписывается на новые
-    записи и обновляет Treeview через `after()`. Без поллинга файла.
-  - `QueryLogEntry` — dataclass, чтобы UI не зависел от dnslib-объектов.
+    записи и обновляет Treeview через сигнал. Без поллинга файла.
+  - `QueryLogEntry` — dataclass, чтобы UI не зависел от сетевых библиотек или
+    формата stdout DPI-движка.
 
-Каждый resolve() в dns_server.py создаёт ровно одну QueryLogEntry.
+Каждый DNS resolve() в dns_server.py создаёт ровно одну запись. Реальные
+структурированные события e1-spike добавляет `core.dpi.log_bridge`.
 """
 
 import logging
@@ -35,6 +37,8 @@ SOURCE_BOGUS_NX = "bogus-NX"        # bogus-detection вернул NXDOMAIN
 SOURCE_BLOCKED = "blocked"        # пользовательская блокировка домена
 SOURCE_SERVFAIL = "servfail"        # upstream не ответил
 SOURCE_BG_REFRESH = "bg-refresh"    # фоновый refresh stale-записи (служебная)
+SOURCE_DPI = "dpi"                  # реальное действие или lifecycle DPI-движка
+SOURCE_DPI_ERROR = "dpi-error"      # реальная ошибка DPI-движка или его lifecycle
 
 
 @dataclass
@@ -46,7 +50,7 @@ class QueryLogEntry:
     timestamp: float            # unix time, time.time()
     domain: str                 # доменное имя запроса (без точки в конце)
     qtype: str                  # "A", "AAAA", "HTTPS", и т.д.
-    source: str                 # один из SOURCE_*
+    source: str                 # один из SOURCE_* (DNS, DPI или системная диагностика)
     routed: bool                # был ли домен в списке routed_domains
     rcode: str = "NOERROR"      # текстовый код ответа
     latency_ms: int = 0         # сколько занял resolve() (0 для cache)

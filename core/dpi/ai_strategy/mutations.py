@@ -61,11 +61,33 @@ def _replace_fake_bins(args: list[str], mask_id: str) -> list[str]:
     return out
 
 
+VOICE_UDP_RANGES = ("19294-19344", "50000-65535")
+
+
+def _voice_only_wf_udp(arg: str) -> str | None:
+    """Из --wf-udp=... оставить только голосовые диапазоны (None — нечего).
+
+    Голос Дискорда (19294-19344, 50000-65535) переживает мутацию «tcp_only»:
+    эксперимент «только TCP» про UDP/QUIC-443, а не про голос (2026-10-06).
+    """
+    if not arg.startswith("--wf-udp="):
+        return None
+    parts = [p.strip() for p in arg.split("=", 1)[1].split(",") if p.strip()]
+    kept = [p for p in parts if p in VOICE_UDP_RANGES]
+    if not kept:
+        return None
+    return "--wf-udp=" + ",".join(kept)
+
+
 def _remove_udp_blocks(args: list[str]) -> list[str]:
     """Убирает UDP/QUIC блоки из args, оставляя TCP-секции.
 
     Работает с winws-разделителями --new. Если секция содержит --filter-udp
     или --wf-udp без TCP-фильтра, секция удаляется.
+
+    ГОЛОС НЕ ТРОГАЕМ (2026-10-06): секция с --filter-l7= (discord,stun)
+    сохраняется всегда, а из --wf-udp остаются голосовые диапазоны. Иначе
+    сохранённая стратегия ломала бы голос Дискорда.
     """
     sections: list[list[str]] = [[]]
     for arg in args:
@@ -77,23 +99,36 @@ def _remove_udp_blocks(args: list[str]) -> list[str]:
     kept: list[list[str]] = []
     global_args: list[str] = []
     for idx, section in enumerate(sections):
-        has_udp = any(a.startswith("--filter-udp") or a.startswith("--wf-udp") for a in section)
-        has_tcp_filter = any(a.startswith("--filter-tcp") for a in section)
-        if idx == 0:
-            # В первой секции могут быть глобальные --wf-tcp/--wf-udp. Сохраняем
-            # TCP-глобалы, UDP-глобалы выкидываем.
-            filtered = [a for a in section if not a.startswith("--wf-udp")]
-            if has_udp and not has_tcp_filter:
-                global_args = [a for a in filtered if a.startswith("--wf-tcp")]
-            else:
-                kept.append(filtered)
-        elif has_udp and not has_tcp_filter:
-            continue
-        else:
+        # Голосовая секция — свята: вырезать нельзя ни при какой мутации.
+        if any(a.startswith("--filter-l7=") for a in section):
             kept.append(section)
+            continue
+        has_udp = any(a.startswith("--filter-udp") for a in section)
+        has_tcp_filter = any(a.startswith("--filter-tcp") for a in section)
+        # Глобальные --wf-*: TCP — всегда; из UDP — только голосовые диапазоны.
+        wf_args: list[str] = []
+        rest: list[str] = []
+        for a in section:
+            if a.startswith("--wf-udp"):
+                v = _voice_only_wf_udp(a)
+                if v:
+                    wf_args.append(v)
+            elif a.startswith("--wf-tcp"):
+                wf_args.append(a)
+            else:
+                rest.append(a)
+        if has_udp and not has_tcp_filter:
+            # Сам UDP/QUIC-блок выкидываем, глобалы (в т.ч. голос) — сохраняем.
+            global_args.extend(wf_args)
+            continue
+        if idx == 0:
+            global_args.extend(wf_args)
+            kept.append(rest)
+        else:
+            kept.append(wf_args + rest)
 
     if global_args and kept:
-        kept[0] = global_args + [a for a in kept[0] if not a.startswith("--wf-tcp")]
+        kept[0] = global_args + [a for a in kept[0] if not a.startswith("--wf-")]
     elif global_args and not kept:
         kept.append(global_args)
 

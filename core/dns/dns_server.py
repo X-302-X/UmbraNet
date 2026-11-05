@@ -12,7 +12,6 @@ UmbraNet - Локальный DNS-сервер с выборочной марш�
 Решение: слушаем также на ::1 и прописываем оба DNS в Windows.
 """
 
-import base64
 import copy
 import ipaddress
 import json
@@ -23,21 +22,22 @@ import socket
 import threading
 import time
 
-import requests
-
 from core.diagnostics import log_recoverable
+from endpoint_probe import query_doh_record
 from bogus_ips import (
     build_bogus_index_with_cache,
     response_contains_bogus,
 )
 from config_utils import _to_bool, load_config_file, save_config_file
 from dns_cache import DNSCache
+from rollback_paths import rollback_file
 from dns_helpers import cap_response_ttl as _cap_response_ttl
 from dns_helpers import ordered_upstreams as _ordered_upstreams
-from dnslib import QTYPE, RCODE, DNSRecord
+from dnslib import A, AAAA, QTYPE, RCODE, DNSRecord, RR
 from dnslib.server import BaseResolver, DNSLogger, DNSServer
 from profile_utils import (
     BUILTIN_DNS_PROFILE,
+    DNS_AI_PROFILE_ID,
     get_active_dns_profile,
     get_failover_providers,
 )
@@ -67,11 +67,22 @@ from winws_engine import get_winws_engine
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
+# Все логи — в одной папке logs\ (раньше umbranet.log жил в корне).
+LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+# Старые логи в корне (до появления logs\) убираем сами — пользователь
+# 2026-10-05: «удали оставшиеся логи вне папки logs».
+try:
+    from winws_engine import remove_legacy_root_logs
+    remove_legacy_root_logs(PROJECT_ROOT)
+except Exception:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(PROJECT_ROOT, 'umbranet.log'), encoding='utf-8'),
+        logging.FileHandler(os.path.join(LOG_DIR, 'umbranet.log'), encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -335,34 +346,17 @@ def _query_udp_dns(server_ip: str, request, timeout: float = 4.0):
     return response
 
 
-def _query_doh_dns(doh_url: str, request, timeout: float = 5.0):
-    """DoH-запрос с GET и POST fallback, сохраняя исходный DNS wire-format."""
-    wire = request.pack()
-
-    try:
-        b64 = base64.urlsafe_b64encode(wire).rstrip(b'=').decode()
-        response = requests.get(
-            doh_url,
-            headers={"Accept": "application/dns-message"},
-            params={"dns": b64},
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        return DNSRecord.parse(response.content)
-    except Exception as exc:
-        log_recoverable(log, 'DoH POST не удался; пробуем GET', exc, level=logging.DEBUG)
-
-    response = requests.post(
-        doh_url,
-        headers={
-            "Content-Type": "application/dns-message",
-            "Accept": "application/dns-message",
-        },
-        data=wire,
-        timeout=timeout,
+def _query_doh_dns(
+    doh_url: str,
+    request,
+    timeout: float = 5.0,
+    connect_ip: str | None = None,
+):
+    """DoH-запрос с HTTP/2; при IP сохраняет SNI и TLS-проверку имени."""
+    response, _transport = query_doh_record(
+        doh_url, request, timeout=timeout, connect_ip=connect_ip
     )
-    response.raise_for_status()
-    return DNSRecord.parse(response.content)
+    return response
 
 
 def _run_upstreams_with_strategy(
@@ -470,19 +464,83 @@ def resolve_via_xbox_udp(request, config: dict, timeout: float = 4.0, profile: d
     )
 
 
+def _profile_doh_connect_ips(profile: dict) -> list[str]:
+    """Извлекает IP DoH-апстрима из профиля в порядке безопасного failover."""
+    out = []
+    for key in ("ipv4_primary", "ipv4_secondary", "ipv6_primary", "ipv6_secondary"):
+        ip = str((profile or {}).get(key) or "").strip()
+        if ip and ip not in out:
+            out.append(ip)
+    return out
+
+
+# Chromium запрашивает HTTPS/SVCB-записи раньше или вместе с A/AAAA и может
+# использовать ipv4hint/ipv6hint вместо ответа A. DNS-AI для доменов обхода
+# выдаёт специальный IPv4, но в HTTPS и AAAA оставляет публичные Cloudflare IP;
+# тогда браузер обходит сам результат DNS-AI. Эти типы скрываем только при
+# активном DNS-AI и только в маршрутизируемой ветке — не для обычного DNS.
+_DNS_AI_BROWSER_DIRECT_HINT_TYPES = frozenset({"AAAA", "HTTPS", "SVCB"})
+
+
+def _needs_dns_ai_browser_compat(profile: dict, qtype: str) -> bool:
+    """Нужно ли оставить Chromium только безопасный IPv4-ответ DNS-AI."""
+    if str(qtype or "").upper() not in _DNS_AI_BROWSER_DIRECT_HINT_TYPES:
+        return False
+    return str((profile or {}).get("id") or "") == DNS_AI_PROFILE_ID
+
+
+def _bootstrap_upstream_reply(request, profile: dict):
+    """Отдаёт IP активного DNS-апстрима без рекурсивного резолва его имени."""
+    domain, _qtype = _question_meta(request)
+    names = {
+        str(profile.get("dot_host") or "").strip().lower().rstrip("."),
+        str(profile.get("doq_host") or "").strip().lower().rstrip("."),
+        _hostname_from_url(profile.get("doh_url")) or "",
+    }
+    if domain.lower().rstrip(".") not in names:
+        return None
+
+    qtype = int(request.q.qtype)
+    if qtype == QTYPE.A:
+        addresses = [profile.get("ipv4_primary"), profile.get("ipv4_secondary")]
+        record_type, record_data = QTYPE.A, A
+    elif qtype == QTYPE.AAAA:
+        addresses = [profile.get("ipv6_primary"), profile.get("ipv6_secondary")]
+        record_type, record_data = QTYPE.AAAA, AAAA
+    else:
+        return None
+
+    reply = request.reply()
+    for ip in dict.fromkeys(str(item).strip() for item in addresses if item):
+        try:
+            reply.add_answer(RR(request.q.qname, record_type, rdata=record_data(ip), ttl=60))
+        except Exception as exc:
+            log.debug("Некорректный bootstrap IP DNS-профиля %s: %s", ip, exc)
+    return reply if reply.rr else None
+
+
 def resolve_via_xbox_doh(request, config: dict, profile: dict = None):
-    """Резолвит через DoH DNS-профиля, сохраняя полный DNS-ответ апстрима."""
+    """Резолвит через DoH DNS-профиля, не резолвя апстрим через самого себя."""
     domain, qtype = _question_meta(request)
     if profile is None:
         profile = get_active_dns_profile(config)
     doh_url = profile.get("doh_url") or BUILTIN_DNS_PROFILE["doh_url"]
-    try:
-        response = _query_doh_dns(doh_url, request, timeout=5.0)
-        log.info(f"[{profile.get('name')} DoH] {domain} {qtype} → {_response_summary(response)}")
-        return response
-    except Exception as e:
-        log.error(f"{profile.get('name')} DoH не удался для {domain} {qtype}: {e}")
-        return None
+    connect_ips = _profile_doh_connect_ips(profile)
+    errors = []
+    for connect_ip in connect_ips or [None]:
+        try:
+            response = _query_doh_dns(
+                doh_url, request, timeout=5.0, connect_ip=connect_ip
+            )
+            log.info(f"[{profile.get('name')} DoH] {domain} {qtype} → {_response_summary(response)}")
+            return response
+        except Exception as exc:
+            target = connect_ip or _hostname_from_url(doh_url) or doh_url
+            errors.append(f"{target}: {exc}")
+    log.error(
+        f"{profile.get('name')} DoH не удался для {domain} {qtype}: {'; '.join(errors)}"
+    )
+    return None
 
 
 def _profile_dot_doq_targets(profile: dict, transport: str = "dot"):
@@ -900,6 +958,9 @@ class UmbraNetResolver(BaseResolver):
             return  # уже обновляется кем-то другим
 
         domain, qtype = _question_meta(request)
+        # Снимок поколения нужен, чтобы clear() при смене профиля/остановке
+        # не был отменён запоздавшим ответом старого фонового запроса.
+        cache_generation = self.cache.generation()
 
         if not self._refresh_slots.acquire(blocking=False):
             # Все места заняты (P2-1): под нагрузкой «поток на домен» — это сотни
@@ -927,8 +988,17 @@ class UmbraNetResolver(BaseResolver):
                         f"не обновляем кэш"
                     )
                     return
-                self.cache.set(request, routed, fresh, **cache_kwargs)
-                log.debug(f"[bg-refresh] {domain} {qtype}: кэш обновлён")
+                stored = self.cache.set(
+                    request, routed, fresh, **cache_kwargs,
+                    expected_generation=cache_generation,
+                )
+                if stored:
+                    log.debug(f"[bg-refresh] {domain} {qtype}: кэш обновлён")
+                else:
+                    log.debug(
+                        f"[bg-refresh] {domain} {qtype}: "
+                        "ответ отброшен после очистки кэша"
+                    )
             except Exception as exc:
                 log.warning(f"[bg-refresh] {domain} {qtype}: ошибка обновления: {exc}")
             finally:
@@ -950,6 +1020,18 @@ class UmbraNetResolver(BaseResolver):
                        rcode_override="NXDOMAIN", note="пользовательская блокировка")
             return _nxdomain_reply(request)
 
+        # Имя DoH/DoT/DoQ-апстрима нельзя отправлять в его же маршрут: это
+        # создаёт рекурсивный bootstrap-цикл и многосекундные таймауты.
+        profile = get_active_dns_profile(self.config)
+        bootstrap = _bootstrap_upstream_reply(request, profile)
+        if bootstrap is not None:
+            log.info("[bootstrap] %s %s → адреса активного DNS-профиля", domain, qtype)
+            _log_query(
+                request, SOURCE_SYSTEM, False, started, response=bootstrap,
+                note="bootstrap адреса DNS-апстрима",
+            )
+            return _proxy_reply_from_upstream(request, bootstrap)
+
         routed = is_domain_routed(domain, self.config, self.process_tracker)
 
         if routed:
@@ -964,6 +1046,24 @@ class UmbraNetResolver(BaseResolver):
         stale_ttl = self._stale_ttl()
 
         cache_kwargs = {"ttl_override": routed_cache_ttl, "stale_ttl": stale_ttl}
+
+        # DNS-AI подменяет A специальным IPv4 для обхода, но его AAAA и
+        # HTTPS/SVCB-подсказки содержат прямые Cloudflare-адреса. Chromium
+        # предпочитает такие подсказки и этим обходит сам DNS-маршрут. Пустой
+        # NOERROR заставляет браузер использовать следующий A-запрос. Это
+        # намеренно касается лишь выбранного DNS-AI и доменов «обход».
+        active_profile = get_active_dns_profile(self.config)
+        if _needs_dns_ai_browser_compat(active_profile, qtype):
+            reply = request.reply()
+            _log_query(
+                request,
+                SOURCE_ROUTED,
+                routed,
+                started,
+                response=reply,
+                note="DNS-AI: прямые IPv6/HTTPS-подсказки скрыты для IPv4-обхода",
+            )
+            return reply
 
         # ── IPv6 приоритет / трюк обхода ──
         if qtype == "A" and _to_bool(self.config.get("ipv6_priority_enabled", False), False):
@@ -1407,7 +1507,9 @@ class UmbraNetDNS:
                 if os.path.exists(path):
                     try:
                         import shutil
-                        shutil.copy2(path, f"{path}.bak")
+                        backup_path = rollback_file("network", f"{os.path.basename(path)}.bak")
+                        backup_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(path, backup_path)
                     except Exception as exc:
                         log_recoverable(log, 'Не удалось создать резервную копию кэша подписок', exc,
                                         level=logging.WARNING)
@@ -1442,6 +1544,11 @@ class UmbraNetDNS:
         return (self.config is config and self._subscriptions_generation == generation and
                 list(self.config.get("routed_subscriptions", []) or []) == urls)
 
+    def clear_dns_cache(self, reason: str = "ручная очистка") -> None:
+        """Сбрасывает ответы UmbraNet и отменяет устаревшие фоновые refresh."""
+        self.cache.clear()
+        log.info("DNS-кэш UmbraNet очищен: %s", reason)
+
     def reload_config(self):
         with self._subscription_state_lock:
             config = load_config()
@@ -1453,13 +1560,17 @@ class UmbraNetDNS:
             self.config = config
             self.load_subscribed_domains()
             self._cfg_ref[0] = self.config
-            self.cache.clear()
+            self.clear_dns_cache("конфигурация перезагружена")
         log.info("Конфигурация перезагружена; DNS-кэш очищен")
 
     def start(self):
         if self.running:
             log.info("Сервер уже запущен")
             return True
+
+        # Предыдущая сессия могла оставить stale-записи: новый запуск обязан
+        # резолвить через текущий профиль, а не отдавать вчерашний proxy-IP.
+        self.clear_dns_cache("начало новой сессии")
 
         # Новая сессия работы — статистика ответов начинается с нуля, иначе в
         # карточке «Сейчас отвечает» смешались бы прошлый и текущий запуски.
@@ -1516,11 +1627,11 @@ class UmbraNetDNS:
                     self.winws.start(args)
                 else:
                     log.warning(
-                        "WinWS не запущен: %s",
+                        "DPI-движок не запущен: %s",
                         manager.last_error or f"стратегия {strategy_id} не готова",
                     )
             except Exception as exc:
-                log.error(f"Ошибка запуска WinWS: {exc}")
+                log.error(f"Ошибка запуска DPI-движка: {exc}")
 
         resolver = UmbraNetResolver(self._cfg_ref, self.cache, self.process_tracker)
         self._resolver = resolver   # нужен для on_update callback BogusUpdater'а
@@ -1619,7 +1730,7 @@ class UmbraNetDNS:
                 if hasattr(self, "winws") and self.winws:
                     self.winws.stop()
             except Exception as exc:
-                log_recoverable(log, 'Не удалось остановить WinWS после неудачного старта DNS', exc, level=logging.ERROR)
+                log_recoverable(log, 'Не удалось остановить DPI-движок после неудачного старта DNS', exc, level=logging.ERROR)
             # До создания DNS-сокетов мы уже могли запустить фоновые helper'ы.
             # Не оставляем их жить после неудачного старта: иначе повторный
             # запуск создавал лишние потоки и stale-состояние трекера.
@@ -1669,6 +1780,9 @@ class UmbraNetDNS:
             self.cache.stop_janitor()
         except Exception as exc:
             log_recoverable(log, 'Не удалось остановить очистку DNS-кэша', exc, level=logging.WARNING)
+        # После закрытия сокетов новых запросов уже не будет. Инвалидируем
+        # остаток сессии до следующего «Старт».
+        self.clear_dns_cache("остановка DNS-сервера")
         self.running = False
         self.server4 = None
         self.server4_tcp = None
@@ -1714,9 +1828,9 @@ class UmbraNetDNS:
         Устанавливает режим работы DPI.
 
         mode:
-          'off'    — DPI выключен (только DNS; синий режим)
-          'combo'  — split + fake (комбо; чёрный режим)
-          'zapret' — split + fake + disorder (только DPI; красный режим)
+          'off'      — DPI выключен (только DNS; синий режим)
+          'combo'    — split + fake (комбо; чёрный режим)
+          'dpi_only' — split + fake + disorder (только DPI; красный режим)
         """
         log.info(f"Переключение режима DPI → {mode}")
         self.config["dpi_mode"] = mode
@@ -1733,7 +1847,7 @@ class UmbraNetDNS:
           'dns_only' (синий)  — DNS-сервер работает, DPI выключен.
           'combo'    (чёрный) — DNS-сервер работает, DPI в режиме combo.
           'dpi_only' (красный)— DNS-сервер работает (нужен для IP-резолва),
-                                DPI в режиме zapret.
+                                DPI в агрессивном режиме.
 
         Все переключения выполняются атомарно: сначала гарантируется
         корректное состояние DNS, затем меняется DPI.
@@ -1772,7 +1886,7 @@ class UmbraNetDNS:
             elif ui_mode == "combo":
                 self.set_dpi_mode("combo")
             elif ui_mode == "dpi_only":
-                self.set_dpi_mode("zapret")
+                self.set_dpi_mode("dpi_only")
 
             return True, ""
         except Exception as exc:

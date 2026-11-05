@@ -59,6 +59,10 @@ class DNSCache:
     def __init__(self, max_entries: int = 5000, janitor_interval: float = 30.0):
         self._entries = {}
         self._lock = threading.Lock()
+        # Поколение отделяет новую DNS-сессию/конфигурацию от уже запущенного
+        # stale-refresh. После clear() старый фоновый ответ не имеет права
+        # снова положить адрес прежнего провайдера в очищенный кэш.
+        self._generation = 0
         # Верхний лимит записей — защита от неограниченного роста
         # (например при route_all или очень долгой работе).
         self.max_entries = max(0, int(max_entries))  # 0 = без лимита
@@ -156,7 +160,25 @@ class DNSCache:
             if entry is not None:
                 entry.refreshing = False
 
-    def set(self, request, routed: bool, response, ttl_override=None, stale_ttl: int = 0):
+    def generation(self) -> int:
+        """Текущее поколение кэша для безопасного stale-refresh в фоне."""
+        with self._lock:
+            return self._generation
+
+    def set(
+        self,
+        request,
+        routed: bool,
+        response,
+        ttl_override=None,
+        stale_ttl: int = 0,
+        expected_generation: int | None = None,
+    ) -> bool:
+        """Сохраняет ответ, если поколение кэша не сменилось.
+
+        ``expected_generation`` используют только фоновые обновления. Обычные
+        запросы передают ``None`` и всегда могут записать свежий ответ.
+        """
         ttl = self._response_ttl(response)
         if ttl_override is not None:
             try:
@@ -185,6 +207,11 @@ class DNSCache:
         )
         key = self._make_key(request, routed)
         with self._lock:
+            if (
+                expected_generation is not None
+                and expected_generation != self._generation
+            ):
+                return False
             self._entries[key] = entry
             self._enforce_limit_locked()
         return True
@@ -211,8 +238,10 @@ class DNSCache:
             self._entries.pop(k, None)
 
     def clear(self):
+        """Очищает записи и инвалидирует незавершённые stale-refresh задачи."""
         with self._lock:
             self._entries.clear()
+            self._generation += 1
 
     def prune_expired(self):
         now = time.monotonic()
