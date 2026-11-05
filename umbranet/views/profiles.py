@@ -1,5 +1,8 @@
 """
-UmbraNet - раздел «DNS-профили» (PySide6).
+UmbraNet - legacy-редактор DNS-профилей (PySide6).
+
+Модуль не регистрируется и не создаётся актуальным интерфейсом. Он сохраняется
+только как совместимый код для обратимой миграции исторических DNS-данных.
 
 Структура повторяет старую версию (netdocker), но в новом дизайне:
   • Слева две группы: «Встроенные» и «Пользовательские DNS».
@@ -40,8 +43,8 @@ from umbranet.engine_adapter import (
     get_profile_by_id,
     make_new_user_dns_profile,
     max_user_profiles,
-    probe_doh,
-    probe_host,
+    probe_doh_detail,
+    probe_profile_dns_endpoint,
     profile_builtin_id,
     sanitize_dns_profile,
     save_config,
@@ -62,10 +65,9 @@ FORM_FIELDS = [
 class _PingAllWorker(QThread):
     finished = Signal(dict)
 
-    def __init__(self, profiles, mode):
+    def __init__(self, profiles):
         super().__init__()
         self.profiles = profiles
-        self.mode = mode
 
     def run(self):
         results = {}
@@ -74,10 +76,12 @@ class _PingAllWorker(QThread):
             if not p_id:
                 continue
 
-            if self.mode == "doh" and prof.get("doh_url"):
-                ok, ms = probe_doh(prof["doh_url"])
+            if prof.get("doh_url"):
+                ok, ms, _detail = probe_doh_detail(
+                    prof["doh_url"], connect_ip=prof.get("ipv4_primary") or None
+                )
             elif prof.get("ipv4_primary"):
-                ok, ms = probe_host(prof["ipv4_primary"])
+                ok, ms, _detail = probe_profile_dns_endpoint(prof, prof["ipv4_primary"])
             else:
                 ok, ms = False, None
 
@@ -161,7 +165,7 @@ class ProfilesView(QWidget):
         outer.setSpacing(14)
 
         title = QLabel("DNS-профили")
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:22px;font-weight:700;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:22px;font-weight:700;")
         outer.addWidget(title)
 
         body = QHBoxLayout()
@@ -204,7 +208,7 @@ class ProfilesView(QWidget):
         bcl.setContentsMargins(12, 10, 12, 10)
         bcl.setSpacing(6)
         bt = QLabel("🧩  Встроенные")
-        bt.setStyleSheet(f"color:{theme.WHITE};font-size:13px;font-weight:700;background:transparent;border:none;")
+        bt.setStyleSheet(f"color:{theme.TEXT};font-size:13px;font-weight:700;background:transparent;border:none;")
         bcl.addWidget(bt)
         self._builtin_rows = QVBoxLayout()
         self._builtin_rows.setSpacing(4)
@@ -217,7 +221,7 @@ class ProfilesView(QWidget):
         ucl.setContentsMargins(12, 10, 12, 10)
         ucl.setSpacing(6)
         ut = QLabel("🗂  Пользовательские")
-        ut.setStyleSheet(f"color:{theme.WHITE};font-size:13px;font-weight:700;background:transparent;border:none;")
+        ut.setStyleSheet(f"color:{theme.TEXT};font-size:13px;font-weight:700;background:transparent;border:none;")
         ucl.addWidget(ut)
         self._user_rows = QVBoxLayout()
         self._user_rows.setSpacing(4)
@@ -260,7 +264,7 @@ class ProfilesView(QWidget):
 
         self._editor_title = QLabel("⚙  Параметры профиля")
         self._editor_title.setStyleSheet(
-            f"color:{theme.WHITE};font-size:17px;font-weight:700;background:transparent;border:none;")
+            f"color:{theme.TEXT};font-size:17px;font-weight:700;background:transparent;border:none;")
         outer.addWidget(self._editor_title)
 
         self._editor_sub = QLabel("Галочка ☑ слева делает профиль активным")
@@ -432,8 +436,10 @@ class ProfilesView(QWidget):
         if faded:
             return (f"color:{color};font-size:10px;font-weight:700;font-family:Consolas;"
                     "background:transparent;border:none;")
-        # цветная пилюля
-        return ("color:#0e0e17;font-size:10px;font-weight:700;font-family:Consolas;"
+        # Цвет заливки меняется от яркого (тёмные темы) до тёмного (светлая тема),
+        # поэтому выбираем подпись с лучшим контрастом автоматически.
+        fg = theme.text_on_color(color)
+        return (f"color:{fg};font-size:10px;font-weight:700;font-family:Consolas;"
                 f"background:{color};border:none;border-radius:7px;padding:2px 8px;")
 
 
@@ -468,7 +474,7 @@ class ProfilesView(QWidget):
         name.setCursor(Qt.PointingHandCursor)
         name.setStyleSheet(
             f"QPushButton{{background:transparent;border:none;text-align:left;"
-            f"color:{theme.WHITE if is_selected else theme.TEXT};font-size:13px;}}")
+            f"color:{theme.ACCENT if is_selected else theme.TEXT};font-size:13px;}}")
         name.clicked.connect(lambda _=False, p=pid: self._select(p))
         rl.addWidget(name, 1)
 
@@ -589,7 +595,8 @@ class ProfilesView(QWidget):
             ("ipv6_secondary", prof.get("ipv6_secondary"), False),
             ("doh_url", prof.get("doh_url"), True),
         ]
-        any_done = False
+        completed = []
+        all_ok = True
         for key, val, is_doh in checks:
             lbl = self._ping_labels.get(key)
             if lbl is None:
@@ -597,14 +604,27 @@ class ProfilesView(QWidget):
             if not val:
                 lbl.setVisible(False)
                 continue
-            any_done = True
-            ok, ms = (probe_doh(val) if is_doh else probe_host(val))
+            if is_doh:
+                ok, ms, detail = probe_doh_detail(
+                    val, connect_ip=prof.get("ipv4_primary") or None
+                )
+            else:
+                ok, ms, detail = probe_profile_dns_endpoint(prof, val)
+            completed.append((ok, detail))
+            all_ok = all_ok and ok
             txt = f"{ms} мс" if ok and ms is not None else ("OK" if ok else "FAIL")
             lbl.setText(txt)
+            lbl.setToolTip(detail)
             lbl.setStyleSheet(self._ping_style(theme.GREEN if ok else theme.RED))
             lbl.setVisible(True)
-        self._set_status("Проверка завершена" if any_done else "Нет адресов для проверки",
-                         theme.GREEN if any_done else theme.YELLOW)
+        if not completed:
+            self._set_status("Нет адресов для проверки", theme.YELLOW)
+            return
+        summary = next((detail for ok, detail in completed if not ok), completed[-1][1])
+        self._set_status(
+            f"Проверка завершена · {summary}",
+            theme.GREEN if all_ok else theme.RED,
+        )
 
     def _ping_all(self):
         if getattr(self, "_ping_worker", None) and self._ping_worker.isRunning():
@@ -615,9 +635,8 @@ class ProfilesView(QWidget):
             self._btn_ping_all.setText("⏳  Идёт тест...")
 
         profiles = get_all_dns_profiles(self.engine.config)
-        mode = self.engine.config.get("xbox_dns_mode", "udp")
 
-        self._ping_worker = _PingAllWorker(profiles, mode)
+        self._ping_worker = _PingAllWorker(profiles)
 
         def on_done(results):
             self._ping_cache = getattr(self, "_ping_cache", {})

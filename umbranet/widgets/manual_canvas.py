@@ -20,7 +20,7 @@ firefox.exe) НЕ удаляются: вместо ✕ рисуется замо
 Раньше у них рисовался рабочий на вид ✕, но клик молча ничего не делал —
 именно это и путало пользователя.
 
-Автор: 302XXX / UmbraNet_Official
+Автор: X-302-X / UmbraNet_Official
 Лицензия: GPLv3
 """
 
@@ -41,6 +41,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
 from umbranet import theme
+from umbranet.widgets.wheel_scroll import wheel_delta_px
 
 # ── геометрия ────────────────────────────────────────────────────────────────
 CARD_H = 36          # высота карточки
@@ -234,7 +235,9 @@ class ManualCanvas(QWidget):
         return QRect(self.width() - SB_PAD + 1, y, SB_W, thumb_h)
 
     def wheelEvent(self, event):
-        self._scroll(-event.angleDelta().y() * 3 // 2)
+        # Одно деление колеса — 2 карточки списка (см. wheel_scroll): было
+        # 180 px за щелчок ≈ 4.3 карточки, список проскакивал мимо нужной.
+        self._scroll(wheel_delta_px(event.angleDelta().y(), CARD_STRIDE))
 
     def sizeHint(self):
         return QSize(self.width() or 400, self.PREFERRED_H)
@@ -267,7 +270,7 @@ class ManualCanvas(QWidget):
             return
         it = self._filtered[i]
         if not self._in_rm_zone(pos.x()):
-            return   # клик по карточке (не по ✕) ничего не делает — как раньше
+            return   # клик по карточке (не по чипу/✕) ничего не делает — как раньше
         if it.get("protected"):
             return   # защищено: ✕ не рисуется, клик игнорируем на всякий случай
         if it["key"] == "routed_subscriptions":
@@ -364,13 +367,16 @@ class ManualCanvas(QWidget):
         p.end()
 
     def _paint_card(self, p: QPainter, it: dict, rect: QRect, hovered: bool):
-        # фон карточки: прозрачное стекло с рамкой; hover — фиолет
+        # фон карточки: прозрачная поверхность темы с заметным акцентным hover.
         if hovered:
-            bg = QColor(139, 109, 255, 26)      # rgba(139,109,255,0.10)
-            border = QColor(theme.ACCENT)
+            bg = qc_color(theme.ACCENT)
+            bg.setAlpha(26)
+            border = qc_color(theme.ACCENT)
         else:
-            bg = QColor(255, 255, 255, 9)       # rgba(255,255,255,0.035)
-            border = QColor(255, 255, 255, 20)  # theme.BORDER
+            # Сохраняем лёгкий блик исходных тёмных тем; рамка уже берётся
+            # из палитры и поэтому корректна и на светлом фоне.
+            bg = QColor(255, 255, 255, 9)
+            border = qc_color(theme.BORDER)
         p.setBrush(bg)
         p.setPen(QPen(border, 1))
         p.drawRoundedRect(QRect(rect.x(), rect.y() + 1, rect.width(), rect.height() - 2), 10, 10)
@@ -404,10 +410,14 @@ class ManualCanvas(QWidget):
 
         # имя (Consolas, с обрезкой)
         rm_x = rect.width() - RM_RIGHT - RM_W
-        badge_w = 0
+        tag_text = ""
+        tag_color = ""
         if it.get("badge") and it["key"] != "routed_subscriptions":
-            badge_w = self._fm_badge.horizontalAdvance(it["badge"]) + 14
-        avail = rm_x - 12 - NAME_X - badge_w
+            tag_text = str(it["badge"])
+            tag_color = str(it.get("badge_color") or theme.ACCENT2)
+        tag_w = self._fm_badge.horizontalAdvance(tag_text) + 14 if tag_text else 0
+        tag_gap = 12
+        avail = rm_x - tag_gap - NAME_X - tag_w
         name = it["display"]
         if self._fm_name.horizontalAdvance(name) > avail:
             name = self._fm_name.elidedText(name, Qt.ElideRight, avail)
@@ -416,12 +426,12 @@ class ManualCanvas(QWidget):
         p.drawText(QRect(NAME_X, rect.y(), avail, rect.height()),
                    Qt.AlignVCenter | Qt.AlignLeft, name)
 
-        # бейдж сервиса (правее имени, перед ✕)
-        if badge_w:
-            p.setPen(QPen(QColor(it.get("badge_color") or theme.ACCENT2)))
+        # Бейдж выбранного сервиса располагается перед ✕.
+        if tag_w:
+            p.setPen(QPen(QColor(tag_color)))
             p.setFont(self._f_badge)
-            p.drawText(QRect(rm_x - 12 - badge_w, rect.y(), badge_w, rect.height()),
-                       Qt.AlignVCenter | Qt.AlignRight, it["badge"])
+            p.drawText(QRect(rm_x - tag_gap - tag_w, rect.y(), tag_w, rect.height()),
+                       Qt.AlignVCenter | Qt.AlignRight, tag_text)
 
         # кнопка ✕ — у защищённых записей вместо неё замок
         if it.get("protected"):
@@ -450,7 +460,7 @@ class ManualCanvas(QWidget):
             return
         c = (qc_color(theme.ACCENT) if self._sb_drag
              else qc_color(theme.SUBTEXT) if self._sb_hover
-             else QColor("#4b4d75"))
+             else qc_color(theme.MUTED))
         c = QColor(c)
         c.setAlpha(int(230 * self._sb_op))
         p.setPen(Qt.NoPen)

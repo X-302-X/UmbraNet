@@ -5,7 +5,7 @@ UmbraNet - раздел «Маршрутизация» (PySide6).
   • шапка: режимы (ModeSwitch) + Start/Stop/Restart (ControlBar);
   • категории сервисов с тумблерами (включил -> домены в routed_domains);
   • ручной список доменов/процессов (поиск, добавление, удаление);
-  • правая панель активного DNS-профиля.
+  • правая панель выбора VPN-сервера или DPI-стратегии.
 
 Вся работа с ядром — через engine_adapter.
 """
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 
 log = logging.getLogger("UmbraNet.RoutingView")
 from PySide6.QtWidgets import (
@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
 
 from umbranet import theme
 from umbranet.engine_adapter import (
-    get_active_dns_profile,
     get_current_mode,
     get_developer_mode,
     get_engine,
@@ -54,38 +53,9 @@ from umbranet.widgets.glow_wrap import GlowWrap
 from umbranet.widgets.manual_canvas import ManualCanvas
 from umbranet.widgets.rounded_panel import RoundedPanel
 from umbranet.widgets.service_canvas import ServiceCanvas
+from umbranet.widgets.vpn_exit_list import VpnExitList
 from umbranet.widgets.toggle import Toggle
-from umbranet.widgets.transport_list import TransportList
 
-
-class _DnsRestartWorker(QThread):
-    """Мягко перезапускает DNS-сервер после изменения маршрутов.
-
-    Системный DNS Windows при этом не трогаем: он уже указывает на 127.0.0.1.
-    Нужен именно restart локального сервера, чтобы изменения маршрутизации
-    применялись сразу и очищался кэш старых решений.
-    """
-    done = Signal(bool)
-
-    def __init__(self, engine):
-        super().__init__()
-        self.engine = engine
-
-    def run(self):
-        ok = False
-        try:
-            self.engine.stop()
-            self.engine.reload_config()
-            # Если пользователь/AI-генерация успели нажать Stop, пока этот
-            # worker выполнялся, нельзя самовольно запускать UmbraNet обратно.
-            if getattr(self.engine, "_manual_stop_requested", False):
-                ok = True
-            else:
-                ok = bool(self.engine.start())
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Не удалось перезапустить DNS после смены маршрута: %s", exc)
-            ok = False
-        self.done.emit(ok)
 
 
 def hex_to_rgba(hex_str: str, alpha: float = 0.35) -> str:
@@ -150,13 +120,13 @@ class CategoryHeader(QWidget):
         lbl = QLabel(title.upper())
         lbl.setStyleSheet(f"color: {color1}; font-size: 11px; font-weight: 800; letter-spacing: 1.5px; background: transparent; border: none;")
         row.addWidget(lbl)
-        
+
         # Растяжка между названием и тумблером, чтобы тумблер оставался справа в ряду с другими
         row.addStretch()
 
         if toggle is not None:
             row.addWidget(toggle)
-            
+
         # Небольшой отступ справа (10px), чтобы тумблеры категорий были гармонично выровнены
         row.addSpacing(10)
 
@@ -277,8 +247,6 @@ class RoutingView(QWidget):
         super().__init__()
         self._subscription_done.connect(self._on_subscription_done)
         self.engine = get_engine()
-        self._route_restart_worker: _DnsRestartWorker | None = None
-        self._route_restart_pending = False
 
         outer = QVBoxLayout(self)
         # справа/снизу нули: это место заняли поля GlowWrap (свечение панели)
@@ -304,7 +272,7 @@ class RoutingView(QWidget):
         self._service_search = ""
 
         # ── состояние «узкого окна» ──
-        # В узком окне правая часть (маршрут / стратегия и данные профиля DNS)
+        # В узком окне правая часть (выбор VPN-сервера / DPI-стратегии)
         # прячется целиком, а её место отдаётся спискам: просьба пользователя —
         # прятать её заранее, когда кнопки режимов вот-вот начнут ужиматься.
         # Вместо неё в шапке вкладки появляется кнопка, по которой панель
@@ -400,7 +368,7 @@ class RoutingView(QWidget):
         title_host = QWidget()
         title_host.setStyleSheet("background:transparent;")
         title = QLabel("🚀  Сервисы")
-        title.setStyleSheet(f"color:{theme.WHITE}; font-size:16px; font-weight:700;")
+        title.setStyleSheet(f"color:{theme.TEXT}; font-size:16px; font-weight:700;")
         self._title_row_h = max(title.sizeHint().height(), 22)
         title_host.setFixedHeight(self._title_row_h)
         title_row = QHBoxLayout(title_host)
@@ -408,7 +376,7 @@ class RoutingView(QWidget):
         title_row.setSpacing(10)
         title_row.addWidget(title, 0, Qt.AlignVCenter)
         title_row.addStretch()
-        self._narrow_toggle = QPushButton("🔌  Маршрут DNS")
+        self._narrow_toggle = QPushButton("👁️  VPN-серверы")
         self._narrow_toggle.setCursor(Qt.PointingHandCursor)
         # Высота — как у строки заголовка: кнопка стоит ровно на одном уровне с
         # надписью «Сервисы» и не свисает ниже неё.
@@ -417,7 +385,7 @@ class RoutingView(QWidget):
             f"QPushButton{{background:{theme.INPUT_BG};color:{theme.TEXT};"
             f"border:1px solid {theme.BORDER};border-radius:7px;"
             "padding:0 10px;font-size:12px;font-weight:600;}"
-            f"QPushButton:hover{{border-color:{theme.ACCENT3};color:{theme.WHITE};}}"
+            f"QPushButton:hover{{border-color:{theme.ACCENT3};color:{theme.TEXT};}}"
         )
         self._narrow_toggle.clicked.connect(self.toggle_right_panel)
         self._narrow_toggle.setVisible(False)      # показывается только в узком окне
@@ -438,7 +406,18 @@ class RoutingView(QWidget):
         # ── телеграмизация: весь список сервисов рисует один paintEvent ──
         # (было: QScrollArea + ~150 дочерних виджетов, медленный ресайз)
         catalog = []
-        for cat, (emoji, c1, c2) in CATEGORIES.items():
+        category_colors = CATEGORIES
+        if theme.CURRENT_THEME == "glass":
+            # В исходном каталоге категории используют неоновые пастельные
+            # цвета для тёмного фона; для стеклянной темы берём читаемые тона.
+            category_colors = {
+                "AI": ("🤖", theme.ACCENT, theme.ACCENT2),
+                "Медиа": ("🎬", theme.ACCENT2, theme.ACCENT3),
+                "Игры": ("🎮", theme.ORANGE, theme.RED),
+                "Работа": ("💼", theme.GREEN, theme.ACCENT2),
+                "Разное": ("🧩", theme.PINK, theme.RED),
+            }
+        for cat, (emoji, c1, c2) in category_colors.items():
             catalog.append((cat, emoji, c1, c2,
                             [(svc, SERVICES[svc][1]) for svc in services_in_category(cat)]))
         self._canvas = ServiceCanvas(catalog, bypass_map=SERVICE_BYPASS)
@@ -470,23 +449,43 @@ class RoutingView(QWidget):
         self._canvas.apply_search(text)
 
     def _toggle_category(self, cat: str, on: bool):
-        """Включить/выключить все сервисы категории разом.
+        """Включить/выключить все сервисы категории одной атомарной операцией.
 
-        В DNS-only DPI-сервисы не включаются (и наоборот). Выключить можно все.
+        В режиме VPN DPI-сервисы не включаются (и наоборот). Выключить можно все.
+        Состояние галочки обновляет ServiceCanvas до этого вызова, поэтому здесь
+        не создаём промежуточных состояний и меняем конфиг одним проходом.
         """
-        routed = self.engine.config.setdefault("routed_domains", [])
         mode = get_current_mode()
         unlock = get_developer_mode()
-        for svc in services_in_category(cat):
-            if on and not unlock and not service_allowed_in_mode(svc, mode):
-                continue
-            _, _, domains = SERVICES[svc]
-            if on:
-                for d in domains:
-                    if d not in routed:
-                        routed.append(d)
-            else:
-                routed[:] = [r for r in routed if r not in domains]
+        services = services_in_category(cat)
+        if on and not unlock:
+            services = [svc for svc in services if service_allowed_in_mode(svc, mode)]
+
+        # Список (а не set) сохраняет порядок доменов из каталога в config.json;
+        # set нужен только для быстрых проверок и удаления.
+        category_domains = [
+            domain
+            for svc in services
+            for domain in SERVICES[svc][2]
+        ]
+        if not category_domains:
+            return
+
+        routed = self.engine.config.setdefault("routed_domains", [])
+        selected = self.engine.config.setdefault("selected_services", [])
+        if on:
+            known = set(routed)
+            for domain in category_domains:
+                if domain not in known:
+                    routed.append(domain)
+                    known.add(domain)
+            for service in services:
+                if service not in selected:
+                    selected.append(service)
+        else:
+            category_domain_set = set(category_domains)
+            routed[:] = [domain for domain in routed if domain not in category_domain_set]
+            selected[:] = [service for service in selected if service not in services]
         self._apply()
 
     def _build_manual(self) -> QWidget:
@@ -521,7 +520,7 @@ class RoutingView(QWidget):
         add_btn.setCursor(Qt.PointingHandCursor)
         add_btn.setFixedHeight(36)
         add_btn.setStyleSheet(
-            f"QPushButton{{background:{theme.grad(theme.GREEN, '#10b981')};color:{theme.WHITE};"
+            f"QPushButton{{background:{theme.GREEN};color:{theme.text_on_color(theme.GREEN)};"
             "border:none;border-radius:8px;padding:0 14px;font-weight:600;font-size:13px;}"
             f"QPushButton:hover{{border-radius:8px;}}")
         add_btn.clicked.connect(self._add_typed)
@@ -545,9 +544,19 @@ class RoutingView(QWidget):
         pick_btn.setFixedWidth(_btn_w)
         add_btn.setFixedWidth(_btn_w)
 
+        self._manual_combo_note = QLabel(
+            "Ручные цели для Combo будут добавлены после отдельного правила этого режима."
+        )
+        self._manual_combo_note.setWordWrap(True)
+        self._manual_combo_note.setStyleSheet(
+            f"color:{theme.MUTED};font-size:12px;background:transparent;border:none;"
+        )
+        self._manual_combo_note.hide()
+
         addrow.addWidget(self.add_input, 1)
         addrow.addWidget(pick_btn)
         addrow.addWidget(add_btn)
+        addrow.addWidget(self._manual_combo_note, 1)
         sec.add_layout(addrow)
 
         # ── заголовок списка ──────────────────────────────────────────
@@ -640,22 +649,22 @@ class RoutingView(QWidget):
         self._tabs_lay.setContentsMargins(0, 0, 0, 0)
         self._tabs_lay.setSpacing(6)
 
-        self._dns_tab_btn = QPushButton("🔌 DNS")
-        self._dns_tab_btn.setCursor(Qt.PointingHandCursor)
-        self._dns_tab_btn.setFixedHeight(32)
-        
+        self._vpn_tab_btn = QPushButton("🔌 VPN")
+        self._vpn_tab_btn.setCursor(Qt.PointingHandCursor)
+        self._vpn_tab_btn.setFixedHeight(32)
+
         self._dpi_tab_btn = QPushButton("🛡 DPI")
         self._dpi_tab_btn.setCursor(Qt.PointingHandCursor)
         self._dpi_tab_btn.setFixedHeight(32)
-        
-        self._tabs_lay.addWidget(self._dns_tab_btn)
+
+        self._tabs_lay.addWidget(self._vpn_tab_btn)
         self._tabs_lay.addWidget(self._dpi_tab_btn)
         lay.addWidget(self._tabs_widget)
-        
-        self._dns_tab_btn.clicked.connect(lambda: self._set_sidebar_tab("dns"))
+
+        self._vpn_tab_btn.clicked.connect(lambda: self._set_sidebar_tab("vpn"))
         self._dpi_tab_btn.clicked.connect(lambda: self._set_sidebar_tab("dpi"))
 
-        self._active_sidebar_tab = "dns"
+        self._active_sidebar_tab = "vpn"
 
         # ── 1) ФИКСИРОВАННАЯ КАРТОЧКА-ОКНО ДЛЯ СПИСКОВ (БЕЗ СВОРАЧИВАНИЯ) ──
         # Вложенная карточка панели — тоже плотная (композит стекла на панели).
@@ -666,8 +675,8 @@ class RoutingView(QWidget):
         card_lay.setSpacing(10)
 
         # Заголовок карточки
-        self._card_title = QLabel("🔌  Маршрут DNS")
-        self._card_title.setStyleSheet(f"color:{theme.WHITE};font-size:14px;font-weight:700;background:transparent;border:none;")
+        self._card_title = QLabel("👁️  VPN-серверы")
+        self._card_title.setStyleSheet(f"color:{theme.TEXT};font-size:14px;font-weight:700;background:transparent;border:none;")
         card_lay.addWidget(self._card_title)
 
         # Разделитель
@@ -676,10 +685,12 @@ class RoutingView(QWidget):
         self._card_sep.setStyleSheet(f"background:{theme.BORDER};border:none;")
         card_lay.addWidget(self._card_sep)
 
-        # DNS Маршруты (TransportList)
-        self._transport_list = TransportList()
-        self._transport_list.transportChanged.connect(self._on_transport_change)
-        card_lay.addWidget(self._transport_list)
+        # Routing shows only friendly server names. Technical data belongs to
+        # the separate «👁️ Сервера» page, never to this mode selector.
+        self._vpn_exit_list = VpnExitList(self.engine.config)
+        self._vpn_exit_list.exitChanged.connect(self._on_vpn_exit_changed)
+        self._vpn_exit_list.serverSetupRequested.connect(self._open_server_library)
+        card_lay.addWidget(self._vpn_exit_list)
 
         # DPI Стратегии (DpiStrategyList)
         from umbranet.widgets.dpi_strategy_list import DpiStrategyList
@@ -688,32 +699,12 @@ class RoutingView(QWidget):
 
         lay.addWidget(self._right_card)
 
-        # ── 2) ДЕТАЛИ DNS ПРОФИЛЯ ──
-        self._dns_profile_container = QWidget()
-        self._dns_profile_container.setStyleSheet("background:transparent;border:none;")
-        dns_prof_lay = QVBoxLayout(self._dns_profile_container)
-        dns_prof_lay.setContentsMargins(0, 0, 0, 0)
-        dns_prof_lay.setSpacing(8)
-
-        self._prof_title = QLabel("🛡  —")
-        self._prof_title.setStyleSheet(f"color:{theme.WHITE};font-size:14px;font-weight:700;background:transparent;border:none;")
-        dns_prof_lay.addWidget(self._prof_title)
-
-        self._prof_rows_host = QWidget()
-        self._prof_rows_host.setStyleSheet("background:transparent;")
-        self._prof_rows_lay = QVBoxLayout(self._prof_rows_host)
-        self._prof_rows_lay.setContentsMargins(0, 0, 0, 0)
-        self._prof_rows_lay.setSpacing(6)
-        dns_prof_lay.addWidget(self._prof_rows_host)
-
-        lay.addWidget(self._dns_profile_container)
-
         # растяжка — контент панели прижат к верху
         lay.addStretch()
 
         # Правая часть прокручивается ВНУТРИ СЕБЯ (по просьбе пользователя: это
         # одна из трёх областей, которым прокрутка разрешена — вместе со списком
-        # сервисов и «Диспетчером задач»). Если окно ниже карточки «Маршрут DNS»,
+        # сервисов и «Диспетчером задач»). Если окно ниже карточки «VPN-серверы»,
         # полоса появляется у правого края, а не поперёк всей вкладки; при
         # достаточной высоте полос нет вовсе.
         scroll = QScrollArea()
@@ -986,7 +977,7 @@ class RoutingView(QWidget):
         w = self._panel_width()
         self._right_scroll.setFixedWidth(w)
         if self._narrow:
-            # Поверх содержимого, но НИЖЕ строки заголовка: кнопка «Маршрут DNS»
+            # Поверх содержимого, но НИЖЕ строки заголовка: кнопка «VPN-серверы»
             # должна оставаться на виду и нажиматься (ею же панель и закрывается).
             margin = 12
             y = self._content_top()
@@ -1043,7 +1034,7 @@ class RoutingView(QWidget):
             return 44
 
     def _sync_right_panel_title(self):
-        """Текст кнопки повторяет заголовок панели («Маршрут DNS» / «Стратегия DPI»)."""
+        """Текст кнопки повторяет заголовок панели («VPN-серверы» / «Стратегия DPI»)."""
         try:
             if not self._overlay_open:
                 self._narrow_toggle.setText(self._card_title.text())
@@ -1072,7 +1063,7 @@ class RoutingView(QWidget):
 
     def _set_sidebar_tab(self, tab_key: str):
         self._active_sidebar_tab = tab_key
-        
+
         # Обновляем стили кнопок вкладок
         active_style = (
             f"QPushButton{{"
@@ -1092,36 +1083,36 @@ class RoutingView(QWidget):
             "}"
             f"QPushButton:hover{{"
             f"  border-color: {theme.ACCENT3};"
-            f"  color: {theme.WHITE};"
+            f"  color: {theme.TEXT};"
             "}"
         )
-        
-        if tab_key == "dns":
-            self._dns_tab_btn.setStyleSheet(active_style)
+
+        if tab_key == "vpn":
+            self._vpn_tab_btn.setStyleSheet(active_style)
             self._dpi_tab_btn.setStyleSheet(inactive_style)
-            
-            # Показываем DNS, скрываем DPI
-            self._transport_list.setVisible(True)
+            self._vpn_exit_list.setVisible(True)
             self._dpi_strategy_list.setVisible(False)
-            self._card_title.setText("🔌  Маршрут DNS")
-            self._dns_profile_container.setVisible(True)
+            self._card_title.setText("👁️  VPN-серверы")
             self._sync_right_panel_title()
         else:
-            self._dns_tab_btn.setStyleSheet(inactive_style)
+            self._vpn_tab_btn.setStyleSheet(inactive_style)
             self._dpi_tab_btn.setStyleSheet(active_style)
-            
-            # Показываем DPI, скрываем DNS
-            self._transport_list.setVisible(False)
+            self._vpn_exit_list.setVisible(False)
             self._dpi_strategy_list.setVisible(True)
             self._card_title.setText("🛡  Стратегия DPI")
-            self._dns_profile_container.setVisible(False)
             self._sync_right_panel_title()
 
-    def _on_transport_change(self, mode: str):
-        """Транспорт сменился — обновляем конфиг и UI."""
-        self.refresh()
-        if self.engine.running:
-            pass
+    def _open_server_library(self):
+        """Take an empty VPN picker straight to the dedicated server library."""
+        window = self.window()
+        show = getattr(window, "_show", None)
+        if callable(show):
+            show("servers")
+
+    def _on_vpn_exit_changed(self, _profile_id: str):
+        # The active TransportRuntime deliberately keeps existing exits until
+        # Restart; this save only selects the first profile of the next session.
+        self._apply()
 
     # ════════════════ логика ════════════════
     def _apply(self):
@@ -1144,29 +1135,9 @@ class RoutingView(QWidget):
         except Exception:
             pass
 
-        if self.engine.running:
-            self._restart_dns_after_route_change()
-        else:
-            self.engine.reload_config()
-            self.refresh()
-
-    def _restart_dns_after_route_change(self):
-        """Перезапускает DNS после изменения маршрутов без смены системного DNS."""
-        worker = getattr(self, "_route_restart_worker", None)
-        if worker is not None and worker.isRunning():
-            self._route_restart_pending = True
-            return
-        self._route_restart_pending = False
-        self._route_restart_worker = _DnsRestartWorker(self.engine)
-        self._route_restart_worker.done.connect(self._on_route_restart_done)
-        self._route_restart_worker.start()
-
-    def _on_route_restart_done(self, ok: bool):
-        if not ok:
-            log.warning("DNS restart после изменения маршрутов завершился с ошибкой")
-        if self._route_restart_pending:
-            self._restart_dns_after_route_change()
-            return
+        # The explicit routing session takes a stable PAC/domain snapshot on
+        # Start. Changing selections or exits while it runs is saved safely and
+        # applies on the next explicit Restart; do not resurrect local DNS here.
         self.refresh()
 
     def _toggle_service(self, svc: str, on: bool):
@@ -1174,15 +1145,23 @@ class RoutingView(QWidget):
             return
         _, _, domains = SERVICES[svc]
         routed = self.engine.config.setdefault("routed_domains", [])
+        selected = self.engine.config.setdefault("selected_services", [])
         if on:
             for d in domains:
                 if d not in routed:
                     routed.append(d)
+            if svc not in selected:
+                selected.append(svc)
         else:
             routed[:] = [r for r in routed if r not in domains]
+            selected[:] = [name for name in selected if name != svc]
         self._apply()
 
     def _add_typed(self):
+        # Combo's manual-target semantics are intentionally not guessed. The
+        # controls are hidden there, and this guard also covers shortcut calls.
+        if get_current_mode() == "combo":
+            return
         raw_text = (self.add_input.text() or "").strip()
         if not raw_text:
             return
@@ -1221,6 +1200,8 @@ class RoutingView(QWidget):
                 continue
 
             key = "routed_processes" if val.lower().endswith(".exe") else "routed_domains"
+            if key == "routed_domains":
+                val = val.lower()
             lst = cfg.setdefault(key, [])
             if val not in lst:
                 lst.append(val)
@@ -1231,6 +1212,8 @@ class RoutingView(QWidget):
             self._apply()
 
     def _pick_process(self):
+        if get_current_mode() == "combo":
+            return
         dlg = ProcessPickerDialog(self)
         if dlg.exec() and dlg.result:
             name = dlg.result
@@ -1248,7 +1231,19 @@ class RoutingView(QWidget):
         if key == "routed_subscriptions":
             self._remove_subscription(name)
             return
-        if name in self.engine.config.get(key, []):
+        if key == "routed_domains":
+            selected = self.engine.config.setdefault("selected_services", [])
+            matched = [service for service in selected
+                       if service in SERVICES and name in SERVICES[service][2]]
+            if matched:
+                for service in matched:
+                    domains = set(SERVICES[service][2])
+                    self.engine.config[key][:] = [domain for domain in self.engine.config[key]
+                                                    if domain not in domains]
+                selected[:] = [service for service in selected if service not in matched]
+            elif name in self.engine.config.get(key, []):
+                self.engine.config[key].remove(name)
+        elif name in self.engine.config.get(key, []):
             self.engine.config[key].remove(name)
         self._apply()
 
@@ -1274,6 +1269,14 @@ class RoutingView(QWidget):
             log.warning("Обновление подписок завершилось без записи кэша")
         self._apply()
 
+    def page_activated(self) -> None:
+        """Resume the child server-status poll when Routing becomes visible."""
+        self._vpn_exit_list.set_page_active(True)
+
+    def page_deactivated(self) -> None:
+        """Stop child polling while another page owns the visible stack."""
+        self._vpn_exit_list.set_page_active(False)
+
     # ════════════════ обновление ════════════════
     def refresh(self):
         cfg = self.engine.config
@@ -1292,83 +1295,54 @@ class RoutingView(QWidget):
         # ручной список (домены не из пресетов + процессы)
         self._rebuild_manual_list()
 
-        # правая панель
-        prof = get_active_dns_profile(cfg)
-        self._prof_title.setText(f"🛡  {prof.get('name', '—')}")
-        self._transport_list.refresh()
-        self._rebuild_profile_rows(prof)
+        # Правая панель показывает только пользовательские названия VPN-серверов.
+        self._vpn_exit_list.set_config(self.engine.config)
 
-        # Переключение видимости в зависимости от текущего режима
         mode = get_current_mode()
+        manual_entry_available = mode in {"vpn", "dpi"}
+        self.add_input.setVisible(manual_entry_available)
+        self._pick_btn.setVisible(manual_entry_available)
+        self._add_btn.setVisible(manual_entry_available)
+        self._manual_combo_note.setVisible(mode == "combo")
         self._canvas.set_app_mode(mode)
         self._canvas.set_developer_mode(get_developer_mode())
         self._dpi_strategy_list.refresh()
 
-        if mode == "dns_only":
+        if mode == "vpn":
             self._tabs_widget.setVisible(False)
-            self._transport_list.setVisible(True)
+            self._vpn_exit_list.setVisible(True)
             self._dpi_strategy_list.setVisible(False)
-            self._card_title.setText("🔌  Маршрут DNS")
-            self._dns_profile_container.setVisible(True)
+            self._card_title.setText("👁️  VPN-серверы")
             self._sync_right_panel_title()
-        elif mode == "dpi_only":
+        elif mode == "dpi":
             self._tabs_widget.setVisible(False)
-            self._transport_list.setVisible(False)
+            self._vpn_exit_list.setVisible(False)
             self._dpi_strategy_list.setVisible(True)
             self._card_title.setText("🛡  Стратегия DPI")
-            self._dns_profile_container.setVisible(False)
             self._sync_right_panel_title()
-        elif mode == "combo":
+        else:
             self._tabs_widget.setVisible(True)
             self._set_sidebar_tab(self._active_sidebar_tab)
 
-    # порядок и подписи параметров профиля для правой панели главного меню
-    # (DoT/DoQ детали тут НЕ показываем — они нужны только в редакторе профиля)
-    _PROFILE_FIELDS = [
-        ("ipv4_primary", "IPv4 основной"),
-        ("ipv4_secondary", "IPv4 резерв"),
-        ("ipv6_primary", "IPv6 основной"),
-        ("ipv6_secondary", "IPv6 резерв"),
-        ("doh_url", "DoH URL"),
-        ("dnscrypt_stamp", "DNSCrypt"),
-    ]
-
-    def _rebuild_profile_rows(self, prof: dict):
-        # очистить прежние строки (виджеты-строки удаляются целиком)
-        while self._prof_rows_lay.count():
-            item = self._prof_rows_lay.takeAt(0)
-            w = item.widget()
-            if w:
-                w.hide()
-                w.deleteLater()
-        # добавить все НЕпустые поля как отдельные виджеты-строки
-        for key, label in self._PROFILE_FIELDS:
-            val = prof.get(key)
-            if val in (None, "", 0):
-                continue
-            row = QWidget(self._prof_rows_host)
-            row.setStyleSheet("background:transparent;")
-            rl = QHBoxLayout(row)
-            rl.setContentsMargins(0, 0, 0, 0)
-            rl.setSpacing(8)
-            k = QLabel(label)
-            k.setStyleSheet(f"color:{theme.SUBTEXT};font-size:12px;background:transparent;border:none;")
-            v = QLabel(str(val))
-            v.setStyleSheet(f"color:{theme.TEXT};font-size:12px;font-weight:600;background:transparent;border:none;")
-            v.setWordWrap(True)
-            v.setAlignment(Qt.AlignRight | Qt.AlignTop)
-            rl.addWidget(k, 0, Qt.AlignTop)
-            rl.addStretch()
-            rl.addWidget(v, 1)
-            self._prof_rows_lay.addWidget(row)
-
-    # Карта: домен -> имя сервиса (строится один раз из SERVICES)
+    # Карта доменов выбранных карточек: только они управляются сервисом. Домен
+    # знакомого сервиса, введённый вручную без включения карточки, остаётся
+    # обычной ручной целью и следует глобальному режиму.
     @staticmethod
-    def _build_domain_to_service() -> dict:
+    def _build_domain_to_service(selected_services, routed_domains) -> dict:
+        selected = {service for service in selected_services or [] if service in SERVICES}
+        routed = {str(domain or "").strip().lower().rstrip(".") for domain in routed_domains or []}
+        # Legacy configs do not yet carry selected_services. A complete known
+        # card remains a service card there too, matching RoutingRuntime rather
+        # than misleadingly showing an ignored manual VPN/DPI policy.
+        for service, (_category, _icon, domains) in SERVICES.items():
+            if domains and set(domains).issubset(routed):
+                selected.add(service)
         result = {}
-        for svc, (_, _, domains) in SERVICES.items():
-            for d in domains:
-                result[d] = svc
+        for svc, (_category, _icon, domains) in SERVICES.items():
+            if svc not in selected:
+                continue
+            for domain in domains:
+                result[domain] = svc
         return result
 
     def _ensure_default_processes(self):
@@ -1396,10 +1370,12 @@ class RoutingView(QWidget):
         """
         self._ensure_default_processes()
         cfg = self.engine.config
-        domain_to_svc = self._build_domain_to_service()
-
+        domain_to_svc = self._build_domain_to_service(
+            cfg.get("selected_services", []), cfg.get("routed_domains", [])
+        )
         current_key = (
             tuple(sorted(cfg.get("routed_domains", []) or [])),
+            tuple(sorted(cfg.get("selected_services", []) or [])),
             tuple(sorted(cfg.get("routed_processes", []) or [])),
             tuple(sorted(cfg.get("routed_subscriptions", []) or [])),
         )
@@ -1424,7 +1400,9 @@ class RoutingView(QWidget):
                           "icon": "📋", "badge": "", "badge_color": theme.ACCENT,
                           "display": short_name})
 
-        # 2) Домены (пресетные — с меткой сервиса)
+        # 2) Домены выбранных карточек имеют метку сервиса. Ручные домены не
+        # хранят отдельных VPN/DPI-политик: в чистых режимах они следуют
+        # глобальному режиму, а для Combo правило будет задано отдельно позже.
         for d in cfg.get("routed_domains", []) or []:
             svc = domain_to_svc.get(d)
             items.append({"name": d, "key": "routed_domains", "icon": "🌐",

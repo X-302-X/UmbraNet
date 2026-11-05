@@ -5,7 +5,7 @@ UmbraNet — канвас списка транспортов DNS (радио-в
 сами, состояния active/normal/unavail и hover — тоже. Логика выбора живёт
 в TransportList (контроллере).
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations
@@ -90,11 +90,11 @@ class TransportCanvas(RowCanvas):
 
         # цвета текста по состоянию
         if state == "active":
-            c_dot, c_name, c_desc = theme.GREEN, theme.TEXT, "#b2b3d6"
+            c_dot, c_name, c_desc = theme.GREEN, theme.TEXT, theme.SUBTEXT
         elif state == "unavail":
-            c_dot, c_name, c_desc = theme.BORDER, theme.MUTED, "#7c7d9c"
+            c_dot, c_name, c_desc = theme.BORDER, theme.MUTED, theme.MUTED
         else:
-            c_dot, c_name, c_desc = theme.MUTED, theme.TEXT, "#b2b3d6"
+            c_dot, c_name, c_desc = theme.MUTED, theme.TEXT, theme.SUBTEXT
 
         # ● точка
         p.setFont(self._f_dot)

@@ -5,7 +5,6 @@ UmbraNet - главное окно (PySide6 / Qt Widgets).
 from __future__ import annotations
 
 import logging
-import time
 
 from PySide6.QtCore import QByteArray, QEvent, QRect, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPixmap, QRadialGradient
@@ -33,20 +32,28 @@ from umbranet.engine_adapter import (
     get_current_mode,
     get_dpi_targets,
     get_engine,
+    get_doctor_notify,
     get_nav_order,
     get_startup_health,
-    is_admin,
-    network_restore_latest,
-    set_dns_to_localhost,
+    post_event,
+    routing_mode_is_explicit,
+    routing_running,
+    routing_start_readiness,
+    routing_vpn_block_message,
+    select_vpn_server_for_next_start,
     set_nav_order,
+    start_routing_runtime,
+    stop_routing_runtime,
+    take_vpn_reserve_choice,
     switch_mode,
+    verify_teardown,
 )
 from umbranet.views.about import AboutView
-from umbranet.views.kus import KusView
+from umbranet.views.extra import ExtraView
 from umbranet.views.log import LogView
 from umbranet.views.network import NetworkView
-from umbranet.views.profiles import ProfilesView
 from umbranet.views.routing import RoutingView
+from umbranet.views.servers import ServersView
 from umbranet.views.settings import SettingsView
 from umbranet.views.strategy_lab import StrategyLabView
 from umbranet.widgets.header import ControlBar, ModeSwitch
@@ -57,14 +64,14 @@ log = logging.getLogger("UmbraNet.App")
 
 NAV_ITEMS = [
     NavItem("routing",  "Маршрутизация",      "🔀"),
+    NavItem("servers",  "Сервера",            "👁️"),
     NavItem("network",  "Сеть и диагностика", "🤖"),
     NavItem("strategy_lab", "AI-стратегии",   "🧪"),
-    NavItem("profiles", "DNS-профили",        "🧩"),
     NavItem("log",      "Логи",               "📑"),
     NavItem("settings", "Настройки",          "⚙"),
     NavItem("about",    "О программе",        "ℹ"),
 ]
-SECRET_NAV = NavItem("kus", "Кусь", "😺")
+EXTRA_NAV = NavItem("extra", "\u041a\u0443\u0441\u044c", "😺")
 
 
 def _ordered_nav_items() -> list[NavItem]:
@@ -84,67 +91,63 @@ def _placeholder(title: str) -> QWidget:
     return w
 
 
-# ── Запуск движка после остановки: повторы вместо одной паузы (P2-3) ─────────
-
-def _start_engine_with_retry(engine, waits=(0.3, 0.7, 1.5), sleeper=None) -> bool:
-    """Запускает движок, давая ОС время освободить порт 53 после `stop()`.
-
-    Раньше здесь стояла одна фиксированная пауза 0.3 с. На медленной машине
-    (или когда «отставший» процесс ещё держит порт) этого не хватало, и человек
-    видел «DPI не запустился» без причины — хотя через миг всё бы встало.
-    Теперь попыток несколько, а паузы нарастают: если порт освободился чуть
-    позже, запуск всё равно удаётся; если причина настоящая — получим честный
-    отказ (в худшем случае это +2.5 с, и попытки видны в логе).
-
-    Времязависимость вынесена в параметры (`waits`, `sleeper`), поэтому тесты
-    проверяют повторы без реальных ожиданий.
-    """
-    sleeper = sleeper or time.sleep
-    ok = False
-    attempts = len(waits)
-    for attempt, wait in enumerate(waits, start=1):
-        sleeper(wait)
-        ok = bool(engine.start())
-        if ok:
-            if attempt > 1:
-                log.info("Движок запустился с %d-й попытки (паузы %s)", attempt, waits[:attempt])
-            return True
-        if attempt < attempts:
-            log.debug("Попытка %d запустить движок не удалась, ждём %.1f с", attempt, waits[attempt])
-    log.warning("Движок не запустился после %d попыток", attempts)
-    return ok
-
-
 # ── Фоновые потоки для start/stop/restart ─────────────────────────────────────
 
 class _EngineWorker(QThread):
-    """Выполняет start/stop/restart в фоне — UI не замерзает."""
+    """Runs the DNS-independent VPN / Combo / DPI lifecycle away from the UI."""
     finished = Signal(str, bool)   # (action, ok)
 
-    def __init__(self, engine, action: str):
+    def __init__(self, action: str):
         super().__init__()
-        self.engine = engine
-        self.action = action   # "start" | "stop" | "restart"
+        self.action = action
+        self.message = ""
+        # Restart consists of an explicit PAC restore followed by Start. Keep
+        # this fact for the GUI so a failed restore cannot be hidden if the
+        # subsequent Start also fails before committing a new PAC.
+        self.restore_failed = False
+        # QThread cannot safely be killed while it owns a route lifecycle.  A
+        # real application exit therefore asks it to stop and waits; checks on
+        # both sides of Start prevent a late worker from resurrecting e1-spike
+        # or the PAC gateway after the shutdown cleanup.
+        self._shutdown_requested = False
+
+    def request_shutdown(self):
+        self._shutdown_requested = True
+
+    def _stop_after_shutdown_request(self, message: str) -> tuple[bool, str]:
+        stopped, stop_message = stop_routing_runtime()
+        detail = stop_message or "маршрутизация остановлена"
+        return bool(stopped), f"{message}; {detail}"
 
     def run(self):
         ok = False
         try:
             if self.action == "start":
-                ok = bool(self.engine.start())
+                if self._shutdown_requested:
+                    ok, self.message = self._stop_after_shutdown_request("Выход отменил запуск")
+                else:
+                    ok, self.message = start_routing_runtime()
+                    if self._shutdown_requested:
+                        ok, self.message = self._stop_after_shutdown_request("Выход отменил запуск")
             elif self.action == "stop":
-                self.engine.stop()
-                ok = True
-            else:  # restart
-                self.engine.stop()
-                # Повторы с нарастающей паузой вместо одной фиксированной (P2-3):
-                # ОС не обязана освободить порт 53 мгновенно.
-                ok = _start_engine_with_retry(self.engine)
+                ok, self.message = stop_routing_runtime()
+            else:
+                stopped, stop_message = stop_routing_runtime()
+                self.restore_failed = not stopped
+                if self._shutdown_requested:
+                    ok = bool(stopped)
+                    self.message = stop_message or "Выход отменил перезапуск"
+                else:
+                    ok, self.message = start_routing_runtime()
+                    if self._shutdown_requested:
+                        ok, self.message = self._stop_after_shutdown_request("Выход отменил перезапуск")
+                if not ok and stop_message:
+                    self.message = f"{stop_message}; {self.message}"
         except Exception as exc:
+            self.message = str(exc)
             log.error("_EngineWorker(%s) ошибка: %s", self.action, exc)
             ok = False
         finally:
-            # Гарантируем отправку сигнала даже при исключении,
-            # чтобы _busy всегда снимался и кнопки разблокировались
             self.finished.emit(self.action, ok)
 
 
@@ -290,11 +293,17 @@ class GlowContainer(QWidget):
             p.end()
             return pm
 
-        # Пурпурно-розовая туманность правого верхнего угла (возле «Старт»)
+        # Мягкий цветовой блик в правом верхнем углу (возле «Старт»).
+        # Цвета берём из темы: для Neon это прежний розово-лавандовый фон,
+        # а для «Ледяного стекла» — более холодное, приглушённое свечение.
         def nebula_tr(p, s):
             grad = QRadialGradient(s * 0.5, s * 0.5, 400)
-            grad.setColorAt(0, QColor(242, 89, 176, 12))     # розовый (PINK)
-            grad.setColorAt(0.5, QColor(139, 109, 255, 6))   # лавандовый
+            pink = QColor(theme.PINK)
+            pink.setAlpha(12)
+            accent = QColor(theme.ACCENT)
+            accent.setAlpha(6)
+            grad.setColorAt(0, pink)
+            grad.setColorAt(0.5, accent)
             grad.setColorAt(1, QColor(0, 0, 0, 0))
             p.setBrush(grad)
             p.setPen(Qt.NoPen)
@@ -339,8 +348,14 @@ class GlowContainer(QWidget):
         self._resize_settle.start()
 
     def set_live_resize(self, live: bool):
-        """live=True — контент НЕ замораживать при resize (вкладка быстрая)."""
+        """Switch between snapshot-freeze and a genuinely live page resize."""
         self._freeze_content = not live
+        # Routing is painted cheaply by canvases and must never inherit an
+        # in-progress snapshot from a previously shown heavyweight page.  The
+        # overlay intentionally stretches its screenshot while dragging, which
+        # otherwise looks like the whole Services page is a scaled photograph.
+        if live and self._live_freezer.active:
+            self._live_freezer.end()
 
     def showEvent(self, event):
         # Первый показ: вешаем фильтр на QWindow окна. Его событие Resize —
@@ -425,18 +440,18 @@ class MainWindow(GlowContainer):
         self._ai_generation_worker: _AiGenerationWorker | None = None
         self._strategy_check_worker: _StrategyCheckWorker | None = None
         self._last_startup_health = {"severity": "ok", "can_start": True, "summary": "Готов к запуску", "problems": [], "warnings": []}
+        # `None` forces the first render; later equal readiness values must not
+        # reapply button QSS or measure the header on every queue tick.
+        self._last_can_start: bool | None = None
         self._watchdog_proc = None
-        # Запоминаем, меняли ли мы системный DNS в этой сессии.
-        # Начиная с фикса логов DPI-режима мы переключаем DNS на UmbraNet
-        # во всех режимах запуска: иначе журнал DNS-запросов в DPI Only пустой,
-        # потому что Windows продолжает спрашивать DNS провайдера напрямую.
-        # При остановке возвращаем DNS на DHCP только если меняли его сами.
-        self._dns_was_set_by_app = False
+        self._shutdown_started = False
+        self._shutdown_worker_timeout = False
+        self._exit_fallback_scheduled = False
         # AI-генерация запускается как controlled session: сначала подтверждение,
         # затем Stop, и только после успешной остановки — подготовка плана.
         self._ai_generation_pending = False
         self._strategy_check_pending = False
-        
+
         # One scheduler owns startup and periodic list refreshes. No GUI-only
         # domain thread, no duplicate startup subscription download.
         self._updates_start_timer = QTimer(self)
@@ -473,7 +488,7 @@ class MainWindow(GlowContainer):
         self.sidebar.orderChanged.connect(
             lambda order: set_nav_order(order, [it.key for it in NAV_ITEMS])
         )
-        self.sidebar.secretUnlocked.connect(self._unlock_kus)
+        self.sidebar.extraNavRequested.connect(self._show_extra)
         root.addWidget(self.sidebar)
 
         right = QVBoxLayout()
@@ -487,30 +502,20 @@ class MainWindow(GlowContainer):
         self.stack.setStyleSheet("background:transparent;")
         self._views: dict[str, QWidget] = {}
         self._pages: dict[str, int] = {}
-        for it in NAV_ITEMS:
-            if it.key == "routing":
-                page = RoutingView()
-            elif it.key == "profiles":
-                page = ProfilesView()
-            elif it.key == "network":
-                page = NetworkView()
-            elif it.key == "strategy_lab":
-                page = StrategyLabView()
-                page.generationRequested.connect(self._on_ai_generation_requested)
-                page.generationCancelRequested.connect(self._on_ai_generation_cancel_requested)
-                page.strategyCheckRequested.connect(self._on_strategy_check_requested)
-                page.strategyCheckCancelRequested.connect(self._on_strategy_check_cancel_requested)
-            elif it.key == "log":
-                page = LogView()
-            elif it.key == "settings":
-                page = SettingsView()
-            elif it.key == "about":
-                page = AboutView()
-            else:
-                page = _placeholder(it.label)
-            self._views[it.key] = page
-            idx = self.stack.addWidget(self._scrollable_page(page, key=it.key))
-            self._pages[it.key] = idx
+        # The shell owns active/inactive transitions.  Pages with a cheap
+        # periodic visual status use this to stop their timers while hidden.
+        self._active_page_key: str | None = None
+        # A view is initially fresh after its own constructor has populated it.
+        # Later, engine events invalidate views that are not visible.  This
+        # avoids destroying/recreating whole page trees merely because the user
+        # returned to an unchanged tab.
+        self._stale_view_keys: set[str] = set()
+        self._ensure_page("routing")
+        # StrategyLab is the one complex scrollable page whose native Qt
+        # construction visibly flashed on Windows when deferred until a click.
+        # Create its empty shell before MainWindow is ever shown; JSON loading
+        # and row construction remain deferred until first activation.
+        self._ensure_page("strategy_lab")
         right.addWidget(self.stack, 1)
 
         right_wrap = QWidget()
@@ -530,7 +535,7 @@ class MainWindow(GlowContainer):
                 "show":    self._restore_window,
                 "quit":    self._quit_app,
             })
-            self.tray.set_running(self.engine.running)
+            self.tray.set_running(routing_running())
             self.tray.show()
 
         self._show_timer = QTimer(self)
@@ -587,18 +592,23 @@ class MainWindow(GlowContainer):
         row = QHBoxLayout()
         row.setSpacing(12)
 
-        init_mode = {"dns_only": "blue", "combo": "black", "dpi_only": "red"}.get(
-            get_current_mode(), "blue"
-        )
+        init_mode = ""
+        if routing_mode_is_explicit():
+            init_mode = {"vpn": "blue", "combo": "black", "dpi": "red"}.get(
+                get_current_mode(), ""
+            )
         self.mode_switch = ModeSwitch(active=init_mode)
         self.mode_switch.modeChanged.connect(self._on_mode_change)
         row.addWidget(self.mode_switch)
         row.addStretch()
 
-        self.control = ControlBar(running=self.engine.running, mode=get_current_mode())
+        self.control = ControlBar(running=routing_running(), mode=get_current_mode())
         self.control.startClicked.connect(self._on_start)
         self.control.stopClicked.connect(self._on_stop)
         self.control.restartClicked.connect(self._on_restart)
+        # Header text/button mutations are event-driven; never wait for the
+        # 200-ms engine queue drain merely to reconcile its compact layout.
+        self.control.visualStateChanged.connect(self._apply_topbar_compact)
         row.addWidget(self.control)
         # Инициализируем серую кнопку Старт если целей нет
         try:
@@ -630,7 +640,14 @@ class MainWindow(GlowContainer):
         return " • ".join(str(x) for x in items[:3])
 
     def _update_startup_health(self) -> dict:
-        """Запускает предстартовую диагностику в фоне и возвращает последний результат."""
+        """Запускает предстартовую диагностику в фоне и возвращает последний результат.
+
+        2026-10-06: без Старта — полная тишина. Раньше таймер опрашивал Health
+        каждые 30 секунд даже в простое («доктор видит что-то, даже когда я не
+        нажал старт»). Теперь проверки идут только после Старта и по кнопкам.
+        """
+        if not routing_running():
+            return self._last_startup_health
         if self._startup_health_worker and self._startup_health_worker.isRunning():
             return self._last_startup_health
         self._startup_health_worker = _StartupHealthWorker()
@@ -646,11 +663,13 @@ class MainWindow(GlowContainer):
             return
 
         if severity == "error":
-            icon, color, bg = "⛔", theme.RED, "rgba(255, 100, 120, 0.12)"
+            icon, color = "⛔", theme.RED
             title = "UmbraNet не готов к запуску"
         else:
-            icon, color, bg = "⚠", theme.YELLOW, "rgba(251, 191, 36, 0.12)"
+            icon, color = "⚠", theme.YELLOW
             title = "Есть предупреждения"
+        color_rgb = QColor(color)
+        bg = f"rgba({color_rgb.red()}, {color_rgb.green()}, {color_rgb.blue()}, 0.12)"
 
         self.health_banner.setText(
             f"{icon} <b>{title}</b>: {self._format_health_details(self._last_startup_health)}"
@@ -673,11 +692,11 @@ class MainWindow(GlowContainer):
     # ── режим DPI ──
     def _on_mode_change(self, ui_key: str):
         UI_KEY_TO_MODE = {
-            "blue":  "dns_only",
+            "blue": "vpn",
             "black": "combo",
-            "red":   "dpi_only",
+            "red": "dpi",
         }
-        ui_mode = UI_KEY_TO_MODE.get(ui_key, "dns_only")
+        ui_mode = UI_KEY_TO_MODE.get(ui_key, "vpn")
 
         # C1 guard убран с переключения: теперь режимы переключаются всегда,
         # даже если список целей пуст. Блокируется только кнопка Старт
@@ -685,13 +704,13 @@ class MainWindow(GlowContainer):
         # запустить пустую конфигурацию.
 
         # Если пытаемся сменить режим пока программа работает - просто останавливаем ее
-        if self.engine.running:
+        if routing_running():
             self._on_stop()
 
         ok, err = switch_mode(ui_mode)
         if not ok:
             log.warning("Не удалось переключить режим '%s': %s", ui_mode, err)
-            actual_key = {"dns_only": "blue", "combo": "black", "dpi_only": "red"}.get(
+            actual_key = {"vpn": "blue", "combo": "black", "dpi": "red"}.get(
                 get_current_mode(), "blue"
             )
             self.mode_switch.set_active(actual_key)
@@ -701,14 +720,14 @@ class MainWindow(GlowContainer):
         self._update_mode_hint()
         QTimer.singleShot(400, self._update_startup_health)
 
-        # Обновляем все UI-компоненты (вкладку Маршрутизация и т.д.),
-        # чтобы они переключились с DNS-маршрутов на DPI-стратегии.
+        # Обновляем UI-компоненты, чтобы они отразили новый глобальный режим
+        # VPN, Combo или DPI и соответствующие доступные стратегии.
         self._refresh_views()
 
     def _show_dpi_guard_dialog(self, custom_text: str | None = None):
         """Диалог C1: объясняет, почему DPI без целей не включается."""
         text = custom_text or (
-            "Для режимов <b>Combo / DPI Only</b> нужны цели DPI.<br><br>"
+            "Для режимов <b>Combo / DPI</b> нужны цели.<br><br>"
             "Включите хотя бы один сервис в <b>Маршрутизация</b> "
             "(например, YouTube, Discord, ChatGPT) или добавьте домен вручную "
             "в блоке «Диспетчер задач».<br><br>"
@@ -732,7 +751,7 @@ class MainWindow(GlowContainer):
         # Подсветка Health-баннера
         try:
             self.health_banner.setText(
-                "⚠ <b>DPI-цели не выбраны</b>: включите сервисы/домены в «Маршрутизация», затем снова выберите Combo/DPI Only."
+                "⚠ <b>DPI-цели не выбраны</b>: включите сервисы/домены в «Маршрутизация», затем снова выберите Combo/DPI."
             )
             self.health_banner.setStyleSheet(
                 f"QLabel{{background:rgba(251, 191, 36, 0.14); color:{theme.TEXT};"
@@ -753,20 +772,22 @@ class MainWindow(GlowContainer):
         никогда не станет серой, т.к. процессы есть всегда.
         """
         try:
-            return count_dpi_targets() > 0
+            ready, _message = routing_start_readiness()
+            return ready
         except Exception:
-            return True
+            return False
 
     def _show_start_guard_dialog(self):
         """Диалог при попытке старта без выбранных доменов/сервисов."""
+        _ready, reason = routing_start_readiness()
         text = (
-            "Выберите хотя бы один сервис в <b>Маршрутизация</b> перед запуском.<br><br>"
-            "Включите нужные сервисы (например, YouTube, Discord, ChatGPT) "
-            "или добавьте домен вручную в «Диспетчер задач».<br><br>"
-            "Без целей запускать UmbraNet бессмысленно — нечего обходить."
+            "<b>Маршрут ещё не готов к запуску.</b><br><br>"
+            f"{reason or 'Выберите сервис и VPN-сервер, или добавьте домен вручную в «Диспетчер задач».'}<br><br>"
+            "В VPN и Combo AI-сервисы используют только проверенный VPN-сервер; "
+            "при отсутствии готового сервера прямого подключения не будет."
         )
         box = QMessageBox(self)
-        box.setWindowTitle("Выберите сервис")
+        box.setWindowTitle("Настройте маршрут")
         box.setIcon(QMessageBox.Warning)
         box.setTextFormat(Qt.RichText)
         box.setText(text)
@@ -793,42 +814,42 @@ class MainWindow(GlowContainer):
         except Exception:
             pass
 
-    def _update_start_button(self):
-        """Делает кнопку Старт серой, если нет выбранных целей."""
-        # Текст статуса и кнопки меняется (Старт/Стоп, «выберите сервис») — значит
-        # меняется и требуемая ширина строки: пересчитываем ужимание.
-        try:
-            self._apply_topbar_compact()
-        except Exception:
-            pass
+    def _update_start_button(self) -> bool:
+        """Synchronize Start availability only when readiness actually changed.
+
+        Header geometry is now driven by ``ControlBar.visualStateChanged``.
+        This helper deliberately contains no layout work, so an empty engine
+        queue cannot repeatedly measure or restyle the top bar.
+        """
         try:
             can = self._can_start()
-            # running-процесс не трогаем — Стоп всегда активен
-            if hasattr(self, "control") and self.control:
-                self.control.set_can_start(can)
         except Exception:
-            pass
+            return False
+        if can == self._last_can_start:
+            return False
+        self._last_can_start = can
+        control = getattr(self, "control", None)
+        if control is not None:
+            control.set_can_start(can)
+        return True
 
     # ── ФИХ #3 + #6: старт/стоп/рестарт через фоновый поток ──
     def _start_action(self, action: str):
         """Запускает action в фоновом потоке с блокировкой повторных кликов."""
-        if self._busy:
+        if self._shutdown_started or self._busy:
             return
+        # Каждый Старт/Стоп — новое «поколение» сессии. Фоновые проверки
+        # сверяются с ним и не вмешиваются в следующую сессию после быстрого
+        # Стоп→Старт.
+        self._runtime_gen = getattr(self, "_runtime_gen", 0) + 1
         # Блок Старта без целей — вместо блока переключения режимов
         if action in ("start", "restart") and not self._can_start():
             self._show_start_guard_dialog()
             self._update_start_button()
             return
-        # Явный пользовательский Stop должен отменять любые фоновые мягкие
-        # restart-задачи из вкладок. Иначе worker маршрутизации мог остановить
-        # engine, а затем снова стартовать его уже после нажатия «Стоп».
-        try:
-            self.engine._manual_stop_requested = action == "stop"
-        except Exception:
-            pass
-        # Не запускаем тяжёлую предстартовую диагностику в UI-потоке по нажатию
-        # «Старт»: сам engine.start() делает preflight в рабочем потоке и вернёт
-        # понятную ошибку через last_start_error. Это убирает зависание кнопки.
+        # Жизненный цикл запускается только через RoutingRuntime. Он сам
+        # проверяет VPN-выходы и DPI-стратегии в рабочем потоке; локальный DNS
+        # при этом не стартует и не перезапускается.
         self._busy = True
         self.control.set_busy(action)          # показываем промежуточный статус
         if self.tray:
@@ -836,7 +857,7 @@ class MainWindow(GlowContainer):
                 {"start": "Запуск...", "stop": "Остановка...", "restart": "Перезапуск..."}
                 .get(action, "...")
             )
-        self._worker = _EngineWorker(self.engine, action)
+        self._worker = _EngineWorker(action)
         self._worker.finished.connect(self._on_action_done)
         self._worker.start()
 
@@ -861,7 +882,7 @@ class MainWindow(GlowContainer):
             if hasattr(view, "_generation_busy"):
                 view._generation_busy()
             return
-        was_running = bool(getattr(self.engine, "running", False))
+        was_running = routing_running()
         self._strategy_check_pending = True
         if hasattr(view, "_check_stop_started"):
             view._check_stop_started(was_running)
@@ -893,7 +914,7 @@ class MainWindow(GlowContainer):
             log.warning("Strategy check start failed: %s", exc)
             self._busy = False
             self._strategy_check_pending = False
-            self.control.set_running(bool(getattr(self.engine, "running", False)), mode=get_current_mode())
+            self.control.set_running(routing_running(), mode=get_current_mode())
             if hasattr(view, "_generation_plan_error"):
                 view._generation_plan_error(str(exc))
 
@@ -938,7 +959,7 @@ class MainWindow(GlowContainer):
         self._strategy_check_pending = False
         self.control.set_running(False, mode=get_current_mode())
         if self.tray:
-            self.tray.set_running(bool(getattr(self.engine, "running", False)))
+            self.tray.set_running(routing_running())
         if hasattr(view, "_check_finished"):
             view._check_finished(result)
         self._refresh_current_view()
@@ -955,7 +976,7 @@ class MainWindow(GlowContainer):
             if hasattr(view, "_generation_busy"):
                 view._generation_busy()
             return
-        was_running = bool(getattr(self.engine, "running", False))
+        was_running = routing_running()
         self._ai_generation_pending = True
         if hasattr(view, "_generation_stop_started"):
             view._generation_stop_started(was_running)
@@ -988,7 +1009,7 @@ class MainWindow(GlowContainer):
         except Exception as exc:  # noqa: BLE001
             log.warning("AI generation start failed: %s", exc)
             self._busy = False
-            self.control.set_running(bool(getattr(self.engine, "running", False)), mode=get_current_mode())
+            self.control.set_running(routing_running(), mode=get_current_mode())
             if hasattr(view, "_generation_plan_error"):
                 view._generation_plan_error(str(exc))
             self._ai_generation_pending = False
@@ -1020,7 +1041,7 @@ class MainWindow(GlowContainer):
 
     def _on_ai_generation_done(self, result: dict):
         view = self._views.get("strategy_lab")
-        # Safety net: controlled generation must never leave WinWS/engine running
+        # Safety net: controlled generation must never leave WinWS running
         # after completion. User will start UmbraNet manually when ready.
         cleanup = {"stopped": [], "errors": []}
         try:
@@ -1049,131 +1070,81 @@ class MainWindow(GlowContainer):
         self._strategy_check_pending = False
         self.control.set_running(False, mode=get_current_mode())
         if self.tray:
-            self.tray.set_running(bool(getattr(self.engine, "running", False)))
+            self.tray.set_running(routing_running())
         if hasattr(view, "_generation_finished"):
             view._generation_finished(result)
         self._refresh_current_view()
 
+    def _show_manual_server_reserve_choice(self, proposal: dict[str, str]) -> None:
+        """Ask about a verified reserve after a failed manual readiness check."""
+        failed = proposal.get("failed_profile_name") or "выбранный VPN-сервер"
+        suggested = proposal.get("suggested_profile_name") or "проверенный резерв"
+        suggested_id = proposal.get("suggested_profile_id") or ""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("VPN-сервер недоступен")
+        box.setText(f"Сервер «{failed}» не прошёл проверку перед подключением.")
+        box.setInformativeText(
+            f"Доступен проверенный резерв «{suggested}». Подключиться к нему? "
+            "Без вашего выбора UmbraNet не заменит выбранный сервер."
+        )
+        reserve_button = box.addButton("Подключиться к резерву", QMessageBox.AcceptRole)
+        box.addButton("Не подключаться", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is reserve_button and suggested_id:
+            saved, message = select_vpn_server_for_next_start(suggested_id)
+            if saved:
+                self.control.set_busy("start")
+                QTimer.singleShot(0, lambda: self._start_action("start"))
+                return
+            self.control.set_error(message)
+            return
+        self.control.set_error("Подключение отменено: выбранный VPN-сервер недоступен")
+
     def _on_action_done(self, action: str, ok: bool):
         """Вызывается из фонового потока по завершении start/stop/restart."""
         self._busy = False
-        running = self.engine.running
+        # During real application exit the worker may finish after the UI has
+        # already started teardown.  It must not arm a watchdog, schedule an AI
+        # session, or refresh disappearing widgets at that point.
+        if self._shutdown_started:
+            return
+        running = routing_running()
         self.control.set_running(running, mode=get_current_mode())
+        if running:
+            # A committed PAC with no verified HTTP/SOCKS exit is intentionally
+            # a blocking state. Surface it as yellow so "VPN запущен" never
+            # suggests that selected services have a usable unblocked route.
+            self.control.set_vpn_blocked(routing_vpn_block_message())
         if self.tray:
             self.tray.set_running(running)
         self._update_start_button()
 
         if ok and action in ("start", "restart") and running:
-            current_mode = get_current_mode()
-            if is_admin():
-                # ВАЖНО: системный DNS переключаем на 127.0.0.1 во всех режимах,
-                # включая DPI Only. Иначе в красном режиме сам DPI/WinWS работает,
-                # но Windows отправляет DNS-запросы мимо UmbraNet, поэтому вкладка
-                # «Логи запросов» остаётся пустой. DNS-сервер всё равно запущен
-                # и нужен для корректного резолва/журнала.
-                import os
-                import subprocess
-                import threading as _threading
-
-                # Запускаем watchdog, чтобы он следил за нами.
-                # P0-3: watchdog теперь держится на pipe, а не на опросе PID.
-                # stdin=PIPE ОБЯЗАТЕЛЕН и не должен закрываться: как только он
-                # закроется (мы умерли) — watchdog проснётся и вернёт DNS.
-                if getattr(self, "_watchdog_proc", None) is None:
-                    try:
-                        import sys
-                        core_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "core")
-                        wd_path = os.path.join(core_dir, "watchdog.py")
-                        if os.path.exists(wd_path):
-                            python_exe = sys.executable
-                            if "python.exe" in python_exe.lower() and "pythonw.exe" not in python_exe.lower():
-                                pw = python_exe.lower().replace("python.exe", "pythonw.exe")
-                                if os.path.exists(pw):
-                                    python_exe = pw
-                            self._watchdog_proc = subprocess.Popen(
-                                [python_exe, wd_path],
-                                stdin=subprocess.PIPE,      # ← детект нашей смерти
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                            )
-                            # Рукопожатие: watchdog ждёт HELLO, прежде чем считать
-                            # себя на связи. Без него он не мог бы отличить
-                            # «родитель жив, но канал молчит» от «родитель умер».
-                            try:
-                                self._watchdog_proc.stdin.write(b"HELLO\n")
-                                self._watchdog_proc.stdin.flush()
-                            except Exception as exc:
-                                log.warning(f"Watchdog не подтвердил рукопожатие: {exc}")
-                            log.info(f"Запущен Watchdog (PID {self._watchdog_proc.pid}) для защиты DNS")
-                    except Exception as exc:
-                        log.warning(f"Не удалось запустить watchdog: {exc}")
-
-                cfg = self.engine.config
-                def _set_dns():
-                    # P0-2: ДО первого вмешательства фиксируем DNS пользователя.
-                    # Иначе после остановки мы вернём не «как было», а «Авто».
-                    try:
-                        from umbranet.engine_adapter import dns_snapshot_before_change
-                        snap = dns_snapshot_before_change()
-                        if snap and snap.get("ok"):
-                            log.info("DNS пользователя сохранён в снапшот: %s", snap.get("path"))
-                    except Exception as exc:
-                        log.debug("Снапшот DNS перед сменой не снят: %s", exc)
-
-                    dns_ok, dns_msg, _ = set_dns_to_localhost(
-                        fallback_ipv4=cfg.get("fallback_dns", "1.1.1.1"),
-                        fallback_ipv6=cfg.get("fallback_dns6", ""),
-                        enable_ipv6=cfg.get("enable_ipv6", True),
-                    )
-                    if not dns_ok:
-                        log.warning("set_dns_to_localhost не удалось: %s", dns_msg)
-                    else:
-                        self._dns_was_set_by_app = True
-                        log.info("Системный DNS переключён на UmbraNet для режима %s", current_mode)
-                        # После смены DNS запускаем общий автодоктор в фоне:
-                        # Health → если надо repair → Health → запись в логи.
-                        _threading.Thread(
-                            target=self._auto_doctor_after_start,
-                            daemon=True, name="UmbraNet-AutoDoctor"
-                        ).start()
-                _threading.Thread(target=_set_dns, daemon=True, name="UmbraNet-SetDNS").start()
+            # PAC has already been committed by TransportRuntime. Arm a
+            # proxy-only watchdog now: unlike the historical DNS watchdog it
+            # never rewrites system DNS after an application crash.
+            self._ensure_proxy_watchdog()
+        elif action == "stop":
+            if ok:
+                self._shutdown_watchdog("CLEAN")
             else:
-                # Без прав администратора нельзя сменить системный DNS —
-                # логи DNS-запросов в DPI Only/Combo могут быть пустыми.
-                self.control.set_running(True, mode=get_current_mode(), admin_warn=True)
-
-        elif ok and action == "stop":
-            # Добиваем временные/оторванные DPI-процессы. Обычный engine.stop()
-            # не всегда видит orphan winws.exe, а именно он держит WinDivert.
-            try:
-                dpi_strategy_ai_cleanup_runtime()
-            except Exception as exc:
-                log.debug("cleanup после Stop не удался: %s", exc)
-
-            # Watchdog НЕ убиваем: он ещё пригодится, если программа упадёт
-            # после остановки. Его задача — вернуть DNS из снапшота, а это
-            # действие идемпотентно, повторный запуск ничего не портит.
-
-            # Возвращаем системный DNS только если именно мы его меняли.
-            # P0-2: не «сброс на Авто», а восстановление снапшота — то есть
-            # именно тех DNS, что были у пользователя до запуска UmbraNet.
-            if self._dns_was_set_by_app and is_admin():
-                import threading as _threading
-
-                def _reset():
-                    ok, msg = network_restore_latest()
-                    if ok:
-                        log.info("DNS пользователя восстановлен при остановке: %s", msg)
-                        self._dns_was_set_by_app = False
-                    else:
-                        log.warning("Не удалось восстановить DNS при остановке: %s", msg)
-
-                _threading.Thread(
-                    target=_reset, daemon=True, name="UmbraNet-RestoreDNS"
-                ).start()
+                # A failed in-process restore leaves its atomic snapshot for
+                # the watchdog. It is safer to ask for one more restoration
+                # attempt than to acknowledge a potentially stale PAC.
+                self._handoff_proxy_restore_to_watchdog()
+        elif action == "restart" and not ok and bool(
+            getattr(self._worker, "restore_failed", False)
+        ):
+            # The old gateway was closed during Restart, while a failed restore
+            # retained the durable PAC snapshot. Since Start did not commit a
+            # replacement PAC, delegate that stale-PAC recovery to the
+            # independent watchdog exactly as a failed Stop would.
+            self._handoff_proxy_restore_to_watchdog()
 
         if action == "stop" and self._ai_generation_pending:
             if ok:
-                # Даём UI и фоновому DNS-reset короткий тик, затем готовим план.
+                # Даём UI короткий тик после остановки, затем готовим план.
                 QTimer.singleShot(350, self._begin_ai_generation_session)
             else:
                 view = self._views.get("strategy_lab")
@@ -1190,114 +1161,22 @@ class MainWindow(GlowContainer):
                     view._generation_plan_error("Не удалось остановить UmbraNet перед проверкой стратегий")
                 self._strategy_check_pending = False
 
-        if not ok and action in ("start", "restart"):
-            self.control.set_error(self.engine.last_start_error or "Не удалось запустить")
+        reserve_choice = take_vpn_reserve_choice() if not ok and action in ("start", "restart") else None
+        if reserve_choice:
+            # The failed route state was captured by VPN core before its
+            # preflight controller stopped, so both server surfaces can render
+            # it red while this modal decision is visible.
+            self._show_manual_server_reserve_choice(reserve_choice)
+        elif not ok and action in ("start", "restart"):
+            worker_message = str(getattr(self._worker, "message", "") or "")
+            self.control.set_error(worker_message or "Не удалось запустить")
         QTimer.singleShot(300, self._update_startup_health)
+        self._invalidate_views()
         self._refresh_current_view()
 
-    def _auto_doctor_after_start(self):
-        """Фоновый автодоктор после успешного старта.
-
-        Идея: пользователь не должен руками выбирать «что чинить». После старта
-        UmbraNet сам проверяет Health, применяет безопасную починку при нужде и
-        пишет итог в QueryLog/события UI.
-        """
-        import time
-        time.sleep(2.0)  # ждём DNS/WinWS и применение DNS-настроек Windows
-        try:
-            from umbranet.engine_adapter import (
-                add_query_log_event,
-                health_score,
-                network_repair_soft,
-                post_event,
-            )
-
-            def _choose_repair_level(hs: dict) -> tuple[bool, str]:
-                checks = hs.get("checks") or []
-                need_dns = False
-                need_browser = False
-                for c in checks:
-                    status = str(c.get("status") or "")
-                    title = str(c.get("title") or "")
-                    if status not in ("warn", "error"):
-                        continue
-                    if title in ("Системный DNS", "DNS/DPI утечки"):
-                        need_dns = True
-                    elif title == "Браузерный DoH":
-                        need_browser = True
-                if need_browser:
-                    return True, "browser"
-                if need_dns:
-                    return True, "soft"
-                return False, "none"
-
-            before = health_score()
-            before_score = int(before.get("score", 0) or 0)
-            before_title = before.get("title", "Health")
-            add_query_log_event(
-                "[Автодоктор: проверка]",
-                source="check" if before_score >= 85 else "leak",
-                rcode="OK" if before_score >= 85 else "WARN",
-                note=f"Health {before_score}/100 — {before_title}",
-            )
-
-            need, level = _choose_repair_level(before)
-            repair_report = None
-            if need:
-                log.info("Автодоктор: требуется починка уровня %s", level)
-                repair_report = network_repair_soft(level)
-                add_query_log_event(
-                    "[Автодоктор: лечение]",
-                    source="fixed" if repair_report.get("ok") else "error",
-                    rcode="OK" if repair_report.get("ok") else "WARN",
-                    note=(repair_report.get("after") or {}).get("title")
-                         or "; ".join(repair_report.get("errors") or [])
-                         or f"уровень {level}",
-                )
-            else:
-                log.info("Автодоктор: лечение не требуется (%s/100)", before_score)
-
-            after = health_score()
-            after_score = int(after.get("score", 0) or 0)
-            after_title = after.get("title", "Health")
-            add_query_log_event(
-                "[Автодоктор: итог]",
-                source="fixed" if after_score >= before_score else "error",
-                rcode="OK" if after_score >= 85 else "WARN",
-                note=f"Health {before_score} → {after_score}/100 — {after_title}",
-            )
-            post_event({
-                "type": "auto_doctor_done",
-                "score_before": before_score,
-                "score_after": after_score,
-                "title": after_title,
-                "repaired": bool(need),
-                "level": level,
-                "ok": after_score >= 85,
-                "message": f"Автодоктор: Health {before_score} → {after_score}/100",
-            })
-        except Exception as exc:
-            log.debug("_auto_doctor_after_start ошибка: %s", exc)
-            try:
-                from umbranet.engine_adapter import add_query_log_event, post_event
-                add_query_log_event(
-                    "[Автодоктор: ошибка]",
-                    source="error",
-                    rcode="FAIL",
-                    note=str(exc),
-                )
-                post_event({"type": "auto_doctor_done", "ok": False, "message": f"Автодоктор ошибка: {exc}"})
-            except Exception:
-                pass
-
     def _refresh_views(self):
-        """Обновляет только текущую вкладку.
-
-        Раньше при смене режима мы refresh'или все вкладки, включая скрытую
-        «AI-стратегии». На Windows/PySide перестройка скрытых QWidget-списков
-        может давать микро-окна/мигание. Скрытые вкладки обновятся при входе в
-        них через _show().
-        """
+        """Refresh the active page and defer every hidden page until it is opened."""
+        self._invalidate_views()
         self._refresh_current_view()
 
     def _apply_window_layout_mode(self) -> bool:
@@ -1316,7 +1195,7 @@ class MainWindow(GlowContainer):
           1. прячется ТЕКСТ статуса в шапке (точка-индикатор остаётся, а сам текст
              переезжает в подсказку точки) — это дублирующая надпись, она же есть
              на вкладке «Маршрутизация»;
-          2. кнопки режимов DNS / Combo / DPI сбрасывают подписи и остаются только
+          2. кнопки режимов VPN / Combo / DPI сбрасывают подписи и остаются только
              значками — примерно половина прежней ширины. Так они перестают
              упираться в «Перезапуск» и «Старт»;
           3. в узком окне «Перезапуск» остаётся со значком ↻;
@@ -1374,7 +1253,7 @@ class MainWindow(GlowContainer):
         #
         # Ступени, в порядке уступки:
         #   1) прячется текст статуса (остаётся точка);
-        #   2) ужимаются подписи режимов DNS / Combo / DPI (плавно, до значков);
+        #   2) ужимаются подписи режимов VPN / Combo / DPI (плавно, до значков);
         #   3) «Перезапуск» теряет подпись, остаётся ↻;
         #   4) «Старт/Стоп» ужимается плавно, в пределе — только значок ▶ / ⏹.
         need_full = mode_w["full"] + ctrl_w["full"] + margin
@@ -1464,6 +1343,87 @@ class MainWindow(GlowContainer):
         except Exception as exc:                        # noqa: BLE001
             log.debug("Пересчёт шапки после изменения боковой панели не удался: %s", exc)
 
+    def _make_view(self, key: str) -> QWidget:
+        """Create one page and connect only the signals owned by that page.
+
+        Pages remain resident after their first visit.  Their potentially
+        expensive initial widget construction is therefore paid once, while a
+        normal tab switch only changes the stack index.
+        """
+        if key == "routing":
+            return RoutingView()
+        if key == "servers":
+            return ServersView()
+        if key == "network":
+            page = NetworkView()
+            page.openLogRequested.connect(self._on_open_log_with_filter)
+            return page
+        if key == "strategy_lab":
+            # Build the complex lazy page as a child of the existing stack.
+            # Creating it parentless can make Windows briefly surface a native
+            # mini-window before QScrollArea reparents it.
+            page = StrategyLabView(self.stack)
+            page.generationRequested.connect(self._on_ai_generation_requested)
+            page.generationCancelRequested.connect(self._on_ai_generation_cancel_requested)
+            page.strategyCheckRequested.connect(self._on_strategy_check_requested)
+            page.strategyCheckCancelRequested.connect(self._on_strategy_check_cancel_requested)
+            return page
+        if key == "log":
+            return LogView()
+        if key == "settings":
+            return SettingsView()
+        if key == "about":
+            return AboutView()
+        item = next((entry for entry in NAV_ITEMS if entry.key == key), None)
+        return _placeholder(item.label if item is not None else key)
+
+    def _ensure_page(self, key: str) -> QWidget | None:
+        """Create and register a page on its first visit, not at application start."""
+        existing = self._views.get(key)
+        if existing is not None:
+            return existing
+        if key not in {item.key for item in NAV_ITEMS}:
+            return None
+        page = self._make_view(key)
+        self._views[key] = page
+        self._pages[key] = self.stack.addWidget(self._scrollable_page(page, key=key))
+        return page
+
+    def _invalidate_views(self, keys: tuple[str, ...] | None = None) -> None:
+        """Mark pages stale; invisible pages refresh only when next opened."""
+        if keys is None:
+            keys = tuple(item.key for item in NAV_ITEMS)
+        self._stale_view_keys.update(keys)
+
+    def _refresh_view(self, key: str) -> bool:
+        """Refresh one constructed page and clear its stale mark on success."""
+        view = self._views.get(key)
+        if view is None or not hasattr(view, "refresh"):
+            self._stale_view_keys.discard(key)
+            return True
+        try:
+            view.refresh()
+        except Exception as exc:  # noqa: BLE001 - UI refresh must not break navigation
+            log.debug("Обновление вкладки %s не удалось: %s", key, exc)
+            return False
+        self._stale_view_keys.discard(key)
+        return True
+
+    def _set_page_active(self, key: str, active: bool) -> None:
+        """Notify a constructed page when it enters or leaves the stack.
+
+        The hook is intentionally optional.  Ordinary pages remain plain
+        widgets; pages with periodic visual work stop that work while hidden.
+        """
+        view = self._views.get(key)
+        hook_name = "page_activated" if active else "page_deactivated"
+        hook = getattr(view, hook_name, None)
+        if callable(hook):
+            try:
+                hook()
+            except Exception as exc:  # noqa: BLE001 - navigation must remain usable
+                log.debug("Переход активности вкладки %s не удался: %s", key, exc)
+
     def _apply_page_layout_mode(self):
         """Просит текущую вкладку подстроиться под ширину окна.
 
@@ -1489,34 +1449,52 @@ class MainWindow(GlowContainer):
             return
 
     def _refresh_current_view(self):
+        """Force-refresh only the visible page after a real state transition."""
         self._update_start_button()
         try:
             idx = self.stack.currentIndex()
             for key, page_idx in self._pages.items():
                 if page_idx == idx:
-                    v = self._views.get(key)
-                    if v is not None and hasattr(v, "refresh"):
-                        v.refresh()
+                    self._refresh_view(key)
                     return
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - a stale view must not break the shell
+            log.debug("Не удалось обновить текущую вкладку: %s", exc)
+
+    def _refresh_visible_if_affected(self, keys: tuple[str, ...]) -> None:
+        """Refresh a visible affected page without waking unrelated tabs."""
+        try:
+            visible_index = self.stack.currentIndex()
+            for key, page_index in self._pages.items():
+                if page_index == visible_index:
+                    if key in keys:
+                        self._refresh_view(key)
+                    return
+        except Exception as exc:  # noqa: BLE001 - status invalidation is best-effort
+            log.debug("Не удалось обновить связанную с событием вкладку: %s", exc)
+
+    def _on_open_log_with_filter(self, filter_key: str):
+        """Кнопка «📋 Лог» в виджете лечения: вкладка «Логи» + категория."""
+        log_view = self._ensure_page("log")
+        if log_view is not None and hasattr(log_view, "set_filter"):
+            log_view.set_filter(filter_key)
+        self._on_navigate("log")
 
     def _on_navigate(self, key: str):
         self._show(key)
 
-    def _unlock_kus(self):
-        """Показывает скрытую вкладку «Кусь» (сессия, без сохранения в порядок)."""
-        if SECRET_NAV.key in self._pages:
-            self.sidebar.set_active(SECRET_NAV.key)
-            self._show(SECRET_NAV.key)
+    def _show_extra(self):
+        """Показывает дополнительную вкладку (сессия, без сохранения в порядок)."""
+        if EXTRA_NAV.key in self._pages:
+            self.sidebar.set_active(EXTRA_NAV.key)
+            self._show(EXTRA_NAV.key)
             return
-        page = KusView()
-        self._views[SECRET_NAV.key] = page
-        idx = self.stack.addWidget(self._scrollable_page(page, key=SECRET_NAV.key))
-        self._pages[SECRET_NAV.key] = idx
-        self.sidebar.add_item(SECRET_NAV)
-        self.sidebar.set_active(SECRET_NAV.key)
-        self._show(SECRET_NAV.key)
+        page = ExtraView()
+        self._views[EXTRA_NAV.key] = page
+        idx = self.stack.addWidget(self._scrollable_page(page, key=EXTRA_NAV.key))
+        self._pages[EXTRA_NAV.key] = idx
+        self.sidebar.add_item(EXTRA_NAV)
+        self.sidebar.set_active(EXTRA_NAV.key)
+        self._show(EXTRA_NAV.key)
 
     # ── Размер и положение окна ─────────────────────────────────────────────
     # Настройка живёт в общем состоянии UI (core/ui_state.py): тот же файл, что
@@ -1667,36 +1645,64 @@ class MainWindow(GlowContainer):
         self.activateWindow()
 
     def _process_engine_events(self):
-        # Кнопка Старт серая без целей — обновляем каждый тик (200 мс)
-        self._update_start_button()
+        # The 200-ms timer drains cross-thread events only.  Start readiness
+        # and header geometry update inside the relevant event branches.
         for event in drain_events():
             etype = event.get("type")
             if etype == "status_changed":
                 running = bool(event.get("running", False))
                 if not self._busy:
                     self.control.set_running(running, mode=get_current_mode())
+                    if running:
+                        self.control.set_vpn_blocked(routing_vpn_block_message())
                     if self.tray:
                         self.tray.set_running(running)
+                self._update_start_button()
                 self._update_startup_health()
+                self._invalidate_views()
                 self._refresh_current_view()
             elif etype == "mode_changed":
-                mode = event.get("mode", "dns_only")
-                ui_key = {"dns_only": "blue", "combo": "black", "dpi_only": "red"}.get(mode, "blue")
+                mode = event.get("mode", "vpn")
+                ui_key = {"vpn": "blue", "combo": "black", "dpi": "red"}.get(mode, "blue")
                 self.mode_switch.set_active(ui_key)
                 self._update_mode_hint()
                 self._update_start_button()
+                self._invalidate_views()
+                self._refresh_current_view()
             elif etype == "config_changed":
                 self._update_start_button()
+                self._invalidate_views()
+                self._refresh_current_view()
+            elif etype == "transport_status_changed":
+                # The core posted no data here: both views re-read their
+                # existing sanitized snapshot surface. Do not refresh other
+                # tabs or construct hidden ones for a routine health change.
+                affected = ("servers", "routing")
+                self._invalidate_views(affected)
+                self._refresh_visible_if_affected(affected)
             elif etype == "auto_doctor_done":
                 msg = event.get("message", "Автодоктор завершён")
                 ok = bool(event.get("ok", False))
                 log.info("%s", msg)
-                if self.tray:
+                # Фоновые уведомления — по галочке «Уведомления» в виджете
+                # лечения (2026-10-06: «постоянные уведомления нельзя отключить»).
+                if self.tray and get_doctor_notify():
                     try:
                         self.tray.notify(("✅ " if ok else "⚠ ") + msg)
                     except Exception:
                         pass
+                self._invalidate_views()
                 self._refresh_current_view()
+            elif etype == "teardown_audit":
+                problems = event.get("problems") or []
+                if problems:
+                    msg = "После остановки: " + "; ".join(str(p) for p in problems[:2])
+                    log.warning("%s", msg)
+                    if self.tray and get_doctor_notify():
+                        try:
+                            self.tray.notify("⚠ " + msg)
+                        except Exception:
+                            pass
             elif etype == "error":
                 msg = event.get("message", "Неизвестная ошибка")
                 log.warning("Событие ошибки от движка: %s", msg)
@@ -1709,6 +1715,41 @@ class MainWindow(GlowContainer):
         except Exception:
             pass
 
+    def _stop_lifecycle_workers(self) -> bool:
+        """Quiesce workers that could otherwise recreate runtime resources.
+
+        The Start/Restart worker is the critical one: it owns synchronous core
+        calls and cannot be safely terminated by Qt.  It receives an explicit
+        shutdown request, then gets a bounded chance to return and stop any
+        route it might have committed meanwhile.
+        """
+        self._ai_generation_pending = False
+        self._strategy_check_pending = False
+        clean = True
+        worker = getattr(self, "_worker", None)
+        if worker is not None and worker.isRunning():
+            try:
+                request = getattr(worker, "request_shutdown", None)
+                if callable(request):
+                    request()
+                if not worker.wait(20_000):
+                    clean = False
+                    log.warning("Lifecycle worker не завершился за 20 секунд при выходе")
+            except Exception as exc:
+                clean = False
+                log.warning("Не удалось дождаться lifecycle worker при выходе: %s", exc)
+        health = getattr(self, "_startup_health_worker", None)
+        if health is not None and health.isRunning():
+            try:
+                if not health.wait(3_000):
+                    clean = False
+                    log.warning("Startup health worker не завершился за 3 секунды при выходе")
+            except Exception as exc:
+                clean = False
+                log.debug("Не удалось дождаться startup health worker: %s", exc)
+        self._shutdown_worker_timeout = not clean
+        return clean
+
     def _stop_view_workers(self):
         try:
             nv = self._views.get("network")
@@ -1720,94 +1761,170 @@ class MainWindow(GlowContainer):
             pass
         try:
             rv = self._views.get("routing")
-            if rv is not None and hasattr(rv, "_transport_list"):
-                rv._transport_list.stop_workers()
+            vpn_exit_list = getattr(rv, "_vpn_exit_list", None)
+            if vpn_exit_list is not None and hasattr(vpn_exit_list, "stop_workers"):
+                vpn_exit_list.stop_workers()
         except Exception:
             pass
 
-    def _hard_stop_runtime(self, reset_dns: bool = False):
-        """Единая жёсткая остановка runtime для выхода/удаления/аварий.
+    def _hard_stop_runtime(self) -> bool:
+        """Idempotently stop every resource that can retain the install folder.
 
-        Останавливает фоновые UI-worker'ы, engine, WinWS/orphan WinWS и watchdog.
-        При reset_dns=True дополнительно возвращает системный DNS на DHCP.
+        The order matters: first prevent workers from creating a new session,
+        then stop PAC/VPN/DPI, then sweep detached e1-spike children and audit
+        the result.  This is the path for a real application exit, not merely a
+        window hide-to-tray action.
         """
-        try:
-            self.engine._manual_stop_requested = True
-        except Exception:
-            pass
+        if self._shutdown_started:
+            return not self._shutdown_worker_timeout
+        self._shutdown_started = True
         for tname in ("_show_timer", "_event_timer", "_health_timer", "_updates_start_timer", "_release_timer"):
             try:
-                t = getattr(self, tname, None)
-                if t is not None:
-                    t.stop()
+                timer = getattr(self, tname, None)
+                if timer is not None:
+                    timer.stop()
             except Exception:
                 pass
+
+        workers_stopped = self._stop_lifecycle_workers()
         self._stop_view_workers()
-
-        # Если пользователь выходит/удаляет программу во время генерации DPI-
-        # стратегий, рабочий QThread раньше мог продолжить цикл и снова поднять
-        # winws.exe уже после общей очистки. Запрашиваем отмену и ждём коротко:
-        # runner проверяет флаг между вариантами/пробами и сам добивает WinWS.
+        # The scheduler is daemonized, but asking it to stop first prevents a
+        # late cache/config write while Windows is releasing this installation.
         try:
-            w = getattr(self, "_ai_generation_worker", None)
-            if w is not None and w.isRunning():
-                if hasattr(w, "request_cancel"):
-                    w.request_cancel()
-                else:
-                    w.requestInterruption()
-                w.wait(15000)
-        except Exception:
-            pass
-        try:
-            w = getattr(self, "_strategy_check_worker", None)
-            if w is not None and w.isRunning():
-                if hasattr(w, "request_cancel"):
-                    w.request_cancel()
-                else:
-                    w.requestInterruption()
-                w.wait(15000)
-        except Exception:
-            pass
-
-        try:
-            dpi_strategy_ai_cleanup_runtime()
+            updater = getattr(self.engine, "bogus_updater", None)
+            stop_updates = getattr(updater, "stop", None)
+            if callable(stop_updates):
+                stop_updates()
         except Exception as exc:
-            log.debug("hard cleanup runtime ошибка: %s", exc)
+            log.debug("Не удалось остановить фоновый updater при выходе: %s", exc)
+
+        proxy_restored = True
+        try:
+            proxy_restored, proxy_message = stop_routing_runtime()
+            if not proxy_restored:
+                log.warning("Не удалось штатно вернуть PAC при выходе: %s", proxy_message)
+        except Exception as exc:
+            proxy_restored = False
+            log.warning("Остановка маршрутизации при выходе не удалась: %s", exc)
+
+        # Controlled strategy workers launch temporary e1-spike sessions
+        # directly, so cancel them before the final process sweep.
+        for attr in ("_ai_generation_worker", "_strategy_check_worker"):
+            try:
+                worker = getattr(self, attr, None)
+                if worker is not None and worker.isRunning():
+                    if hasattr(worker, "request_cancel"):
+                        worker.request_cancel()
+                    else:
+                        worker.requestInterruption()
+                    if not worker.wait(15_000):
+                        workers_stopped = False
+                        log.warning("%s не завершился за 15 секунд при выходе", attr)
+            except Exception as exc:
+                workers_stopped = False
+                log.debug("Не удалось остановить %s: %s", attr, exc)
 
         try:
-            self.engine.stop()
-        except Exception:
-            pass
+            cleanup = dpi_strategy_ai_cleanup_runtime()
+            if cleanup.get("errors"):
+                log.warning("Финальная DPI-очистка: %s", cleanup.get("errors"))
+        except Exception as exc:
+            log.warning("Финальная DPI-очистка не удалась: %s", exc)
+            workers_stopped = False
 
-        # ── Возврат DNS пользователю на выходе ───────────────────────────────
-        # P0-1: сбрасываем/восстанавливаем ТОЛЬКО если это мы меняли системный
-        # DNS в этой сессии. Раньше проверки не было вообще, и достаточно было
-        # открыть программу и закрыть её — все прописанные вручную DNS
-        # затирались на «Авто (DHCP)» безвозвратно.
-        restore_needed = bool(reset_dns and self._dns_was_set_by_app and is_admin())
-        if restore_needed:
-            if self._handoff_dns_restore_to_watchdog():
-                # Отдали watchdog'у: он вернёт снапшот в фоне, а окно не морозим.
-                self._dns_was_set_by_app = False
-            else:
-                # Watchdog недоступен — делаем синхронно, пусть и с задержкой
-                # закрытия. Лучше медленное закрытие, чем мёртвый 127.0.0.1.
-                try:
-                    ok, msg = network_restore_latest()
-                    log.info("DNS возвращён при выходе: %s (%s)", ok, msg)
-                    self._dns_was_set_by_app = False
-                except Exception as exc:
-                    log.warning("Не удалось вернуть DNS при выходе: %s", exc)
+        try:
+            report = verify_teardown()
+            if not report.get("ok", False):
+                workers_stopped = False
+                log.warning("После выхода остались ресурсы: %s", report.get("problems") or report)
+        except Exception as exc:
+            workers_stopped = False
+            log.warning("Не удалось проверить финальную очистку: %s", exc)
+
+        if proxy_restored:
+            self._shutdown_watchdog("CLEAN")
         else:
-            # Ничего не меняли — просто закрываем watchdog без действий.
-            self._shutdown_watchdog()
+            # A watchdog may remain briefly only to restore a failed PAC
+            # rollback; it receives EOF after this process exits and then ends.
+            self._handoff_proxy_restore_to_watchdog()
+        return bool(workers_stopped and proxy_restored)
+
+    def _ensure_proxy_watchdog(self) -> bool:
+        """Arm one pipe watchdog for PAC restoration after an unexpected exit."""
+        proc = getattr(self, "_watchdog_proc", None)
+        if proc is not None and proc.poll() is None:
+            return True
+        self._watchdog_proc = None
+        try:
+            import os
+            import subprocess
+            import sys
+            from watchdog_launcher import watchdog_commands
+
+            core_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "core")
+            watchdog_path = os.path.join(core_dir, "watchdog.py")
+            if not os.path.exists(watchdog_path):
+                raise RuntimeError("watchdog.py не найден")
+            launch_errors = []
+            for command in watchdog_commands(watchdog_path, sys.executable):
+                child = None
+                try:
+                    child = subprocess.Popen(
+                        command,
+                        stdin=subprocess.PIPE,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    if child.stdin is None:
+                        raise RuntimeError("stdin watchdog недоступен")
+                    child.stdin.write(b"HELLO\nARM_PROXY\n")
+                    child.stdin.flush()
+                    self._watchdog_proc = child
+                    log.info("Запущен watchdog PAC (PID %s, %s)", child.pid, command[0])
+                    return True
+                except Exception as exc:
+                    launch_errors.append(f"{command[0]}: {exc}")
+                    if child is not None:
+                        try:
+                            child.kill()
+                            child.wait(timeout=1)
+                        except Exception:
+                            pass
+            raise RuntimeError("; ".join(launch_errors) or "watchdog не запущен")
+        except Exception as exc:
+            log.warning("Не удалось запустить watchdog PAC: %s", exc)
+            return False
+
+    def _handoff_proxy_restore_to_watchdog(self) -> bool:
+        """Ask a watchdog to retry PAC restoration after this process exits.
+
+        Usually Start already armed it after the PAC commit. If that launch
+        failed or the watchdog itself exited, bootstrap a fresh proxy-only
+        watcher before conceding recovery; a failed Stop must not merely leave
+        the durable PAC snapshot unattended.
+        """
+        proc = getattr(self, "_watchdog_proc", None)
+        if proc is None or proc.poll() is not None or proc.stdin is None:
+            if not self._ensure_proxy_watchdog():
+                log.warning("Не удалось передать proxy restore: watchdog недоступен")
+                return False
+            proc = getattr(self, "_watchdog_proc", None)
+        if proc is None or proc.poll() is not None or proc.stdin is None:
+            return False
+        try:
+            proc.stdin.write(b"RESTORE_PROXY\n")
+            proc.stdin.flush()
+            proc.stdin.close()
+            self._watchdog_proc = None
+            return True
+        except Exception as exc:
+            log.warning("Не удалось передать proxy restore watchdog: %s", exc)
+            return False
 
     def _shutdown_watchdog(self, command: str = "CLEAN"):
         """Аккуратно завершает watchdog, сообщив ему, что делать НЕ нужно.
 
-        command="CLEAN" — штатный выход: родитель сам всё вернул.
-        Используется, когда восстанавливать нечего (мы не меняли DNS) —
-        иначе watchdog увидел бы EOF и зря полез бы в сеть.
+        command="CLEAN" — штатный выход: PAC уже возвращён родителем.
+        Иначе watchdog увидел бы EOF и выполнил бы лишнее восстановление proxy.
         """
         proc = getattr(self, "_watchdog_proc", None)
         self._watchdog_proc = None
@@ -1824,31 +1941,24 @@ class MainWindow(GlowContainer):
             log.debug("shutdown watchdog: %s", exc)
             try:
                 proc.kill()
+                proc.wait(timeout=1)
             except Exception:
                 pass
 
-    def _handoff_dns_restore_to_watchdog(self) -> bool:
-        """Передаёт возврат DNS watchdog'у и не морозит UI на PowerShell.
-
-        Возвращает True, если handoff удался — тогда синхронный откат не нужен.
-        Watchdog выполнит restore_user_dns() (снапшот → иначе DHCP) уже после
-        нашего выхода: тот же код, что и при краше, поэтому проверен одной веткой.
-        """
-        proc = getattr(self, "_watchdog_proc", None)
-        if proc is None or proc.poll() is not None:
-            return False
+    def _schedule_exit_fallback(self):
+        """Force only the already-clean parent process out of a stuck Qt loop."""
+        if self._exit_fallback_scheduled or self._shutdown_worker_timeout:
+            return
+        self._exit_fallback_scheduled = True
         try:
-            if proc.stdin is None:
-                return False
-            proc.stdin.write(b"RESTORE\n")
-            proc.stdin.flush()
-            proc.stdin.close()
-            self._watchdog_proc = None
-            log.info("Возврат DNS передан watchdog'у (PID %s)", proc.pid)
-            return True
+            import os
+            import threading
+
+            timer = threading.Timer(2.0, lambda: os._exit(0))
+            timer.daemon = True
+            timer.start()
         except Exception as exc:
-            log.debug("handoff DNS watchdog'у не удался: %s", exc)
-            return False
+            log.debug("Не удалось запланировать fallback выхода: %s", exc)
 
     def restart_application(self):
         """Полный перезапуск процесса (нужен, чтобы подтянуть новую тему)."""
@@ -1862,7 +1972,7 @@ class MainWindow(GlowContainer):
             return
         self._really_quit = True
         try:
-            self._hard_stop_runtime(reset_dns=True)
+            self._hard_stop_runtime()
         except Exception as exc:
             log.warning("Остановка runtime перед перезапуском: %s", exc)
         if self.tray:
@@ -1870,17 +1980,23 @@ class MainWindow(GlowContainer):
                 self.tray.hide()
             except Exception:
                 pass
+        self._schedule_exit_fallback()
         QApplication.quit()
-        # Если цикл событий не вышел (трей / вложенный exec) — добиваем процесс.
-        QTimer.singleShot(800, lambda: __import__("os")._exit(0))
 
     def _quit_app(self):
+        """Tray action for a real, resource-clean application exit."""
         self._really_quit = True
-        # При настоящем выходе всегда чистим runtime и DNS. Это важно для
-        # удаления папки программы и чтобы после выхода не оставался WinDivert/winws.
-        self._hard_stop_runtime(reset_dns=True)
+        cleaned = self._hard_stop_runtime()
         if self.tray:
             self.tray.hide()
+        # Close the native window too.  With quitOnLastWindowClosed disabled,
+        # QApplication.quit() is still required below.
+        try:
+            self.close()
+        except Exception:
+            pass
+        if cleaned:
+            self._schedule_exit_fallback()
         QApplication.quit()
 
     def hideEvent(self, event):                         # noqa: N802 - Qt API
@@ -1918,12 +2034,17 @@ class MainWindow(GlowContainer):
         if self.tray and not self._really_quit:
             event.ignore()
             self.hide()
-            self.tray.notify("UmbraNet свёрнут в трей. DNS продолжает работать.")
+            self.tray.notify(
+                "UmbraNet свёрнут в трей — программа и маршрутизация продолжают работать. "
+                "Для полного завершения выберите «Полностью выйти» в меню трея."
+            )
         else:
-            # Если это реальный выход (не сворачивание в трей), чистим runtime.
-            # reset_dns=True нужен и для сценария без трея/принудительного закрытия.
-            self._hard_stop_runtime(reset_dns=True)
+            # A real close must end the event loop explicitly: the application
+            # intentionally keeps quitOnLastWindowClosed disabled for tray use.
+            self._really_quit = True
+            self._hard_stop_runtime()
             event.accept()
+            QApplication.quit()
 
     # Вкладки с живым (незамороженным) resize — «как в хроме»: контент
     # всегда чёткий и сразу едет за краем окна; на слабой машине возможно
@@ -1934,15 +2055,17 @@ class MainWindow(GlowContainer):
     # Телеграмизация 2026-09: все вкладки кроме карты теперь paintEvent-чистые
     # (RoundedPanel/Canvas) и не фризят при живом resize — freeze-снимок
     # больше не нужен. Карта исключена по просьбе юзера (сырой виджет).
-    LIVE_RESIZE_PAGES = {"routing", "network", "strategy_lab", "profiles", "log", "settings", "about", "kus"}
+    LIVE_RESIZE_PAGES = {
+        "routing", "servers", "network", "strategy_lab", "log", "settings", "about", "extra",
+    }
 
     # ── Когда вкладке давать прокрутку ──────────────────────────────────────
     # Пороги привязаны к минимальному окну (560x420) и его внутреннему месту:
     # если вкладке нужно больше этого запаса — значит в узком окне её содержимое
     # не поместится, и вместо обрезки даём прокрутку. Значения сверены по факту
     # (minimumSizeHint каждой вкладки):
-    #   ширина: «Маршрутизация» 677, «Профили» 659, «Логи» 916, «AI-стратегии» 965;
-    #   высота:  «Маршрутизация» 742, «Профили» 641, «AI-стратегии» 590.
+    #   ширина: «Маршрутизация» 677, «Логи» 916, «AI-стратегии» 965;
+    #   высота:  «Маршрутизация» 742, «AI-стратегии» 590.
     # Небольшие вкладки (Настройки 617x150, О программе 399x152) не оборачиваются:
     # у них своя прокрутка, лишняя обёртка только усложняла бы вид.
     SCROLL_MIN_PAGE_W = 620
@@ -1974,7 +2097,7 @@ class MainWindow(GlowContainer):
 
     # Вкладки, которые в прокрутку страницы не берём НИКОГДА.
     # «Маршрутизация» — по прямому указанию пользователя: прокрутка всей вкладки
-    # (когда вместе с содержимым уезжает и карточка «Маршрут DNS») неудобна и
+    # (когда вместе с содержимым уезжает и карточка выбора VPN-выхода) неудобна и
     # мешает. У неё своя прокрутка внутри: длинный список слева прокручивается
     # отдельно, а правая карточка остаётся на месте.
     NEVER_WRAP_IN_PAGE_SCROLL = {"routing"}
@@ -2012,9 +2135,19 @@ class MainWindow(GlowContainer):
         if needed_w <= self.SCROLL_MIN_PAGE_W and needed_h <= self.SCROLL_MIN_PAGE_H:
             return page
 
-        area = QScrollArea()
+        # This wrapper is itself a native-capable QWidget on Windows. It must
+        # never briefly exist without a parent while a lazy complex page is
+        # attached, otherwise the first construction can flash as a mini-window.
+        area = QScrollArea(self.stack)
         area.setWidgetResizable(True)          # вкладка растягивается по ширине окна
         area.setFrameShape(QScrollArea.NoFrame)
+        if key == "servers":
+            # The outer page scrollbar is the one that appears when the whole
+            # Servers view is too tall.  Reserve its gutter even after its
+            # thumb becomes unnecessary; otherwise the viewport widens by one
+            # scrollbar and both server columns visibly jump during resize.
+            # The shared QSS keeps a disabled no-range handle transparent.
+            area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         area.setStyleSheet(
             "QScrollArea{background:transparent;border:none;}"
             "QScrollArea > QWidget > QWidget{background:transparent;}"
@@ -2029,17 +2162,24 @@ class MainWindow(GlowContainer):
         return area
 
     def _show(self, key: str):
-        if key in self._pages:
-            self.set_live_resize(key in self.LIVE_RESIZE_PAGES)
-            self.stack.setCurrentIndex(self._pages[key])
-            self._apply_window_layout_mode()
-            self._apply_page_layout_mode()
-            v = self._views.get(key)
-            if v is not None and hasattr(v, "refresh"):
-                try:
-                    v.refresh()
-                except Exception:
-                    pass
+        view = self._ensure_page(key)
+        if view is None or key not in self._pages:
+            return
+        previous_key = self._active_page_key
+        if previous_key and previous_key != key:
+            self._set_page_active(previous_key, False)
+        self.set_live_resize(key in self.LIVE_RESIZE_PAGES)
+        self.stack.setCurrentIndex(self._pages[key])
+        if previous_key != key:
+            self._active_page_key = key
+            self._set_page_active(key, True)
+        self._apply_window_layout_mode()
+        self._apply_page_layout_mode()
+        # Switching between unchanged tabs is intentionally render-only.  A
+        # refresh is reserved for a first visit (the constructor does that) or
+        # for a page invalidated by an actual engine/configuration event.
+        if key in self._stale_view_keys:
+            self._refresh_view(key)
 
 
 _RELAUNCH_FLAG = "umbranet.relaunch"

@@ -124,8 +124,8 @@ class Toggle(QWidget):
         if self._partial:
             track = QColor(theme.ORANGE)
         else:
-            # Сделали неактивное (off) состояние более ярким и видным (#4b4d75 вместо тусклого #3a3a55)
-            off = QColor("#4b4d75")
+            # Цвет выключенного состояния задаётся темой, включая светлую палитру.
+            off = QColor(theme.MUTED)
             on = QColor(theme.GREEN)
             t = self._offset
             track = QColor(

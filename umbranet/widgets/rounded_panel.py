@@ -19,7 +19,7 @@ DPI: все кэши рендерятся в физических пикселя
 на экранах с масштабом 125-150% текст и рамки остаются чёткими
 (фикс «текст нечёткий, цвет не тот»).
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations

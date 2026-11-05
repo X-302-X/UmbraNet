@@ -35,13 +35,13 @@ SOURCE_LABELS = {
     "cache": "кэш", "stale-cache": "stale", "routed": "обход",
     "system": "система", "bogus-NX": "bogus", "blocked": "блок", "servfail": "ошибка",
     "bg-refresh": "фон", "fixed": "починка", "error": "ошибка",
-    "check": "проверка", "leak": "утечка",
+    "check": "проверка", "leak": "утечка", "dpi": "DPI", "dpi-error": "DPI",
 }
 SOURCE_COLORS = {
     "routed": theme.ACCENT, "system": theme.SUBTEXT, "cache": theme.ACCENT3,
     "stale-cache": theme.ACCENT3, "bogus-NX": theme.RED, "blocked": theme.RED, "servfail": theme.RED,
     "fixed": theme.GREEN, "error": theme.ORANGE,
-    "check": theme.ACCENT2, "leak": theme.RED,
+    "check": theme.ACCENT2, "leak": theme.RED, "dpi": theme.ACCENT, "dpi-error": theme.ORANGE,
 }
 
 
@@ -195,8 +195,10 @@ class LogCanvas(RowCanvas):
 
         # бейдж qtype
         x = self._paint_badge(p, x, y, h, qtype, theme.ACCENT2, 54)
-        # бейдж маршрут
-        if routed:
+        # бейдж маршрут: DPI — отдельный фактический путь, не DNS-«напрямую».
+        if source in ("dpi", "dpi-error"):
+            x = self._paint_badge(p, x, y, h, "DPI", theme.ACCENT, 64, filled=routed)
+        elif routed:
             x = self._paint_badge(p, x, y, h, "обход", theme.ACCENT, 64, filled=True)
         else:
             x = self._paint_badge(p, x, y, h, "напрямую", theme.MUTED, 64, filled=False)

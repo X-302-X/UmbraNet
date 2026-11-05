@@ -72,7 +72,7 @@ class Tray:
         self._act_restart.triggered.connect(lambda: self._cb.get("restart", lambda: None)())
         self._act_show = QAction("🗗  Показать окно", self._menu)
         self._act_show.triggered.connect(lambda: self._cb.get("show", lambda: None)())
-        self._act_quit = QAction("✕  Выход", self._menu)
+        self._act_quit = QAction("✕  Полностью выйти", self._menu)
         self._act_quit.triggered.connect(lambda: self._cb.get("quit", lambda: None)())
 
         self._menu.addAction(self._act_start)

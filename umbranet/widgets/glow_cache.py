@@ -24,7 +24,7 @@ UmbraNet — кэшированное свечение для всегда-ви�
 DPI: кэш 1× — свечение это блюр без текста и резких краёв, апскейл
 на экранах 125–150% невидим (тот же вывод, что у GlowWrap правой панели).
 
-Автор: 302XXX / UmbraNet_Official, GPLv3.
+Автор: X-302-X / UmbraNet_Official, GPLv3.
 """
 
 from __future__ import annotations

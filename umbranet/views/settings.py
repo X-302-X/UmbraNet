@@ -1,14 +1,13 @@
 """
 UmbraNet - раздел «Настройки» (PySide6).
 
-Перенос окна настроек из старой версии (3 секции), с автосохранением:
-  • DNS-сервер: порт, fallback IPv4/IPv6;
-  • Поведение: режим разработчика, IPv6-сервер, автозапуск, стратегия upstream;
-  • Routed-кэш: пресет режима + кэш/TTL (слайдеры) + optimistic cache.
+Раздел настроек с автосохранением:
+  • темы оформления и поведение приложения;
+  • надёжность VPN: проверка, автозамена и горячий резерв;
+  • серверы и их технические данные находятся в отдельной вкладке «Сервера».
 
-Всё сохраняется СРАЗУ при изменении (как в DNS-профилях). Пресет режима
-показывает только реальные пресеты; «Пользовательский» появляется в подписи
-сам, когда значения не совпадают ни с одним пресетом.
+Устаревшие параметры DNS сохраняются в конфигурации для совместимости и
+диагностики, но не изменяются из обычного интерфейса настроек.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -38,29 +36,28 @@ from umbranet.engine_adapter import (
     backup_load,
     get_developer_mode,
     get_engine,
-    get_routed_preset_map,
-    parse_domain_lines,
+    post_event,
     save_config,
     set_developer_mode,
-    set_filter_lists,
-    upstream_modes,
+    sync_routing_runtime_config,
 )
+from core.vpn.profiles import normalize_probe_url
 from umbranet.widgets.dialogs import ThemeRestartDialog
 from umbranet.widgets.flow_layout import FlowLayout
+from umbranet.widgets.hover_hint import HoverHintBadge, SHOW_DELAY_MS
 from umbranet.widgets.rounded_panel import RoundedPanel
-from umbranet.widgets.slider_field import SliderField
 from umbranet.widgets.toggle import Toggle
 
-# Стратегии upstream: ключ ядра -> русская подпись
-UPSTREAM_LABELS = {
-    "parallel": "Параллельно (быстрее)",
-    "fastest": "Самый быстрый",
-    "sequential": "По очереди",
+TRANSPORT_FAILOVER_LABELS = {
+    "economy": "Экономный — резерв проверяется после сбоя",
+    "recommended": "Рекомендуемый — один горячий резерв",
+    "continuous": "Бесперебойный — все выходы постоянно готовы",
 }
-
-# Поля пресета кэша (по ним определяется «Пользовательский»)
-PRESET_FIELDS = ("routed_cache_enabled", "routed_cache_ttl", "routed_reply_ttl",
-                 "optimistic_cache_enabled", "stale_cache_ttl")
+TRANSPORT_REACTION_LABELS = {
+    "cautious": "Осторожная — только подтверждённый сбой",
+    "balanced": "Сбалансированная — рекомендуется",
+    "fast": "Быстрая — сразу при первом сбое",
+}
 
 
 def _section(title: str) -> tuple[QWidget, QVBoxLayout]:
@@ -71,7 +68,7 @@ def _section(title: str) -> tuple[QWidget, QVBoxLayout]:
     lay.setContentsMargins(16, 12, 16, 14)
     lay.setSpacing(10)
     t = QLabel(title)
-    t.setStyleSheet(f"color:{theme.WHITE};font-size:14px;font-weight:700;background:transparent;border:none;")
+    t.setStyleSheet(f"color:{theme.TEXT};font-size:14px;font-weight:700;background:transparent;border:none;")
     lay.addWidget(t)
     return f, lay
 
@@ -88,6 +85,11 @@ class _NoWheelComboBox(QComboBox):
     def wheelEvent(self, event):
         event.ignore()
 
+
+
+# Compatibility name retained for focused settings geometry tests. The shared
+# badge owns the actual delay and avoids native Qt tooltip auto-dismissal.
+HINT_HOVER_DELAY_MS = SHOW_DELAY_MS
 
 
 class _FormLabel(QLabel):
@@ -194,7 +196,7 @@ class SettingsView(QWidget):
         self.engine = get_engine()
         self._suppress = False  # подавление автосейва при программном обновлении
         #: Подписи строк-переключателей по именам (по ним проверяется, что текст
-        #: растёт с сужением окна, а не обрезается — см. tests/test_three_tabs_narrow.py).
+        #: растёт с сужением окна, а не обрезается — см. tests/test_routing_settings_narrow.py).
         self._toggle_labels: dict[str, QLabel] = {}
         cfg = self.engine.config
 
@@ -204,7 +206,7 @@ class SettingsView(QWidget):
 
         # заголовок + статус + кнопки (в узком окне кнопки уходят на вторую строку)
         title = QLabel("Настройки")
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:22px;font-weight:700;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:22px;font-weight:700;")
         self._status = QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(f"color:{theme.GREEN};font-size:12px;")
@@ -250,29 +252,16 @@ class SettingsView(QWidget):
         ltheme.addLayout(theme_row)
         body.addWidget(stheme)
 
-        # ── Секция 1: DNS-сервер ──
-        s1, l1 = _section("🖧  DNS-сервер")
-        self._port = self._line_field(l1, "Порт", str(cfg.get("listen_port", 53)), 90)
-        self._fb4 = self._line_field(l1, "Fallback IPv4", cfg.get("fallback_dns", "8.8.8.8"))
-        self._fb6 = self._line_field(l1, "Fallback IPv6", cfg.get("fallback_dns6", ""), 240)
-        body.addWidget(s1)
-
-        # ── Секция 2: Поведение ──
+        # ── Секция 1: Поведение ──
         s2, l2 = _section("⚡  Поведение")
         self._dev_mode = self._toggle_row(
             l2,
-            "Режим разработчика — снять блокировку DNS/DPI у сервисов в главном меню",
+            "Режим разработчика — снять блокировку VPN/DPI у сервисов в главном меню",
             get_developer_mode(),
             key="developer_mode",
             autosave=False,
         )
         self._dev_mode.toggled.connect(self._on_developer_mode)
-        self._ipv6 = self._toggle_row(l2, "Включить IPv6 DNS-сервер", cfg.get("enable_ipv6", True),
-                                      key="ipv6")
-        self._ipv6_priority = self._toggle_row(l2, "Приоритет IPv6 для заблокированных сайтов (трюк обхода)",
-                                               cfg.get("ipv6_priority_enabled", False),
-                                               key="ipv6_priority")
-
         self._autostart = None
         if autostart_supported():
             self._autostart = self._toggle_row(l2, "Запускать UmbraNet при включении Windows",
@@ -282,88 +271,82 @@ class SettingsView(QWidget):
             note.setStyleSheet(f"color:{theme.MUTED};font-size:12px;background:transparent;border:none;")
             l2.addWidget(note)
 
-        # стратегия upstream
-        up_row = QHBoxLayout()
-        up_lbl = self._form_label("Стратегия upstream")
-        self._upstream = _NoWheelComboBox()
-        for mode in upstream_modes():
-            self._upstream.addItem(UPSTREAM_LABELS.get(mode, mode), mode)
-        i = self._upstream.findData(cfg.get("upstream_mode", "parallel"))
-        if i >= 0:
-            self._upstream.setCurrentIndex(i)
-        self._upstream.setFixedHeight(34)
-        self._upstream.setStyleSheet(self._combo_qss())
-        self._upstream.currentIndexChanged.connect(lambda _=0: self._autosave())
-        up_row.addWidget(up_lbl)
-        up_row.addWidget(self._upstream)
-        up_row.addStretch()
-        l2.addLayout(up_row)
         body.addWidget(s2)
 
-        # ── Секция 3: Routed-кэш ──
-        s3, l3 = _section("🗃  Routed-домены: кэш и TTL")
-        preset_row = QHBoxLayout()
-        p_lbl = self._form_label("Пресет режима")
-        self._preset = _NoWheelComboBox()
-        self._presets_map = get_routed_preset_map()
-        # ТОЛЬКО реальные пресеты (без «Пользовательский» — он авто-подпись)
-        self._preset.addItems(list(self._presets_map.keys()))
-        self._preset.setFixedHeight(34)
-        self._preset.setStyleSheet(self._combo_qss())
-        self._preset.activated.connect(self._on_preset_chosen)  # только по клику юзера
-        preset_row.addWidget(p_lbl)
-        preset_row.addWidget(self._preset)
-        preset_row.addStretch()
-        l3.addLayout(preset_row)
-
-        self._cache_on = self._toggle_row(l3, "Внутренний кэш для routed-доменов",
-                                          cfg.get("routed_cache_enabled", True), key="cache_on")
-        # слайдеры TTL
-        self._cache_ttl = SliderField("TTL кэша", int(cfg.get("routed_cache_ttl", 5)), 0, 120)
-        self._cache_ttl.valueChanged.connect(lambda _=0: self._autosave())
-        l3.addWidget(self._cache_ttl)
-        self._reply_ttl = SliderField("TTL ответа", int(cfg.get("routed_reply_ttl", 1)), 0, 60)
-        self._reply_ttl.valueChanged.connect(lambda _=0: self._autosave())
-        l3.addWidget(self._reply_ttl)
-        self._optim = self._toggle_row(l3, "Optimistic cache (мгновенные ответы из «просроченного» кэша)",
-                                       cfg.get("optimistic_cache_enabled", True), key="optim")
-        self._stale_ttl = SliderField("Stale TTL", int(cfg.get("stale_cache_ttl", 3600)), 0, 86400)
-        self._stale_ttl.valueChanged.connect(lambda _=0: self._autosave())
-        l3.addWidget(self._stale_ttl)
-        body.addWidget(s3)
-
-        # ── Секция 4: DNS-фильтрация ──
-        sf, lf = _section("🚦  DNS-фильтрация: blocklist / allowlist")
-        desc = self._filter_desc = QLabel(
-            "Можно вставлять обычные домены, hosts-формат (0.0.0.0 domain) "
-            "и простые AdBlock-правила вида ||domain^. Allowlist имеет приоритет над blocklist."
+        # ── Секция 3: надёжность VPN и горячий резерв ──
+        transport_section, transport_lay = _section("🛟  Надёжность VPN и автозамена")
+        transport_desc = QLabel(
+            "Выбранные VPN-сервисы переключаются только на проверенный резервный сервер. "
+            "Если готовых серверов нет, прямое подключение не используется. "
+            "Изменение этой политики применяется к активной сессии сразу."
         )
-        desc.setWordWrap(True)
-        desc.setMinimumHeight(_DESC_MIN_H)
-        desc.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        desc.setStyleSheet(f"color:{theme.SUBTEXT};font-size:12px;background:transparent;border:none;")
-        lf.addWidget(desc)
-
-        lists_row = QHBoxLayout()
-        self._blocked_edit = self._domain_list_editor(
-            "Блокировать (NXDOMAIN)", cfg.get("blocked_domains", [])
+        transport_desc.setWordWrap(True)
+        transport_desc.setStyleSheet(
+            f"color:{theme.SUBTEXT};font-size:12px;background:transparent;border:none;"
         )
-        self._allow_edit = self._domain_list_editor(
-            "Разрешать всегда (allowlist)", cfg.get("allowlist_domains", [])
+        transport_lay.addWidget(transport_desc)
+        self._transport_probe_url = self._line_field(
+            transport_lay,
+            "HTTPS-проверка сервера",
+            cfg.get("transport_probe_url", ""),
+            380,
+            hint=(
+                "Укажите свой стабильный HTTPS endpoint, который отвечает 2xx/3xx. "
+                "UmbraNet проходит к нему через каждый HTTP CONNECT/SOCKS5 выход, "
+                "проверяет TLS и только затем считает выход готовым.\n\n"
+                "URL не принимает логин, пароль, query-параметры или fragment. Пока "
+                "адрес не задан, выбранные VPN-сервисы блокируются без DIRECT."
+            ),
         )
-        lists_row.addWidget(self._blocked_edit["wrap"], 1)
-        lists_row.addWidget(self._allow_edit["wrap"], 1)
-        lf.addLayout(lists_row)
+        self._transport_probe_url.setPlaceholderText("https://status.example.net/umbranet-health")
+        self._transport_failover = self._toggle_row(
+            transport_lay,
+            "Автоматически заменять недоступный VPN-сервер",
+            cfg.get("transport_failover_enabled", True),
+            key="transport_failover",
+        )
+        transport_mode_row = QHBoxLayout()
+        transport_mode_row.addWidget(self._form_label("Режим автозамены"))
+        self._transport_mode = _NoWheelComboBox()
+        for key, label in TRANSPORT_FAILOVER_LABELS.items():
+            self._transport_mode.addItem(label, key)
+        index = self._transport_mode.findData(cfg.get("transport_failover_mode", "recommended"))
+        self._transport_mode.setCurrentIndex(index if index >= 0 else 1)
+        self._transport_mode.setFixedHeight(34)
+        self._transport_mode.setStyleSheet(self._combo_qss())
+        self._transport_mode.currentIndexChanged.connect(lambda _=0: self._autosave())
+        transport_mode_row.addWidget(self._transport_mode)
+        transport_mode_row.addStretch()
+        transport_lay.addLayout(transport_mode_row)
+        transport_reaction_row = QHBoxLayout()
+        transport_reaction_row.addWidget(self._form_label("Реакция на сбой"))
+        self._transport_reaction = _NoWheelComboBox()
+        for key, label in TRANSPORT_REACTION_LABELS.items():
+            self._transport_reaction.addItem(label, key)
+        index = self._transport_reaction.findData(cfg.get("transport_failure_reaction", "balanced"))
+        self._transport_reaction.setCurrentIndex(index if index >= 0 else 1)
+        self._transport_reaction.setFixedHeight(34)
+        self._transport_reaction.setStyleSheet(self._combo_qss())
+        self._transport_reaction.currentIndexChanged.connect(lambda _=0: self._autosave())
+        transport_reaction_row.addWidget(self._transport_reaction)
+        transport_reaction_row.addStretch()
+        transport_lay.addLayout(transport_reaction_row)
+        no_direct_row = QHBoxLayout()
+        no_direct_label = self._form_label("Если резерва нет")
+        no_direct_value = QLabel("Блокировать выбранные VPN-сервисы")
+        no_direct_value.setStyleSheet(
+            f"color:{theme.YELLOW};font-size:13px;font-weight:600;background:transparent;border:none;"
+        )
+        no_direct_row.addWidget(no_direct_label)
+        no_direct_row.addWidget(self._hint_badge(
+            "UmbraNet не добавляет DIRECT в PAC-цепочку выбранного VPN-сервиса. "
+            "Так при одновременном сбое всех серверов сервис не раскроет прямой маршрут."
+        ))
+        no_direct_row.addWidget(no_direct_value)
+        no_direct_row.addStretch()
+        transport_lay.addLayout(no_direct_row)
+        body.addWidget(transport_section)
 
-        filter_row = QHBoxLayout()
-        self._filter_status = QLabel(self._filter_status_text())
-        self._filter_status.setStyleSheet(f"color:{theme.SUBTEXT};font-size:12px;background:transparent;border:none;")
-        filter_row.addWidget(self._filter_status, 1)
-        self._filter_save_btn = self._small_btn("✓ Сохранить списки", theme.GREEN)
-        self._filter_save_btn.clicked.connect(self._save_filter_lists)
-        filter_row.addWidget(self._filter_save_btn)
-        lf.addLayout(filter_row)
-        body.addWidget(sf)
 
         body.addStretch()
 
@@ -382,8 +365,6 @@ class SettingsView(QWidget):
         scroll.setWidget(bodyw)
         outer.addWidget(scroll, 1)
 
-        self._update_preset_label()
-
     # ── фабрики строк (с автосейвом) ──
     @staticmethod
     def _form_label(text: str) -> QLabel:
@@ -400,7 +381,12 @@ class SettingsView(QWidget):
         lbl.setStyleSheet(f"color:{theme.SUBTEXT};font-size:13px;background:transparent;border:none;")
         return lbl
 
-    def _line_field(self, parent_lay, label, value, width=160) -> QLineEdit:
+    @staticmethod
+    def _hint_badge(text: str) -> HoverHintBadge:
+        """Общий круглый «?» с устойчивой всплывающей подсказкой."""
+        return HoverHintBadge(text)
+
+    def _line_field(self, parent_lay, label, value, width=160, hint: str = "") -> QLineEdit:
         row = QHBoxLayout()
         lbl = self._form_label(label)
         inp = QLineEdit(value)
@@ -417,51 +403,20 @@ class SettingsView(QWidget):
             f"QLineEdit:focus{{border-color:{theme.ACCENT};}}")
         inp.editingFinished.connect(self._autosave)  # сохранить при потере фокуса/Enter
         row.addWidget(lbl)
+        if hint:
+            row.addWidget(self._hint_badge(hint))
         row.addWidget(inp)
         row.addStretch()
         parent_lay.addLayout(row)
         return inp
 
-    def _domain_list_editor(self, title: str, values: list) -> dict:
-        wrap = QFrame()
-        wrap.setStyleSheet("QFrame{background:transparent;border:none;}")
-        lay = QVBoxLayout(wrap)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
-        lbl = QLabel(title)
-        # Перенос по словам: две колонки списков стоят рядом, и в узком окне
-        # подпись без переноса задавала минимальную ширину всей карточки.
-        lbl.setWordWrap(True)
-        lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        lbl.setStyleSheet(f"color:{theme.TEXT};font-size:13px;font-weight:700;background:transparent;border:none;")
-        lay.addWidget(lbl)
-        edit = QPlainTextEdit()
-        edit.setPlainText("\n".join(values or []))
-        edit.setMinimumHeight(130)
-        # NoWrap — ширина не вызывает перекомпоновку документа на каждый пиксель ресайза
-        try:
-            edit.setLineWrapMode(QPlainTextEdit.NoWrap)
-        except Exception:
-            pass
-        edit.setPlaceholderText("example.com\n0.0.0.0 ads.example.com\n||tracker.example.net^")
-        # Упрощённый QSS без border-radius маски (прямоугольник красится быстрее)
-        edit.setStyleSheet(
-            f"QPlainTextEdit{{background:{theme.INPUT_BG};color:{theme.TEXT};"
-            f"border:1px solid {theme.BORDER};border-radius:6px;padding:8px;"
-            "font-family:Consolas;font-size:12px;}" + theme.scrollbar_qss()
-        )
-        lay.addWidget(edit)
-        return {"wrap": wrap, "edit": edit}
-
     def _toggle_row(self, parent_lay, label, checked, key: str = "",
                     autosave: bool = True) -> Toggle:
         """Строка «подпись + переключатель».
 
-        Высота подписи — МИНИМУМ, а не предел. Раньше здесь стояла жёсткая высота
-        22 px («чтобы не считать heightForWidth на каждый пиксель ресайза»), и в
-        узком окне длинные подписи («Режим разработчика — снять блокировку …»,
-        «Optimistic cache …») переносились на вторую строку и обрезались: строка
-        текста просто исчезала. Теперь подпись растёт, карточка растёт следом.
+        Высота подписи — МИНИМУМ, а не предел: длинные названия поведения и
+        политики VPN могут перенестись на вторую строку. Тогда подпись и карточка
+        растут вместе, а текст не обрезается.
         """
         row = QHBoxLayout()
         lbl = QLabel(label)
@@ -539,48 +494,6 @@ class SettingsView(QWidget):
             theme.ACCENT3,
         )
 
-    def _on_preset_chosen(self, index: int):
-        name = self._preset.itemText(index)
-        preset = self._presets_map.get(name)
-        if not preset:
-            return
-        self._suppress = True
-        self._cache_on.setChecked(bool(preset.get("routed_cache_enabled", True)))
-        self._cache_ttl.setValue(int(preset.get("routed_cache_ttl", 5)))
-        self._reply_ttl.setValue(int(preset.get("routed_reply_ttl", 1)))
-        self._optim.setChecked(bool(preset.get("optimistic_cache_enabled", True)))
-        self._stale_ttl.setValue(int(preset.get("stale_cache_ttl", 3600)))
-        self._suppress = False
-        self._autosave()
-
-    def _current_preset_name(self) -> str | None:
-        """Имя пресета, совпадающего с текущими значениями, иначе None."""
-        cur = {
-            "routed_cache_enabled": self._cache_on.isChecked(),
-            "routed_cache_ttl": self._cache_ttl.value(),
-            "routed_reply_ttl": self._reply_ttl.value(),
-            "optimistic_cache_enabled": self._optim.isChecked(),
-            "stale_cache_ttl": self._stale_ttl.value(),
-        }
-        for name, preset in self._presets_map.items():
-            if all(cur[f] == preset.get(f) for f in PRESET_FIELDS):
-                return name
-        return None
-
-    def _update_preset_label(self):
-        name = self._current_preset_name()
-        self._preset.blockSignals(True)
-        if name:
-            i = self._preset.findText(name)
-            if i >= 0:
-                self._preset.setCurrentIndex(i)
-        else:
-            # значения «пользовательские» — показываем это как временный заголовок
-            self._preset.setCurrentIndex(-1)
-            self._preset.setEditable(False)
-            self._preset.setPlaceholderText("Пользовательский")
-        self._preset.blockSignals(False)
-
     def _on_developer_mode(self, _on: bool = False):
         if self._suppress:
             return
@@ -592,34 +505,35 @@ class SettingsView(QWidget):
         if self._suppress:
             return
         cfg = self.engine.config
-        try:
-            cfg["listen_port"] = int(self._port.text())
-        except ValueError:
-            self._set_status("Порт должен быть числом", theme.RED)
+        probe_url = normalize_probe_url(self._transport_probe_url.text())
+        if probe_url is None:
+            self._set_status(
+                "HTTPS-проверка: нужен URL https://host/path без параметров и учётных данных",
+                theme.RED,
+            )
             return
-        cfg["fallback_dns"] = self._fb4.text().strip()
-        cfg["fallback_dns6"] = self._fb6.text().strip()
-        cfg["enable_ipv6"] = self._ipv6.isChecked()
-        cfg["ipv6_priority_enabled"] = self._ipv6_priority.isChecked()
-        cfg["upstream_mode"] = self._upstream.currentData()
-        cfg["routed_cache_enabled"] = self._cache_on.isChecked()
-        cfg["optimistic_cache_enabled"] = self._optim.isChecked()
-        cfg["routed_cache_ttl"] = self._cache_ttl.value()
-        cfg["routed_reply_ttl"] = self._reply_ttl.value()
-        cfg["stale_cache_ttl"] = self._stale_ttl.value()
+        self._transport_probe_url.setText(probe_url)
+        cfg["transport_probe_url"] = probe_url
+        cfg["transport_failover_enabled"] = self._transport_failover.isChecked()
+        cfg["transport_failover_mode"] = self._transport_mode.currentData()
+        cfg["transport_failure_reaction"] = self._transport_reaction.currentData()
+        # Это не пользовательский переключатель: решение продукта — не
+        # выпускать выбранные VPN-сервисы напрямую при потере всех выходов.
+        cfg["transport_no_ready_policy"] = "block"
 
         save_config(cfg)
-        self.engine.reload_config()
-
+        # Settings mutate the shared config map in place. Reconfigure only the
+        # active routing owner; DNS compatibility code is not restarted here.
+        sync_routing_runtime_config(force=True)
+        post_event({"type": "config_changed", "section": "transport_settings"})
         if self._autostart is not None:
             try:
                 autostart_set(self._autostart.isChecked())
             except Exception:
                 pass
 
-        self._update_preset_label()
         self._set_status("✓ Сохранено", theme.GREEN)
-        QTimer.singleShot(1500, lambda: self._set_status("", theme.GREEN))
+        QTimer.singleShot(2200, lambda: self._set_status("", theme.GREEN))
 
     def _backup(self):
         path = backup_create(self.engine.config)
@@ -638,50 +552,38 @@ class SettingsView(QWidget):
         self.engine.config.clear()
         self.engine.config.update(cfg)
         save_config(self.engine.config)
-        self.engine.reload_config()
+        sync_routing_runtime_config(force=True)
+        post_event({"type": "config_changed", "section": "backup_restore"})
         self._load_form_from_cfg(self.engine.config)
         self._set_status("✓ Настройки восстановлены", theme.GREEN)
 
     def _load_form_from_cfg(self, cfg):
         self._suppress = True
-        self._port.setText(str(cfg.get("listen_port", 53)))
-        self._fb4.setText(cfg.get("fallback_dns", "8.8.8.8"))
-        self._fb6.setText(cfg.get("fallback_dns6", ""))
-        self._ipv6.setChecked(bool(cfg.get("enable_ipv6", True)))
-        i = self._upstream.findData(cfg.get("upstream_mode", "parallel"))
+        self._transport_probe_url.setText(str(cfg.get("transport_probe_url", "") or ""))
+        self._transport_failover.setChecked(bool(cfg.get("transport_failover_enabled", True)))
+        i = self._transport_mode.findData(cfg.get("transport_failover_mode", "recommended"))
         if i >= 0:
-            self._upstream.setCurrentIndex(i)
-        self._cache_on.setChecked(bool(cfg.get("routed_cache_enabled", True)))
-        self._cache_ttl.setValue(int(cfg.get("routed_cache_ttl", 5)))
-        self._reply_ttl.setValue(int(cfg.get("routed_reply_ttl", 1)))
-        self._optim.setChecked(bool(cfg.get("optimistic_cache_enabled", True)))
-        self._stale_ttl.setValue(int(cfg.get("stale_cache_ttl", 3600)))
-        if hasattr(self, "_blocked_edit"):
-            self._blocked_edit["edit"].setPlainText("\n".join(cfg.get("blocked_domains", []) or []))
-            self._allow_edit["edit"].setPlainText("\n".join(cfg.get("allowlist_domains", []) or []))
-            self._filter_status.setText(self._filter_status_text())
+            self._transport_mode.setCurrentIndex(i)
+        i = self._transport_reaction.findData(cfg.get("transport_failure_reaction", "balanced"))
+        if i >= 0:
+            self._transport_reaction.setCurrentIndex(i)
         if self._autostart is not None:
             try:
                 self._autostart.setChecked(autostart_enabled())
             except Exception:
                 pass
         self._suppress = False
-        self._update_preset_label()
 
     def _reset_defaults(self):
         self._suppress = True
-        self._port.setText("53")
-        self._fb4.setText("8.8.8.8")
-        self._fb6.setText("2001:4860:4860::8888")
-        self._ipv6.setChecked(True)
-        i = self._upstream.findData("parallel")
+        self._transport_probe_url.setText("")
+        self._transport_failover.setChecked(True)
+        i = self._transport_mode.findData("recommended")
         if i >= 0:
-            self._upstream.setCurrentIndex(i)
-        self._cache_on.setChecked(True)
-        self._cache_ttl.setValue(5)
-        self._reply_ttl.setValue(1)
-        self._optim.setChecked(True)
-        self._stale_ttl.setValue(3600)
+            self._transport_mode.setCurrentIndex(i)
+        i = self._transport_reaction.findData("balanced")
+        if i >= 0:
+            self._transport_reaction.setCurrentIndex(i)
         self._suppress = False
         self._autosave()
         self._set_status("Значения сброшены", theme.YELLOW)
@@ -690,32 +592,6 @@ class SettingsView(QWidget):
         self._status.setText(text)
         self._status.setStyleSheet(f"color:{color or theme.GREEN};font-size:12px;")
 
-    # ── DNS-фильтрация ──
-    def _filter_status_text(self) -> str:
-        cfg = self.engine.config
-        return (
-            f"Блоклист: {len(cfg.get('blocked_domains', []) or [])} • "
-            f"Allowlist: {len(cfg.get('allowlist_domains', []) or [])}"
-        )
-
-    def _save_filter_lists(self):
-        blocked = parse_domain_lines(
-            self._blocked_edit["edit"].toPlainText(),
-            include_adblock_exceptions=False,
-        )
-        allow = parse_domain_lines(self._allow_edit["edit"].toPlainText())
-        if set_filter_lists(blocked=blocked, allowlist=allow):
-            # normalize visible text after parsing hosts/adblock syntax
-            self._blocked_edit["edit"].setPlainText("\n".join(blocked))
-            self._allow_edit["edit"].setPlainText("\n".join(allow))
-            self.engine.config["blocked_domains"] = blocked
-            self.engine.config["allowlist_domains"] = allow
-            self._filter_status.setText(self._filter_status_text())
-            self._set_status("✓ DNS-фильтры сохранены", theme.GREEN)
-        else:
-            self._set_status("Не удалось сохранить DNS-фильтры", theme.RED)
-
     def refresh(self):
-        """Обновляет статусы настроек при переключении на вкладку."""
-        if hasattr(self, "_filter_status"):
-            self._filter_status.setText(self._filter_status_text())
+        """Вкладка не требует динамического обновления."""
+        return None

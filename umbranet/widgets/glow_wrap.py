@@ -24,7 +24,7 @@ source-rect в ФИЗИЧЕСКИХ пикселях (проверено экс�
 сплошная фиолетовая полоса. Текст и рамки (RowCanvas, RoundedPanel)
 кэшируются в физических пикселях — там DPR обязателен; здесь — нет.
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations

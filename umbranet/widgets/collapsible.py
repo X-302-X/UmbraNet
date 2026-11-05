@@ -81,7 +81,7 @@ class Collapsible(RoundedPanel):
 
         self._title = QLabel(title)
         self._title.setStyleSheet(
-            f"color:{theme.WHITE};font-size:14px;font-weight:700;background:transparent;border:none;")
+            f"color:{theme.TEXT};font-size:14px;font-weight:700;background:transparent;border:none;")
         hl.addWidget(self._title)
         hl.addStretch()
 

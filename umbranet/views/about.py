@@ -30,15 +30,42 @@ from umbranet import __version__, theme
 from umbranet.widgets.rounded_panel import RoundedPanel
 from umbranet import engine_adapter as ea
 
+# «О программе» показывает только зависимости текущего пользовательского
+# маршрута/UI. Legacy DNS-библиотеки намеренно не рекламируются как активные
+# протоколы UmbraNet.
 _PACKAGE_NAMES = {
     "PySide6": "PySide6",
-    "dnslib": "dnslib",
     "requests": "requests",
     "psutil": "psutil",
-    "aioquic": "aioquic",
-    "pynacl": "PyNaCl",
     "packaging": "packaging",
 }
+
+_ROUTE_MODE_LABELS = {
+    "vpn": "VPN",
+    "combo": "Combo",
+    "dpi": "DPI",
+    # Только для старых конфигураций: UI не предлагает эти значения.
+    "dns_only": "VPN",
+    "dpi_only": "DPI",
+}
+
+# Цвет названий вкладок в списке «Где что находится»: светлый голубой — тот же
+# синий акцент темы (theme.ACCENT2), но осветлённый, чтобы 12px-текст читался
+# на тёмной карточке и не сливался с фиолетовым интерфейсом.
+_HELP_TAB_COLOR = "#8cc4ff"
+
+
+def _help_row(emoji: str, name: str, text: str) -> str:
+    """Строка списка «Где что находится»: голубое имя вкладки со смайликом + описание.
+
+    Смайлики — те же, что в боковом меню (см. app.NAV_ITEMS), чтобы пункты
+    списка и вкладки узнавались одинаково.
+    """
+    return (
+        f"<div style='margin:4px 0;'>"
+        f"<b><span style='color:{_HELP_TAB_COLOR};'>{emoji} {name}</span></b> — {text}"
+        f"</div>"
+    )
 
 
 def _pkg_version(dist_name: str) -> str:
@@ -46,6 +73,15 @@ def _pkg_version(dist_name: str) -> str:
         return metadata.version(dist_name)
     except Exception:
         return "не установлен"
+
+
+def _routing_snapshot() -> dict:
+    """Safe current routing snapshot without exposing transport credentials."""
+    try:
+        snapshot = ea.get_routing_runtime().snapshot()
+        return snapshot if isinstance(snapshot, dict) else {}
+    except Exception:
+        return {}
 
 
 def _wrapped(label: QLabel, min_height: int) -> QLabel:
@@ -73,7 +109,7 @@ def _card(title: str = "") -> tuple[QWidget, QVBoxLayout]:
         # («🧩 Состояние компонентов») иначе обрезаются вместе с краем карточки.
         t.setWordWrap(True)
         t.setStyleSheet(
-            f"color:{theme.WHITE};font-size:15px;font-weight:700;"
+            f"color:{theme.TEXT};font-size:15px;font-weight:700;"
             "background:transparent;border:none;"
         )
         lay.addWidget(t)
@@ -91,7 +127,7 @@ class AboutView(QWidget):
 
         head = QHBoxLayout()
         title = QLabel("О программе")
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:22px;font-weight:700;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:22px;font-weight:700;")
         head.addWidget(title)
         head.addStretch()
         self._copy_btn = self._small_btn("📋 Скопировать отчёт", theme.ACCENT)
@@ -122,11 +158,23 @@ class AboutView(QWidget):
 
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
+        self._page_active = False
         self._update_poll = QTimer(self)
         self._update_poll.setInterval(1000)
         self._update_poll.timeout.connect(self._refresh_update_status)
-        self._update_poll.start()
         self._refresh_update_status()
+
+    def page_activated(self) -> None:
+        """Poll update-result labels only while the About page is visible."""
+        self._page_active = True
+        self._refresh_update_status()
+        if not self._update_poll.isActive():
+            self._update_poll.start()
+
+    def page_deactivated(self) -> None:
+        """A hidden status page must not wake the GUI event loop every second."""
+        self._page_active = False
+        self._update_poll.stop()
 
     # ── UI blocks ────────────────────────────────────────────────────────────
     def _build_hero(self) -> QFrame:
@@ -136,7 +184,7 @@ class AboutView(QWidget):
         logo = QLabel("Umbra<span style='color:%s;'>Net</span>" % theme.ACCENT2)
         logo.setTextFormat(Qt.RichText)
         logo.setStyleSheet(
-            f"color:{theme.WHITE};font-size:32px;font-weight:800;"
+            f"color:{theme.TEXT};font-size:32px;font-weight:800;"
             "background:transparent;border:none;"
         )
         top.addWidget(logo)
@@ -151,9 +199,9 @@ class AboutView(QWidget):
         lay.addLayout(top)
 
         desc = QLabel(
-            "Локальный DNS-инструмент для Windows: выборочная маршрутизация доменов, "
-            "защита от DNS-подмены провайдера, DoH/DoT/DoQ/DNSCrypt-транспорты, "
-            "журнал запросов и диагностика проблем доступа."
+            "Локальное приложение для Windows: выборочная маршрутизация сервисов, "
+            "DPI-обработка выбранных доменов и браузерный VPN-маршрут через "
+            "проверенные пользователем HTTP CONNECT/SOCKS5 серверы."
         )
         _wrapped(desc, 40)
         desc.setStyleSheet(f"color:{theme.SUBTEXT};font-size:13px;background:transparent;border:none;")
@@ -177,12 +225,14 @@ class AboutView(QWidget):
         self._prereleases.toggled.connect(self._set_update_channel)
         lay.addWidget(self._prereleases)
         # Separate rows keep the card usable at the minimum window width.
+        # Обе кнопки прижаты влево и не растягиваются по ширине карточки —
+        # статичные, как в обычном диалоге.
         self._check_release = self._small_btn("Проверить обновления", theme.ACCENT)
         self._check_release.clicked.connect(self._check_updates)
-        lay.addWidget(self._check_release)
+        lay.addWidget(self._check_release, 0, Qt.AlignLeft)
         self._open_release = self._small_btn("Открыть страницу релиза", theme.ACCENT)
         self._open_release.clicked.connect(self._open_update_release)
-        lay.addWidget(self._open_release)
+        lay.addWidget(self._open_release, 0, Qt.AlignLeft)
         note = _wrapped(QLabel("Файлы программы не скачиваются и не устанавливаются автоматически."), 32)
         note.setStyleSheet(f"color:{theme.SUBTEXT};font-size:12px;")
         lay.addWidget(note)
@@ -219,16 +269,24 @@ class AboutView(QWidget):
 
     def _build_help(self) -> QFrame:
         card, lay = _card("💡  Где что находится")
-        # Один QLabel вместо 5 — в 4× меньше heightForWidth пересчётов при ресайзе
+        # Один QLabel вместо 6 отдельных — в 4× меньше heightForWidth пересчётов при ресайзе
         rows = [
-            "<b>Маршрутизация</b> — Включайте сервисы и домены, которые должны идти через обход.",
-            "<b>Сеть и диагностика</b> — Проверяйте DNS, утечки, доступность сервисов и причину, почему сайт не открывается.",
-            "<b>DNS-профили</b> — Настраивайте провайдеров и защищённые транспорты: DoH, DoT, DoQ, DNSCrypt.",
-            "<b>Логи</b> — Смотрите живые DNS-запросы и системные логи, добавляйте домены в обход, blocklist или allowlist.",
-            "<b>Настройки</b> — Порт DNS, IPv6, кэш, bogus-IP и ручная DNS-фильтрация.",
+            _help_row("🔀", "Маршрутизация",
+                      "Выбирайте сервисы и домены, режим DPI/VPN/Combo и запускайте выбранный маршрут."),
+            _help_row("👁️", "Сервера",
+                      "Добавляйте поддерживаемые HTTP CONNECT/SOCKS5 серверы вручную, из файла или "
+                      "по HTTPS-подписке; здесь же выбирается сервер для следующего VPN-запуска."),
+            _help_row("🤖", "Сеть и диагностика",
+                      "Проверяйте состояние маршрута, локальную сеть и причины, по которым сервис не открывается."),
+            _help_row("🧪", "AI-стратегии",
+                      "Создавайте и проверяйте DPI-стратегии Uz для выбранных сервисов, затем активируйте подходящую."),
+            _help_row("📑", "Логи",
+                      "Смотрите DNS, реальные DPI-действия, события маршрутизации и безопасные сообщения об ошибках."),
+            _help_row("⚙", "Настройки",
+                      "Меняйте общие параметры приложения и интерфейса; управление серверами находится во вкладке «Сервера»."),
         ]
-        txt = "<br>".join(f"<div style='margin:4px 0;'>{r}</div>" for r in rows)
-        # Пять строк текста: раньше высота была жёстко 110 px, и видно было три с
+        txt = "".join(rows)
+        # Шесть строк текста: раньше высота была жёстко 110 px, и видно было три с
         # половиной — остальное обрезалось. Разметку оставляем одним QLabel
         # (меньше пересчётов при ресайзе), но высота теперь минимум.
         lab = QLabel(txt)
@@ -239,7 +297,7 @@ class AboutView(QWidget):
         return card
 
     def _build_tech(self) -> QFrame:
-        card, lay = _card("🛠  Техническая информация")
+        card, lay = _card("🔧  Техническая информация")
         self._tech_grid = QGridLayout()
         self._tech_grid.setHorizontalSpacing(14)
         self._tech_grid.setVerticalSpacing(8)
@@ -249,14 +307,19 @@ class AboutView(QWidget):
 
     # ── Fillers ──────────────────────────────────────────────────────────────
     def _fill_status_grid(self):
-        health = ea.get_startup_health()
+        snapshot = _routing_snapshot()
+        mode = str(snapshot.get("mode") or ea.get_current_mode() or "dpi").lower()
+        routing_active = bool(snapshot.get("running"))
+        dpi = snapshot.get("dpi") if isinstance(snapshot.get("dpi"), dict) else {}
+        transport = snapshot.get("vpn") if isinstance(snapshot.get("vpn"), dict) else {}
+        ready, readiness_note = ea.routing_start_readiness()
         rows = [
-            ("DNS-ядро", "настоящее" if ea.is_real_engine() else "заглушка", ea.is_real_engine()),
+            ("Режим маршрутизации", _ROUTE_MODE_LABELS.get(mode, mode.upper()), mode in _ROUTE_MODE_LABELS),
+            ("Маршрутизация", "активна" if routing_active else "остановлена", routing_active),
+            ("DPI-движок", "активен" if dpi.get("running") else "ожидает запуска", bool(dpi.get("running"))),
+            ("Выборочный транспорт", "активен" if transport.get("running") else "ожидает запуска", bool(transport.get("running"))),
             ("Права администратора", "есть" if ea.is_admin() else "нет", ea.is_admin()),
-            ("DNS-сервер", "работает" if self.engine.running else "остановлен", bool(self.engine.running)),
-            ("DoQ", "доступен" if ea.doq_available() else "нужен aioquic", ea.doq_available()),
-            ("DNSCrypt", "доступен" if ea.dnscrypt_available() else "нужен pynacl", ea.dnscrypt_available()),
-            ("Предстартовая проверка", health.get("summary", "—"), health.get("severity") != "error"),
+            ("Готовность запуска", readiness_note or "готово", ready),
         ]
         for r, (name, value, ok) in enumerate(rows):
             self._kv(self._status_grid, r, name, value, ok=ok)
@@ -268,11 +331,8 @@ class AboutView(QWidget):
             ("Qt", qVersion()),
             ("ОС", f"{platform.system()} {platform.release()}".strip()),
             ("PySide6", _pkg_version(_PACKAGE_NAMES["PySide6"])),
-            ("dnslib", _pkg_version(_PACKAGE_NAMES["dnslib"])),
             ("requests", _pkg_version(_PACKAGE_NAMES["requests"])),
             ("psutil", _pkg_version(_PACKAGE_NAMES["psutil"])),
-            ("aioquic", _pkg_version(_PACKAGE_NAMES["aioquic"])),
-            ("PyNaCl", _pkg_version(_PACKAGE_NAMES["pynacl"])),
             ("packaging", _pkg_version(_PACKAGE_NAMES["packaging"])),
         ]
         for r, (name, value) in enumerate(rows):
@@ -301,6 +361,11 @@ class AboutView(QWidget):
         b = QPushButton(text)
         b.setCursor(Qt.PointingHandCursor)
         b.setFixedHeight(34)
+        # Кнопка статичная: растёт только до своего текста (sizeHint), а не до
+        # ширины карточки. С политикой по умолчанию (Minimum) кнопка занимала
+        # всю строку — «Проверить обновления» тянулась во всю карточку и
+        # «продлевалась бесконечно» при растягивании окна.
+        b.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         b.setStyleSheet(
             f"QPushButton{{background:{bg};color:{fg or theme.WHITE};"
             "border:none;border-radius:9px;padding:0 14px;font-size:12px;font-weight:600;}"
@@ -310,7 +375,11 @@ class AboutView(QWidget):
 
     # ── Report ───────────────────────────────────────────────────────────────
     def _report_text(self) -> str:
-        health = ea.get_startup_health()
+        snapshot = _routing_snapshot()
+        mode = str(snapshot.get("mode") or ea.get_current_mode() or "dpi").lower()
+        dpi = snapshot.get("dpi") if isinstance(snapshot.get("dpi"), dict) else {}
+        transport = snapshot.get("vpn") if isinstance(snapshot.get("vpn"), dict) else {}
+        ready, readiness_note = ea.routing_start_readiness()
         lines = [
             f"UmbraNet v{__version__}",
             "=" * 48,
@@ -318,9 +387,11 @@ class AboutView(QWidget):
             f"Qt: {qVersion()}",
             f"OS: {platform.platform()}",
             f"Admin: {ea.is_admin()}",
-            f"Real engine: {ea.is_real_engine()}",
-            f"DNS running: {bool(self.engine.running)}",
-            f"Startup health: {health.get('severity')} — {health.get('summary')}",
+            f"Routing mode: {_ROUTE_MODE_LABELS.get(mode, mode.upper())}",
+            f"Routing active: {bool(snapshot.get('running'))}",
+            f"DPI active: {bool(dpi.get('running'))}",
+            f"Selective transport active: {bool(transport.get('running'))}",
+            f"Start readiness: {ready} — {readiness_note or 'готово'}",
             "",
             "Dependencies:",
         ]

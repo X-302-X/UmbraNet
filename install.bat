@@ -4,7 +4,7 @@ REM =====================================================================
 REM  UmbraNet - полный установщик зависимостей
 REM
 REM  Что делает:
-REM    1. Проверяет CPython 3.10-3.14 для Windows x64
+REM    1. Проверяет CPython 3.10-3.15 для Windows x64
 REM    2. Создаёт .venv рядом с программой
 REM    3. Обновляет pip/setuptools/wheel
 REM    4. Ставит ВСЕ компоненты DNS: PySide6, dnslib, requests, psutil,
@@ -25,7 +25,8 @@ set "APP_DIR=%~dp0"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 set "PIP_DISABLE_PIP_VERSION_CHECK=1"
-set "PIP_NO_CACHE_DIR=1"
+REM Не отключаем pip-cache: при нестабильном интернете уже скачанные wheel-файлы
+REM должны пережить повторный запуск install.bat.
 
 REM ── Авто-обход Windows MAX_PATH для PySide6 ───────────────────────────
 REM Если путь к папке длинный, делаем временный диск U:/V:/... на эту папку
@@ -86,7 +87,7 @@ if not defined SYS_PY (
 if not defined SYS_PY (
     echo  [ОШИБКА] Python не найден.
     echo.
-    echo  Установите обычный Python 3.10-3.14 для Windows x64:
+    echo  Установите обычный Python 3.10-3.15 для Windows x64:
     echo  https://www.python.org/downloads/
     echo  При установке включите "Add Python to PATH".
     if not defined UMBRANET_INSTALL_NO_PAUSE pause
@@ -98,9 +99,9 @@ echo  Python для создания окружения:
 if errorlevel 1 (
     echo.
     echo  [ОШИБКА] Выбранный Python не прошёл проверку выше. Установка не начата.
-    echo  Нужен обычный CPython 3.10-3.14 для Windows x64.
-    echo  При нескольких версиях можно заранее создать .venv нужным Python, например:
-    echo    py -3.14 -m venv .venv
+echo  Нужен обычный CPython 3.10-3.15 для Windows x64.
+echo  При нескольких версиях можно заранее создать .venv нужным Python, например:
+echo    py -3.15 -m venv .venv
     if not defined UMBRANET_INSTALL_NO_PAUSE pause
     exit /b 1
 )
@@ -124,35 +125,57 @@ if errorlevel 1 (
     echo  [ОШИБКА] Python внутри .venv несовместим или не запускается.
     echo  Смена системного Python не меняет уже созданную .venv.
     echo  Закройте UmbraNet, переименуйте .venv в .venv-old и запустите install.bat снова.
-    echo  Нужен обычный CPython 3.10-3.14 для Windows x64.
+    echo  Нужен обычный CPython 3.10-3.15 для Windows x64.
     if not defined UMBRANET_INSTALL_NO_PAUSE pause
     exit /b 1
 )
 
 echo.
-echo  Обновление pip / setuptools / wheel ...
-"%PY%" -m pip install --upgrade --no-cache-dir -c "%APP_DIR%constraints.txt" pip setuptools wheel
+echo  Проверка встроенного pip ...
+"%PY%" -m pip --version
 if errorlevel 1 (
-    echo  [ОШИБКА] Не удалось обновить pip.
+    echo  [ОШИБКА] Виртуальное окружение не содержит рабочий pip.
+    echo  Переименуйте .venv в .venv-old и запустите install.bat снова.
     if not defined UMBRANET_INSTALL_NO_PAUSE pause
     exit /b 1
+)
+
+REM Обновление bootstrap-пакетов не требуется для установки зафиксированных
+REM wheel-зависимостей UmbraNet. Не делаем лишний запрос к PyPI на сетях,
+REM где он нестабилен. Для явного обновления: set UMBRANET_UPDATE_BOOTSTRAP=1
+if /I "%UMBRANET_UPDATE_BOOTSTRAP%"=="1" (
+    echo  Обновление pip / setuptools / wheel по запросу ...
+    "%PY%" -m pip install --upgrade --retries 2 --timeout 30 pip setuptools wheel
+    if errorlevel 1 (
+        echo  [ПРЕДУПРЕЖДЕНИЕ] Bootstrap-пакеты не обновились - продолжаем.
+    )
+) else (
+    echo  Используется установленный pip; обновление bootstrap-пакетов пропущено.
 )
 
 REM ── Основные и encrypted DNS зависимости ─────────────────────────────
 echo.
 echo  -----------------------------------------------
 echo   Установка обязательных компонентов
-echo   GUI + DNS + DoQ + DNSCrypt
+echo   GUI + DNS + DoH HTTP2 + DoQ + DNSCrypt
 echo  -----------------------------------------------
-"%PY%" -m pip install --upgrade --no-cache-dir --only-binary=:all: -r "%APP_DIR%requirements.txt"
+"%PY%" -m pip install --upgrade --retries 2 --timeout 30 --only-binary=:all: -r "%APP_DIR%requirements.txt"
 if errorlevel 1 (
     echo.
     echo  [ОШИБКА] Не удалось установить обязательные компоненты.
     echo.
     echo  Причина указана pip выше. Сохраните этот вывод для диагностики.
-    echo  No matching distribution / ResolutionImpossible: проверьте версии пакетов
-    echo  и Python. Убедитесь, что requirements.txt и constraints.txt из одной версии UmbraNet.
-    echo  Ошибка сети / TLS / прокси: проверьте доступ к PyPI и настройки сети.
+    echo  Если ВЫШЕ был ConnectionResetError / Max retries / Read timed out / TLS,
+    echo  ResolutionImpossible здесь НЕ означает конфликт версий: pip не смог получить
+    echo  список пакетов с PyPI. Нужна другая разрешённая сеть или настройка прокси.
+    echo  Если сетевых ошибок не было: No matching distribution / ResolutionImpossible
+    echo  означает несовместимые версии Python, requirements.txt и constraints.txt.
+    echo  ConnectionResetError / Max retries / Read timed out / TLS: сеть не даёт pip
+    echo  скачать пакеты. Нужен доступ по HTTPS к pypi.org и files.pythonhosted.org.
+    echo  Проверьте интернет, корпоративный прокси/антивирус и запустите install.bat
+    echo  ещё раз: кэш сохранит уже успешно скачанные wheel-файлы.
+    echo  No matching distribution / ResolutionImpossible: проверьте версии Python,
+    echo  requirements.txt и constraints.txt из одной версии UmbraNet.
     echo  Только при ошибке длинного пути / Errno 2 / 206 перенесите папку в C:\UmbraNet.
     echo  Текущий путь: "%CD%"
     echo.
@@ -171,7 +194,7 @@ if errorlevel 1 (
 REM ── Проверка импортов ────────────────────────────────────────────────
 echo.
 echo  Проверка установленных модулей ...
-"%PY%" -c "from PySide6 import QtCore, QtGui, QtWidgets; import dnslib, requests, psutil, aioquic, nacl, packaging; print('OK: all required modules imported')"
+"%PY%" -c "from PySide6 import QtCore, QtGui, QtWidgets; import dnslib, requests, psutil, aioquic, h2, nacl, packaging; print('OK: all required modules imported')"
 if errorlevel 1 (
     echo  [ОШИБКА] Модули установились не полностью. Повторите install.bat.
     echo  Если ошибка повторяется, удалите папку .venv и запустите install.bat заново.

@@ -38,6 +38,7 @@ from umbranet.engine_adapter import (
     bogus_last_updated,
     flush_dns_cache,
     full_diagnostics_report,
+    get_current_mode,
     get_engine,
     health_score,
     network_repair_soft,
@@ -76,9 +77,9 @@ class _ClickableLabel(QLabel):
 
 def _mode_label(mode: str) -> str:
     return {
-        "dns_only": "DNS Only",
+        "vpn": "VPN",
         "combo": "Combo",
-        "dpi_only": "DPI Only",
+        "dpi": "DPI",
         "unknown": "неясно",
     }.get(mode, mode)
 
@@ -126,7 +127,7 @@ def _card(title: str = "") -> tuple[QWidget, QVBoxLayout]:
         # требовало больше места, чем у карточки, и обрезалось бы вместе с краем.
         t.setWordWrap(True)
         t.setStyleSheet(
-            f"color:{theme.WHITE};font-size:15px;font-weight:700;"
+            f"color:{theme.TEXT};font-size:15px;font-weight:700;"
             "background:transparent;border:none;"
         )
         lay.addWidget(t)
@@ -251,6 +252,9 @@ class _RestoreNetworkWorker(QThread):
 
 
 class NetworkView(QWidget):
+    # Открыть вкладку «Логи» с выбранной категорией («fixed» = Починки/лечение).
+    openLogRequested = Signal(str)
+
     def __init__(self):
         super().__init__()
         self.engine = get_engine()
@@ -269,7 +273,7 @@ class NetworkView(QWidget):
 
         head = QHBoxLayout()
         title = QLabel("Сеть и диагностика")
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:22px;font-weight:700;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:22px;font-weight:700;")
         head.addWidget(title)
         head.addStretch()
         outer.addLayout(head)
@@ -464,26 +468,35 @@ class NetworkView(QWidget):
             self._answer_counters.setText("Записей пока нет.")
 
     def _build_health_doctor(self):
+        """Компактная карточка лечения (2026-10-06, виджет «полностью переделан»).
+
+        Пользователь просил: «статус одной строкой + ряд кнопок, минимум места,
+        текст не съезжает». Контракты узкого окна сохранены: подписи по-прежнему
+        переносятся и растут (tests/test_network_narrow.py), а ряд кнопок
+        переносится на вторую строку (_FlowLayout). Рядом с «Лог» — кнопка-
+        переключатель «Уведомления» с видимой галочкой (вкл/выкл).
+        """
         card, lay = _card("🩺  Автодиагностика и лечение")
         row = QHBoxLayout()
-        row.setSpacing(14)
+        row.setSpacing(12)
 
+        # Пилюля-оценка: ширина рассчитана и на максимальное «100».
         self._health_score_label = QLabel("—")
-        self._health_score_label.setFixedWidth(92)
+        self._health_score_label.setFixedSize(72, 48)
         self._health_score_label.setAlignment(Qt.AlignCenter)
         self._health_score_label.setStyleSheet(
-            f"color:{theme.MUTED};font-size:30px;font-weight:900;background:{theme.INPUT_BG};"
-            f"border:1px solid {theme.BORDER};border-radius:14px;padding:10px;"
+            f"color:{theme.MUTED};font-size:22px;font-weight:900;background:{theme.INPUT_BG};"
+            f"border:1px solid {theme.BORDER};border-radius:12px;"
         )
-        row.addWidget(self._health_score_label)
+        row.addWidget(self._health_score_label, 0, Qt.AlignTop)
 
         texts = QVBoxLayout()
-        texts.setSpacing(5)
+        texts.setSpacing(3)
         self._health_title = QLabel("Проверка ещё не запускалась")
         # Health reports can have long titles. Like their details, they must
         # wrap instead of imposing a minimum width on the whole network page.
         self._health_title.setWordWrap(True)
-        self._health_title.setStyleSheet(f"color:{theme.TEXT};font-size:16px;font-weight:800;background:transparent;border:none;")
+        self._health_title.setStyleSheet(f"color:{theme.TEXT};font-size:14px;font-weight:800;background:transparent;border:none;")
         self._health_text = QLabel("Нажмите одну кнопку — UmbraNet проверит состояние и сам применит безопасную починку, если она нужна.")
         _wrapped(self._health_text, 42)
         self._health_text.setStyleSheet(f"color:{theme.SUBTEXT};font-size:12px;background:transparent;border:none;")
@@ -493,15 +506,41 @@ class NetworkView(QWidget):
         lay.addLayout(row)
 
         self._btn_doctor = self._grad_btn("🛠 Проверить и вылечить", theme.ACCENT, theme.ACCENT2, self._run_auto_doctor)
-        self._btn_health_refresh = self._flat_btn("Обновить", self._refresh_health_score)
+        self._btn_open_log = self._flat_btn("📋 Лог", self._open_doctor_log)
+        self._btn_notify = self._flat_btn("✓ Уведомления: вкл", self._toggle_notify)
+        self._btn_notify.setCheckable(True)
         self._btn_copy_full_report = self._flat_btn("📋 Скопировать отчёт", self._copy_full_report)
-        lay.addLayout(_button_row(self._btn_doctor, self._btn_health_refresh,
-                                  self._btn_copy_full_report))
+        lay.addLayout(_button_row(self._btn_doctor, self._btn_open_log,
+                                  self._btn_notify, self._btn_copy_full_report))
+        self._sync_notify_btn()
         return card
 
+    # ── Лог лечения и переключатель уведомлений (2026-10-06) ────────────────
+    def _open_doctor_log(self):
+        """Открывает вкладку «Логи» сразу с категорией «🔧 Починки» (лечение)."""
+        self.openLogRequested.emit("fixed")
+
+    def _toggle_notify(self):
+        from umbranet.engine_adapter import set_doctor_notify
+        set_doctor_notify(bool(self._btn_notify.isChecked()))
+        self._sync_notify_btn()
+
+    def _sync_notify_btn(self):
+        from umbranet.engine_adapter import get_doctor_notify
+        on = bool(get_doctor_notify())
+        self._btn_notify.setChecked(on)
+        self._btn_notify.setText("✓ Уведомления: вкл" if on else "🔕 Уведомления: выкл")
+        border = theme.ACCENT if on else theme.BORDER
+        self._btn_notify.setStyleSheet(
+            f"QPushButton{{background:{theme.CARD};color:{theme.TEXT};"
+            f"border:1px solid {border};border-radius:10px;padding:0 13px;}}"
+            f"QPushButton:hover{{border-color:{theme.ACCENT};}}"
+            f"QPushButton:disabled{{color:{theme.MUTED};border-color:{theme.BORDER};}}"
+        )
+
     def _build_dpi_tools(self):
-        card, lay = _card("🛡  DPI / WinWS")
-        self._dpi_title = QLabel("WinWS: —")
+        card, lay = _card("🛡  DPI-движок")
+        self._dpi_title = QLabel("Движок: —")
         self._dpi_title.setStyleSheet(f"color:{theme.TEXT};font-size:15px;font-weight:700;background:transparent;border:none;")
         self._dpi_text = QLabel("Статус DPI-движка, стратегия и лог запуска.")
         _wrapped(self._dpi_text, 48)
@@ -509,20 +548,23 @@ class NetworkView(QWidget):
         lay.addWidget(self._dpi_title)
         lay.addWidget(self._dpi_text)
 
-        self._btn_open_winws_log = self._flat_btn("Открыть winws.log", self._open_winws_log)
+        self._btn_open_winws_log = self._flat_btn("Открыть лог движка", self._open_winws_log)
         self._btn_copy_winws_diag = self._flat_btn("📋 Скопировать DPI-диагностику", self._copy_winws_diagnostics)
         lay.addLayout(_button_row(self._btn_open_winws_log, self._btn_copy_winws_diag))
         return card
 
     def _build_tools(self):
         card, lay = _card("🧰  Быстрые инструменты")
-        self._btn_flush = self._flat_btn("Сбросить DNS-кэш", self._flush_dns)
+        self._btn_flush = self._flat_btn("Обновить DNS-кэши", self._flush_dns)
+        self._btn_browser_cache_help = self._flat_btn(
+            "🌐 Браузер: обновить без перезапуска", self._show_browser_cache_help
+        )
         self._btn_bogus_update = self._flat_btn("🛡 Обновить защиту от подмен", self._update_bogus_list)
         # P0-2: ручной откат сети. Показывает, к какому состоянию вернёт —
         # снапшот от такого-то времени либо «Авто (DHCP)», если снапшота нет.
         self._btn_restore_net = self._flat_btn("↩ Откатить сеть", self._restore_network)
-        lay.addLayout(_button_row(self._btn_flush, self._btn_bogus_update,
-                                  self._btn_restore_net))
+        lay.addLayout(_button_row(self._btn_flush, self._btn_browser_cache_help,
+                                  self._btn_bogus_update, self._btn_restore_net))
         self._update_restore_hint()
 
         self._bogus_status = QLabel(self._bogus_status_text())
@@ -577,8 +619,6 @@ class NetworkView(QWidget):
     def _refresh_health_score(self):
         if self._health_worker and self._health_worker.isRunning():
             return
-        self._btn_health_refresh.setEnabled(False)
-        self._btn_health_refresh.setText("Считаю...")
         self._health_title.setText("⏳ Проверяю состояние...")
         self._health_worker = _HealthWorker()
         self._health_worker.done.connect(self._on_health_ready)
@@ -586,8 +626,6 @@ class NetworkView(QWidget):
 
     def _on_health_ready(self, hs: dict):
         self._last_health = hs or {}
-        self._btn_health_refresh.setEnabled(True)
-        self._btn_health_refresh.setText("Обновить")
         if hs.get("error"):
             self._health_score_label.setText("!")
             self._health_title.setText("Health недоступен")
@@ -599,8 +637,8 @@ class NetworkView(QWidget):
         color = theme.GREEN if state == "ok" else (theme.YELLOW if state == "warn" else theme.RED)
         self._health_score_label.setText(str(score))
         self._health_score_label.setStyleSheet(
-            f"color:{color};font-size:30px;font-weight:900;background:{theme.INPUT_BG};"
-            f"border:1px solid {color};border-radius:14px;padding:10px;"
+            f"color:{color};font-size:26px;font-weight:900;background:{theme.INPUT_BG};"
+            f"border:1px solid {color};border-radius:14px;padding:0;"
         )
         self._health_title.setText(hs.get("title", "Health"))
         checks = hs.get("checks") or []
@@ -677,12 +715,12 @@ class NetworkView(QWidget):
 
     def _winws_log_tail(self, max_chars: int = 5000) -> str:
         try:
-            path = Path(self._get_winws_status().get("log_path") or "winws.log")
+            path = Path(self._get_winws_status().get("log_path") or "e1-spike.log")
             if not path.exists():
                 return ""
             return path.read_text(encoding="utf-8", errors="replace")[-max_chars:].strip()
         except Exception as exc:
-            return f"<не удалось прочитать winws.log: {exc}>"
+            return f"<не удалось прочитать лог движка: {exc}>"
 
     def _dpi_targets_info(self) -> dict:
         cfg = getattr(self.engine, "config", {}) or {}
@@ -713,18 +751,17 @@ class NetworkView(QWidget):
         st = self._get_winws_status()
         if st.get("running"):
             color = theme.GREEN
-            title = "WinWS: запущен"
+            title = "Движок: запущен"
         elif st.get("available"):
-            color = theme.YELLOW if cfg.get("dpi_mode", "off") != "off" else theme.MUTED
-            title = "WinWS: остановлен"
+            color = theme.YELLOW if get_current_mode() in {"combo", "dpi"} else theme.MUTED
+            title = "Движок: остановлен"
         else:
             color = theme.RED
-            title = "WinWS: не найден"
+            title = "Движок: не найден"
         self._dpi_title.setText(title)
         self._dpi_title.setStyleSheet(f"color:{color};font-size:15px;font-weight:700;background:transparent;border:none;")
         err = st.get("last_error") or ""
-        raw_mode = cfg.get("dpi_mode", "off")
-        ui_mode = {"off": "dns_only", "combo": "combo", "zapret": "dpi_only"}.get(raw_mode, "unknown")
+        ui_mode = get_current_mode()
         target_count = int(targets.get("count", 0) or 0)
         text = (
             f"Режим: {_mode_label(ui_mode)} • "
@@ -732,7 +769,7 @@ class NetworkView(QWidget):
             f"Целей DPI: {target_count} • "
             f"Аргументов: {len(st.get('last_args') or [])}"
         )
-        if cfg.get("dpi_mode", "off") != "off" and target_count == 0:
+        if ui_mode in {"combo", "dpi"} and target_count == 0:
             text += "\n⚠ Цели DPI не выбраны. Включите сервисы/домены в главном меню — тогда WinWS будет работать только по ним."
         elif target_count:
             preview = ", ".join((targets.get("domains") or [])[:5])
@@ -751,10 +788,10 @@ class NetworkView(QWidget):
             import os
             import webbrowser
             status = self._get_winws_status()
-            path = Path(status.get("log_path") or "winws.log")
+            path = Path(status.get("log_path") or "e1-spike.log")
             if not path.exists():
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("winws.log пока пуст: WinWS ещё не запускался.\n", encoding="utf-8")
+                path.write_text("Лог движка пока пуст: движок ещё не запускался.\n", encoding="utf-8")
             if hasattr(os, "startfile"):
                 os.startfile(str(path))
             else:
@@ -763,7 +800,7 @@ class NetworkView(QWidget):
         except Exception as exc:
             self._btn_open_winws_log.setText("Ошибка")
             self._dpi_text.setText(f"Не удалось открыть winws.log: {exc}")
-        QTimer.singleShot(1500, lambda: self._btn_open_winws_log.setText("Открыть winws.log"))
+        QTimer.singleShot(1500, lambda: self._btn_open_winws_log.setText("Открыть лог движка"))
 
     def _copy_winws_diagnostics(self):
         cfg = getattr(self.engine, "config", {}) or {}
@@ -851,8 +888,25 @@ class NetworkView(QWidget):
     # ── misc ────────────────────────────────────────────────────────────────
     def _flush_dns(self):
         ok = flush_dns_cache()
-        self._btn_flush.setText("✓ Сброшен" if ok else "Ошибка")
-        QTimer.singleShot(1400, lambda: self._btn_flush.setText("Сбросить DNS-кэш"))
+        self._btn_flush.setText("✓ Кэши обновлены" if ok else "Не удалось обновить")
+        QTimer.singleShot(1800, lambda: self._btn_flush.setText("Обновить DNS-кэши"))
+
+    def _show_browser_cache_help(self):
+        """Показывает безопасный путь без закрытия вкладок и процесса браузера."""
+        QMessageBox.information(
+            self,
+            "Обновить кэш браузера без перезапуска",
+            "UmbraNet уже очистил свой кэш и кэш Windows. Chromium-браузеры могут "
+            "хранить прежний адрес около минуты и держать открытое соединение.\n\n"
+            "Chrome:\n"
+            "1. Открой chrome://net-internals/#dns и нажми Clear host cache.\n"
+            "2. Открой chrome://net-internals/#sockets и нажми Flush socket pools.\n\n"
+            "Microsoft Edge:\n"
+            "Используй те же страницы, заменив chrome:// на edge://.\n\n"
+            "Это не закрывает браузер, не трогает вкладки и не меняет его профиль. "
+            "Если эти страницы недоступны в версии браузера, подожди до минуты "
+            "и обнови страницу.",
+        )
 
     # ── Откат сети (P0-2) ───────────────────────────────────────────────────
     def _update_restore_hint(self):

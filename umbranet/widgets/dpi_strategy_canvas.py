@@ -4,7 +4,7 @@ UmbraNet — канвас списка DPI-стратегий (радио-выб
 Замена QScrollArea + карточек-QFrame из dpi_strategy_list.py. Логика
 выбора стратегии (WinWS-перезапуск и т.д.) остаётся в DpiStrategyList.
 
-UmbraNet_Official / 302XXX, GPLv3.
+UmbraNet_Official / X-302-X, GPLv3.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ class DpiStrategyCanvas(RowCanvas):
     """Рисует строки-стратегии: ● название / описание (до 2 строк)."""
 
     rowClicked = Signal(str)   # id стратегии
+    rowContextRequested = Signal(str, object)  # id, global mouse position
 
     ROW_H = ROW_H
     STRIDE = STRIDE
@@ -34,7 +35,9 @@ class DpiStrategyCanvas(RowCanvas):
         base = self.font()
         self._f_dot = QFont(base); self._f_dot.setPixelSize(10)
         self._f_name = QFont(base); self._f_name.setPixelSize(12); self._f_name.setBold(True)
-        self._f_desc = QFont(base); self._f_desc.setPixelSize(10)
+        # Описания должны быть такими же читаемыми, как текст у DNS-маршрутов:
+        # 10 px на DPI-карточках выглядели слишком тонко и «мыльно» при масштабе Windows.
+        self._f_desc = QFont(base); self._f_desc.setPixelSize(11)
         self._fm_desc = QFontMetrics(self._f_desc)
 
     # ── API ──
@@ -49,8 +52,28 @@ class DpiStrategyCanvas(RowCanvas):
     def _row_clicked(self, i: int):
         self.rowClicked.emit(self._rows[i]["key"])
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            index = self._index_at(event.position().y())
+            if index >= 0 and self._rows[index].get("key"):
+                global_pos = event.globalPosition().toPoint()
+                self.rowContextRequested.emit(str(self._rows[index]["key"]), global_pos)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
     def _rows_state_key(self):
-        return tuple((r["key"], r["active"]) for r in self._rows)
+        return tuple(
+            (
+                r["key"],
+                r["active"],
+                r.get("name", ""),
+                r.get("desc", ""),
+                r.get("status_color", ""),
+                bool(r.get("status_underline")),
+            )
+            for r in self._rows
+        )
 
     # ── отрисовка ──
 
@@ -62,20 +85,27 @@ class DpiStrategyCanvas(RowCanvas):
 
         path = QPainterPath()
         path.addRoundedRect(0.5, y + 0.5, w - 1, h - 1, 9, 9)
+        status_color = it.get("status_color", "")
         if active:
             g = QLinearGradient(0, y, 0, y + h)
             g.setColorAt(0.0, theme.qc(theme.CARD_TOP))
             g.setColorAt(1.0, theme.qc(theme.ROW_BG))
             p.fillPath(path, g)
-            p.setPen(self._pen(theme.ACCENT))
+            p.setPen(self._pen(status_color or theme.ACCENT))
         else:
             p.fillPath(path, QBrush(theme.qc(theme.ROW_BG)))
-            p.setPen(self._pen(theme.ACCENT if hover else theme.BORDER))
+            p.setPen(self._pen(status_color or (theme.ACCENT if hover else theme.BORDER)))
         p.drawPath(path)
+
+        # Failed manually-selected routes receive an additional red underline,
+        # not a subtle icon-only state.  Other row users leave it unset.
+        if it.get("status_underline") and status_color:
+            p.setPen(self._pen(status_color))
+            p.drawLine(26, y + 18, max(26, w - 10), y + 18)
 
         # ● точка
         p.setFont(self._f_dot)
-        p.setPen(self._pen(theme.GREEN if active else theme.MUTED))
+        p.setPen(self._pen(status_color or (theme.GREEN if active else theme.MUTED)))
         p.drawText(10, y + 1, 14, 16, int(Qt.AlignLeft | Qt.AlignVCenter), "●")
 
         # название
@@ -86,7 +116,7 @@ class DpiStrategyCanvas(RowCanvas):
 
         # описание до 2 строк
         p.setFont(self._f_desc)
-        p.setPen(self._pen("#b2b3d6"))
+        p.setPen(self._pen(theme.SUBTEXT))
         lines = self._wrap2(it.get("desc", ""), self._fm_desc, w - 20)
         ty = y + 18
         for ln in lines[:2]:

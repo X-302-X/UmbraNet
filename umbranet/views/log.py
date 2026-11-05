@@ -1,7 +1,7 @@
 """
 UmbraNet - раздел «Журнал» (PySide6) — телеграмизирован.
 
-Живой поток DNS-запросов:
+Живой поток DNS-, DPI- и диагностических событий:
   • строка статистики сверху (всего / обход / напрямую / блок / починка / ошибка):
     карточки ужимаются под ширину окна плавно и в пределе остаются «смайлик + цифра»
     (StatCard.set_compression — тот же приём, что у кнопок DNS / Combo / DPI);
@@ -16,7 +16,7 @@ UmbraNet - раздел «Журнал» (PySide6) — телеграмизир�
   только видимые ~15 строк за 2-3 мс, кэш, затухающий ползунок.
 
 Архитектура обновлений:
-  - Новые записи приходят через QueryLog.subscribe() из DNS-потока.
+  - Новые записи приходят через QueryLog.subscribe() из DNS- и DPI-потоков.
   - Прокидываются в UI через Qt-сигнал _entry_arrived (thread-safe).
   - refresh() при переключении вкладки НЕ перестраивает DOM —
     только подгружает записи которые пришли пока вкладка была скрыта.
@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
 
 from umbranet import theme
 from umbranet.engine_adapter import get_query_log
+from umbranet.widgets.log_batch import LogBatchBuffer
 from umbranet.widgets.log_canvas import LogCanvas
 from umbranet.widgets.rounded_panel import RoundedPanel
 
@@ -49,11 +50,14 @@ SOURCE_LABELS = {
     "cache": "кэш", "stale-cache": "stale", "routed": "обход",
     "system": "система", "bogus-NX": "bogus", "blocked": "блок", "servfail": "ошибка",
     "bg-refresh": "фон", "fixed": "починка", "error": "ошибка",
-    "check": "проверка", "leak": "утечка",
+    "check": "проверка", "leak": "утечка", "dpi": "DPI", "dpi-error": "DPI",
 }
 
 MAX_VISIBLE = 200   # лимит отображения (для canvas — виртуальный скролл, но лимит буфера)
 MAX_BUFFER  = 2000  # строк в памяти
+# A short coalescing window bounds GUI work during a stream of DNS/DPI events
+# while retaining a live feeling in the visible journal.
+LOG_BATCH_MS = 120
 
 
 def _reason_for(entry) -> str:
@@ -369,7 +373,12 @@ class LogView(QWidget):
         self._filter  = "all"
         self._search  = ""
         self._paused  = False
-        self._rows: list = []
+        # Counts are maintained as rows enter/leave the bounded buffer.  A
+        # batch therefore updates stat cards in O(1), not by scanning 2000 rows.
+        self._row_buffer = LogBatchBuffer(MAX_BUFFER)
+        self._rows = self._row_buffer.rows
+        self._stats = self._row_buffer.stats
+        self._display_dirty = True
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(24, 18, 24, 18)
@@ -378,7 +387,7 @@ class LogView(QWidget):
         # ── заголовок + LIVE ──
         head = QHBoxLayout()
         title = QLabel("Логи запросов")
-        title.setStyleSheet(f"color:{theme.WHITE};font-size:22px;font-weight:700;")
+        title.setStyleSheet(f"color:{theme.TEXT};font-size:22px;font-weight:700;")
         head.addWidget(title)
         self._live = QLabel("●  LIVE")
         self._live.setStyleSheet(f"color:{theme.GREEN};font-size:12px;font-weight:700;")
@@ -506,13 +515,40 @@ class LogView(QWidget):
 
         self._last_entry_ts: float = 0.0
         self._live_blink_state: bool = False
+        self._page_active = False
         self._live_timer = QTimer(self)
         self._live_timer.setInterval(600)
         self._live_timer.timeout.connect(self._tick_live)
-        self._live_timer.start()
+        self._batch_timer = QTimer(self)
+        self._batch_timer.setSingleShot(True)
+        self._batch_timer.setInterval(LOG_BATCH_MS)
+        self._batch_timer.timeout.connect(self._flush_pending_display)
 
         self._set_filter("all")
         self.refresh()
+
+    def page_activated(self) -> None:
+        """Resume visual work and flush one accumulated journal batch on entry."""
+        self._page_active = True
+        self._sync_from_core()
+        if not self._live_timer.isActive():
+            self._live_timer.start()
+        self._tick_live()
+        self._schedule_display_flush(immediate=True)
+
+    def page_deactivated(self) -> None:
+        """Hidden pages keep data only; they do not touch canvas, stats or QSS."""
+        self._page_active = False
+        self._live_timer.stop()
+        self._batch_timer.stop()
+
+    def showEvent(self, event):  # noqa: N802 - Qt API
+        super().showEvent(event)
+        self._schedule_display_flush(immediate=True)
+
+    def hideEvent(self, event):  # noqa: N802 - Qt API
+        self._batch_timer.stop()
+        super().hideEvent(event)
 
     # ── ужимание карточек под ширину окна ────────────────────────────────────
 
@@ -643,7 +679,7 @@ class LogView(QWidget):
                 f"QPushButton:hover{{color:{theme.TEXT};border-color:{theme.ACCENT};}}")
 
     def _tick_live(self):
-        if self._paused:
+        if not self._page_active or not self.isVisible() or self._paused:
             return
         import time as _time
         now = _time.monotonic()
@@ -657,6 +693,37 @@ class LogView(QWidget):
             self._live.setText("○  нет данных")
             self._live.setStyleSheet(f"color:{theme.MUTED};font-size:12px;font-weight:600;")
 
+    # ── пакетная обработка входящих записей ──────────────────────────────────
+
+    def _append_row(self, entry) -> None:
+        """Append one row and evict oldest rows without a full stats rescan."""
+        self._row_buffer.append(entry)
+
+    def _schedule_display_flush(self, *, immediate: bool = False) -> None:
+        """Request at most one canvas/stats update for the next event batch."""
+        if (
+            not self._display_dirty
+            or self._paused
+            or not self._page_active
+            or not self.isVisible()
+        ):
+            return
+        if immediate:
+            self._batch_timer.start(0)
+        elif not self._batch_timer.isActive():
+            self._batch_timer.start()
+
+    def _flush_pending_display(self) -> None:
+        """Render a pending batch only for the currently visible journal."""
+        if (
+            not self._display_dirty
+            or self._paused
+            or not self._page_active
+            or not self.isVisible()
+        ):
+            return
+        self._rebuild()
+
     # ── приём записей из ядра ──
     def _on_entry_from_core(self, entry):
         self._entry_arrived.emit(entry)
@@ -664,20 +731,9 @@ class LogView(QWidget):
     def _add_row_ui(self, entry):
         import time as _time
         self._last_entry_ts = _time.monotonic()
-        if self._paused:
-            self._rows.append(entry)
-            if len(self._rows) > MAX_BUFFER:
-                self._rows = self._rows[-MAX_BUFFER:]
-            return
-        self._rows.append(entry)
-        if len(self._rows) > MAX_BUFFER:
-            self._rows = self._rows[-MAX_BUFFER:]
-        # если проходит фильтр — обновляем canvas (виртуально, без перестроения всех виджетов)
-        if self._passes_filter(entry):
-            # canvas рисует только видимые, поэтому просто пересобираем отфильтрованный список
-            # оптимизация: инкрементально добавлять, но проще пересобрать (быстро)
-            self._update_canvas()
-        self._update_stats()
+        self._append_row(entry)
+        self._display_dirty = True
+        self._schedule_display_flush()
 
     # ── фильтры ──
     def _passes_filter(self, entry) -> bool:
@@ -692,7 +748,7 @@ class LogView(QWidget):
             return False
         if self._filter == "fixed" and source != "fixed":
             return False
-        if self._filter == "errors" and source not in ("servfail", "bogus-NX", "blocked", "error", "leak"):
+        if self._filter == "errors" and source not in ("servfail", "bogus-NX", "blocked", "error", "leak", "dpi-error"):
             return False
         if self._filter == "cache" and source not in ("cache", "stale-cache"):
             return False
@@ -712,6 +768,14 @@ class LogView(QWidget):
             chip.setStyleSheet(self._chip_qss(k == key))
         self._rebuild()
 
+    def set_filter(self, key: str):
+        """Публичный выбор категории (фильтра) из других вкладок.
+
+        Например «fixed» — «🔧 Починки» (лечение): кнопка «📋 Лог» в виджете
+        автодиагностики ведёт сюда сразу с этой категорией (2026-10-06).
+        """
+        self._set_filter(key)
+
     def _on_search(self, text: str):
         self._search = (text or "").lower().strip()
         self._rebuild()
@@ -724,6 +788,7 @@ class LogView(QWidget):
         except Exception:
             pass
         if self._paused:
+            self._batch_timer.stop()
             self._btn_pause.set_label("▶", "Продолжить")
             self._live.setText("⏸  ПАУЗА")
             self._live.setStyleSheet(f"color:{theme.YELLOW};font-size:12px;font-weight:700;")
@@ -732,7 +797,8 @@ class LogView(QWidget):
             self._live.setText("●  LIVE")
             self._live.setStyleSheet(f"color:{theme.GREEN};font-size:12px;font-weight:700;")
             self._sync_from_core()
-            self._rebuild()
+            self._display_dirty = True
+            self._schedule_display_flush(immediate=True)
 
     # ── очистка ──
     def _clear(self):
@@ -740,7 +806,9 @@ class LogView(QWidget):
             self.qlog.clear()
         except Exception:
             pass
-        self._rows.clear()
+        self._batch_timer.stop()
+        self._row_buffer.clear()
+        self._display_dirty = False
         self._update_canvas()
         self._update_stats()
 
@@ -755,26 +823,39 @@ class LogView(QWidget):
         self._canvas.set_entries(shown)
 
     def _rebuild(self):
+        """Synchronously render an explicit user action or one coalesced batch."""
+        self._batch_timer.stop()
+        self._display_dirty = False
         self._update_canvas()
         self._update_stats()
 
+    @staticmethod
+    def _set_stat_value(card, value: int) -> bool:
+        text = str(value)
+        if card._value.text() == text:
+            return False
+        card._value.setText(text)
+        return True
+
     def _update_stats(self):
-        visible = [e for e in self._rows if getattr(e, "source", "") != "bg-refresh"]
-        total   = len(visible)
-        routed  = sum(1 for e in visible if getattr(e, "routed", False))
-        blocked = sum(1 for e in visible if getattr(e, "source", "") in ("bogus-NX", "blocked"))
-        fixed   = sum(1 for e in visible if getattr(e, "source", "") == "fixed")
-        errors  = sum(1 for e in visible if getattr(e, "source", "") in ("error", "servfail", "leak"))
-        direct  = max(0, total - routed - fixed - errors - blocked)
-        self._stat_total._value.setText(str(total))
-        self._stat_routed._value.setText(str(routed))
-        self._stat_direct._value.setText(str(direct))
-        self._stat_blocked._value.setText(str(blocked))
-        self._stat_fixed._value.setText(str(fixed))
-        self._stat_error._value.setText(str(errors))
-        # Цифры стали длиннее/короче — значит изменилась и требуемая ширина
-        # карточек: пересчитываем ужим, иначе подпись могла бы упереться в рамку.
-        self._apply_layout_mode(force=True)
+        total = max(0, self._stats["total"])
+        routed = max(0, self._stats["routed"])
+        blocked = max(0, self._stats["blocked"])
+        fixed = max(0, self._stats["fixed"])
+        errors = max(0, self._stats["errors"])
+        dpi_status = max(0, self._stats["dpi_status"])
+        direct = max(0, total - routed - fixed - errors - blocked - dpi_status)
+        changed = any((
+            self._set_stat_value(self._stat_total, total),
+            self._set_stat_value(self._stat_routed, routed),
+            self._set_stat_value(self._stat_direct, direct),
+            self._set_stat_value(self._stat_blocked, blocked),
+            self._set_stat_value(self._stat_fixed, fixed),
+            self._set_stat_value(self._stat_error, errors),
+        ))
+        # Only changed digit widths can alter the required compact layout.
+        if changed:
+            self._apply_layout_mode(force=True)
 
     # ── контекстное меню для canvas ──
     def _show_canvas_menu(self, idx: int, global_pos):
@@ -848,7 +929,8 @@ class LogView(QWidget):
         if domain and domain not in routed:
             routed.append(domain)
             save_config(cfg)
-            eng.reload_config()
+            # Новая цель вступает в силу при явном Restart routing runtime;
+            # перезапуск legacy DNS для этого не нужен.
             self._rebuild()
 
     def _block_domain(self, domain):
@@ -882,19 +964,23 @@ class LogView(QWidget):
         QGuiApplication.clipboard().setText(text)
 
     # ── синхронизация с ядром ──
-    def _sync_from_core(self):
+    def _sync_from_core(self) -> bool:
+        """Merge missed core rows into the bounded buffer without rendering them."""
         try:
             snap = self.qlog.snapshot()
         except Exception:
-            return
+            return False
         if not snap:
-            return
+            return False
         last_ts = getattr(self._rows[-1], "timestamp", 0) if self._rows else 0
         new = [e for e in snap if getattr(e, "timestamp", 0) > last_ts]
-        for e in new:
-            self._rows.append(e)
-        if len(self._rows) > MAX_BUFFER:
-            self._rows = self._rows[-MAX_BUFFER:]
+        if not new:
+            return False
+        for entry in new:
+            self._append_row(entry)
+        self._last_entry_ts = time.monotonic()
+        self._display_dirty = True
+        return True
 
     def _export_clipboard(self):
         lines = ["Время\tДомен\tТип\tМаршрут\tИсточник\tПричина\tмс"]
@@ -913,11 +999,5 @@ class LogView(QWidget):
 
     def refresh(self):
         self._sync_from_core()
-        # если ещё пусто — rebuild покажет empty, иначе обновит canvas/статы
-        if not self._rows:
-            self._rebuild()
-        else:
-            self._update_stats()
-            # canvas уже обновляется через _add_row_ui / _rebuild, но на вход на вкладку
-            # надо убедиться что фильтр применён
-            self._update_canvas()
+        self._display_dirty = True
+        self._schedule_display_flush(immediate=True)

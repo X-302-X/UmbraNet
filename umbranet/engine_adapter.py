@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 
 from core.diagnostics import log_recoverable
 
@@ -68,14 +69,18 @@ class _StubEngine:
         self.last_start_error = ""
         self.config = {
             "xbox_dns_mode": "doh",
-            "dpi_mode": "off",
+            "dpi_mode": "dpi_only",
+            "routing_mode": "dpi",
+            "selected_services": [],
+            "transport_profiles": [],
+            "transport_gateway_port": 18777,
             "fallback_dns": "8.8.8.8",
             "fallback_dns6": "2001:4860:4860::8888",
             "listen_port": 53,
             "listen_host": "127.0.0.1",
             "listen_host6": "::1",
             "enable_ipv6": True,
-            "active_dns_profile": "builtin-xbox-dns",
+            "active_dns_profile": "builtin-dns-ai",
             "user_dns_profiles": [],
             "routed_domains": ["openai.com", "chatgpt.com", "github.com", "claude.ai"],
             "routed_processes": ["chrome.exe", "msedge.exe", "firefox.exe"],
@@ -121,16 +126,13 @@ class _StubEngine:
         self.config["dpi_mode"] = mode
 
     def switch_mode(self, ui_mode: str) -> tuple:
-        """Заглушка switch_mode — всегда успешна в stub-режиме."""
-        VALID = ("dns_only", "combo", "dpi_only")
-        if ui_mode not in VALID:
+        """Compatibility stub for explicit VPN / Combo / DPI selection."""
+        aliases = {"dns_only": "vpn", "dpi_only": "dpi"}
+        selected = aliases.get(ui_mode, ui_mode)
+        if selected not in ("vpn", "combo", "dpi"):
             return False, f"Неизвестный режим '{ui_mode}'"
-        self.config["dpi_mode"] = {
-            "dns_only": "off",
-            "combo": "combo",
-            "dpi_only": "zapret",
-        }[ui_mode]
-        # Выбор режима не запускает заглушку/движок.
+        self.config["routing_mode"] = selected
+        self.config["dpi_mode"] = {"vpn": "off", "combo": "combo", "dpi": "dpi_only"}[selected]
         return True, ""
 
     def access_status(self) -> dict:
@@ -178,78 +180,275 @@ def is_real_engine() -> bool:
     return REAL_ENGINE
 
 
+_routing_runtime = None
+_routing_runtime_config = None
+# A structured start outcome is kept at the facade boundary because the legacy
+# worker contract deliberately transports only (ok, message).  It contains no
+# endpoint or credential data and is consumed once by the Qt main thread.
+_last_reserve_choice: dict[str, str] | None = None
+
+
+def _post_transport_status_changed() -> None:
+    """Queue one payload-free invalidation for controller health changes.
+
+    The controller invokes this from its worker thread.  The actual snapshot
+    stays behind ``vpn_server_statuses()`` so this boundary never carries
+    endpoints, credentials, or raw probe diagnostics into the UI queue.
+    """
+    global _transport_status_event_pending
+    with _transport_status_event_lock:
+        if _transport_status_event_pending:
+            return
+        _transport_status_event_pending = True
+    if not post_event({"type": "transport_status_changed"}):
+        with _transport_status_event_lock:
+            _transport_status_event_pending = False
+
+
+def sync_routing_runtime_config(*, force: bool = False) -> None:
+    """Rebind a live routing owner without restarting the legacy DNS engine.
+
+    ``force`` applies live-safe settings after an in-place config edit. Route,
+    profile and strategy snapshots remain owned by the current session until an
+    explicit Restart.
+    """
+    global _routing_runtime_config
+    if _routing_runtime is None:
+        return
+    config = getattr(get_engine(), "config", {}) or {}
+    if force or _routing_runtime_config is not config:
+        _routing_runtime.reconfigure(config)
+        _routing_runtime_config = config
+
+
+def get_routing_runtime():
+    """Return the DNS-independent owner for the active VPN / Combo / DPI session."""
+    global _routing_runtime, _routing_runtime_config
+    config = getattr(get_engine(), "config", {}) or {}
+    if _routing_runtime is None:
+        from core.routing_runtime import RoutingRuntime
+        _routing_runtime = RoutingRuntime(
+            config,
+            transport_status_listener=_post_transport_status_changed,
+        )
+        _routing_runtime_config = config
+    else:
+        sync_routing_runtime_config()
+    return _routing_runtime
+
+
+def routing_running() -> bool:
+    try:
+        return bool(get_routing_runtime().snapshot().get("running"))
+    except Exception:
+        return False
+
+
+def routing_vpn_block_message() -> str:
+    """Explain a live strict block without calling it a successful VPN exit."""
+    try:
+        snapshot = get_routing_runtime().snapshot()
+        if not snapshot.get("running"):
+            return ""
+        targets = snapshot.get("targets", {})
+        vpn_domains = targets.get("vpn", []) if isinstance(targets, dict) else []
+        vpn = snapshot.get("vpn", {})
+        controller = vpn.get("controller") if isinstance(vpn, dict) else None
+        active_id = controller.get("active_id", "") if isinstance(controller, dict) else ""
+        if vpn_domains and not active_id:
+            return "VPN: нет готового сервера — выбранные VPN-сервисы заблокированы"
+    except Exception:
+        pass
+    return ""
+
+
+def start_routing_runtime() -> tuple[bool, str]:
+    """Start Routing and retain a one-shot manual-reserve proposal for the UI."""
+    global _last_reserve_choice
+    result = get_routing_runtime().start()
+    if bool(getattr(result, "reserve_choice_required", False)):
+        _last_reserve_choice = {
+            "failed_profile_id": str(getattr(result, "failed_profile_id", "") or ""),
+            "failed_profile_name": str(getattr(result, "failed_profile_name", "") or ""),
+            "suggested_profile_id": str(getattr(result, "suggested_profile_id", "") or ""),
+            "suggested_profile_name": str(getattr(result, "suggested_profile_name", "") or ""),
+        }
+    else:
+        _last_reserve_choice = None
+    return bool(result.ok), str(result.message)
+
+
+def take_vpn_reserve_choice() -> dict[str, str] | None:
+    """Return and clear a pending UI-only reserve decision."""
+    global _last_reserve_choice
+    proposal = _last_reserve_choice
+    _last_reserve_choice = None
+    return dict(proposal) if proposal else None
+
+
+def select_vpn_server_for_next_start(profile_id: str) -> tuple[bool, str]:
+    """Persist an explicit server selected by the person for the next start.
+
+    This performs no networking and is shared by the reserve-confirmation path
+    and normal server selection.  Empty id remains the Auto policy.
+    """
+    selected = str(profile_id or "").strip()
+    try:
+        from core.vpn.profiles import profiles_from_config
+        engine = get_engine()
+        config = getattr(engine, "config", {}) or {}
+        if selected:
+            profiles = profiles_from_config(config)
+            match = next((profile for profile in profiles if profile.id == selected and profile.enabled), None)
+            if match is None:
+                return False, "Выбранный VPN-сервер больше недоступен в настройках"
+        config["transport_primary_profile_id"] = selected
+        save_config(config)
+        sync_routing_runtime_config(force=True)
+        return True, "Выбран VPN-сервер для следующего запуска" if selected else "Включён автоматический выбор VPN-сервера"
+    except Exception as exc:
+        return False, f"Не удалось сохранить выбор VPN-сервера: {exc}"
+
+
+def vpn_protocol_capabilities() -> list[dict[str, object]]:
+    """Public non-secret protocol capability map owned by VPN core.
+
+    This is intentionally a display/readiness surface only.  A protocol shown
+    as requiring a backend or native integration is not imported, selected, or
+    started by the UI.
+    """
+    try:
+        snapshot = get_routing_runtime().snapshot()
+        vpn = snapshot.get("vpn", {}) if isinstance(snapshot, dict) else {}
+        protocols = vpn.get("protocols", []) if isinstance(vpn, dict) else []
+        return [dict(item) for item in protocols if isinstance(item, dict)]
+    except Exception:
+        return []
+
+
+def vpn_server_statuses() -> dict[str, dict[str, object]]:
+    """Public, non-secret last/live readiness state keyed by server id."""
+    try:
+        snapshot = get_routing_runtime().snapshot()
+        vpn = snapshot.get("vpn", {}) if isinstance(snapshot, dict) else {}
+        controller = vpn.get("server_statuses") if isinstance(vpn, dict) else None
+        routes = controller.get("routes", []) if isinstance(controller, dict) else []
+        live = bool(vpn.get("running")) if isinstance(vpn, dict) else False
+        result: dict[str, dict[str, object]] = {}
+        for route in routes:
+            if not isinstance(route, dict) or not str(route.get("id") or ""):
+                continue
+            # The status channel is intentionally narrower than a transport
+            # profile.  A card needs its friendly name and probe state, never
+            # host/port, credentials, a probe URL, or a raw network exception.
+            probe = route.get("probe")
+            safe_probe = {
+                "ok": bool(probe.get("ok")),
+                "stage": str(probe.get("stage", "") or ""),
+                "latency_ms": probe.get("latency_ms"),
+                "exit_country": str(probe.get("exit_country", "") or ""),
+                "service_tls_ok": bool(probe.get("service_tls_ok")),
+            } if isinstance(probe, dict) else None
+            profile_id = str(route["id"])
+            result[profile_id] = {
+                "id": profile_id,
+                "name": str(route.get("name", "") or profile_id),
+                "state": str(route.get("state", "") or ""),
+                "failures": int(route.get("failures", 0) or 0),
+                "last_checked_at": route.get("last_checked_at"),
+                "active_since": route.get("active_since"),
+                "probe": safe_probe,
+                "live": live,
+            }
+        return result
+    except Exception:
+        return {}
+
+
+def stop_routing_runtime() -> tuple[bool, str]:
+    return get_routing_runtime().stop()
+
+
+def routing_mode_is_explicit() -> bool:
+    """Return whether top-level mode has a valid user-facing state.
+
+    Empty legacy maps receive DPI as their first-run default, so the UI must
+    render DPI rather than an unselected trio while migration is still pending.
+    """
+    config = getattr(get_engine(), "config", {}) or {}
+    selected = str(config.get("routing_mode", "") or "").strip().lower()
+    return selected in {"", "vpn", "combo", "dpi"}
+
+
+def routing_start_readiness() -> tuple[bool, str]:
+    """Check only local configuration prerequisites; network checks happen on Start."""
+    try:
+        from core.vpn.profiles import profiles_from_config
+        from core.routing_runtime import split_routing_targets
+        config = getattr(get_engine(), "config", {}) or {}
+        selected = str(config.get("routing_mode", "") or "").strip().lower()
+        if selected not in {"vpn", "combo", "dpi"}:
+            # Config files normally receive this through schema v11 migration.
+            # Keep the first-run DPI default true for a lightweight/injected
+            # engine too, so UI and runtime never disagree about an empty mode.
+            config["routing_mode"] = "dpi"
+            config["dpi_mode"] = "dpi_only"
+        targets = split_routing_targets(config)
+        if not targets.vpn_domains and not targets.dpi_domains:
+            return False, "Выберите хотя бы один сервис или домен в «Маршрутизация»."
+        if targets.vpn_domains and not any(profile.enabled for profile in profiles_from_config(config)):
+            return False, "Добавьте хотя бы один включённый VPN-сервер на странице «👁️ Сервера»."
+        return True, ""
+    except Exception as exc:
+        return False, f"Не удалось проверить настройки маршрута: {exc}"
+
+
 def switch_mode(ui_mode: str) -> tuple:
     """
     Атомарное переключение режимов UmbraNet через адаптер.
 
     ui_mode:
-      'dns_only' — DNS-сервер включён, DPI выключен (синий)
-      'combo'    — DNS + DPI в режиме split+fake (чёрный)
-      'dpi_only' — DNS + DPI в режиме zapret (красный)
+      'vpn'   — PAC/gateway для выбранных VPN-целей (синий)
+      'combo' — PAC для AI/ручных целей + DPI для DPI-целей (чёрный)
+      'dpi'   — только e1-spike для выбранных целей (красный)
 
-    Возвращает (ok: bool, error: str). UI вызывает только этот метод
-    для смены режима — не трогает start()/stop()/set_dpi_mode() напрямую.
-
-    C1 guard: раньше Combo/DPI Only без целей блокировались на переключении.
-    Теперь переключение разрешено всегда — блокируется только Старт (кнопка
-    серая + диалог), чтобы пользователь мог спокойно листать режимы без выбранных
-    доменов, но не мог запустить программу впустую.
+    Old ``dns_only`` and ``dpi_only`` values are accepted only as input aliases
+    for upgrade compatibility.  Selection never starts or stops a runtime.
     """
-    # ── C1: переключение режимов теперь ВСЕГДА разрешено ──────────────────
-    if ui_mode in ("combo", "dpi_only"):
-        try:
-            if not get_dpi_targets():
-                log.info("switch_mode(%s): hostlist пуст — переключение разрешено, но Старт будет заблокирован", ui_mode)
-        except Exception as exc:
-            log_recoverable(log, 'Не удалось проверить DPI-цели при переключении режима', exc, level=logging.DEBUG)
-    eng = get_engine()
+    aliases = {"dns_only": "vpn", "dpi_only": "dpi"}
+    selected = aliases.get(str(ui_mode or "").strip().lower(), str(ui_mode or "").strip().lower())
+    if selected not in ("vpn", "combo", "dpi"):
+        error = f"Неизвестный режим '{ui_mode}'"
+        post_event({"type": "error", "message": error})
+        return False, error
     try:
-        ok, err = eng.switch_mode(ui_mode)
-        if ok:
-            post_event({"type": "mode_changed", "mode": ui_mode})
-            # Мы больше не отправляем status_changed отсюда, чтобы не сбивать
-            # статус в UI (особенно если параллельно идет остановка сервера).
-        else:
-            post_event({"type": "error", "message": err})
-        return ok, err
-    except AttributeError:
-        # Ядро старой версии без switch_mode — graceful fallback
-        log.warning("switch_mode недоступен в ядре, используем ручное переключение")
-        try:
-            # fallback тоже разрешает переключение без целей — старт заблокируем отдельно
-            MODE_MAP = {"dns_only": "off", "combo": "combo", "dpi_only": "zapret"}
-            dpi_mode = MODE_MAP.get(ui_mode, "off")
-            eng.set_dpi_mode(dpi_mode)
-            post_event({"type": "mode_changed", "mode": ui_mode})
-            return True, ""
-        except Exception as exc:
-            post_event({"type": "error", "message": str(exc)})
-            return False, str(exc)
+        eng = get_engine()
+        config = getattr(eng, "config", {}) or {}
+        config["routing_mode"] = selected
+        # Kept only so legacy diagnostics and config rollback retain meaning.
+        config["dpi_mode"] = {"vpn": "off", "combo": "combo", "dpi": "dpi_only"}[selected]
+        if type(eng).__module__ == "dns_server":
+            save_config(config)
+        post_event({"type": "mode_changed", "mode": selected})
+        return True, ""
     except Exception as exc:
-        # Убираем пост в event-queue ошибки при смене режима:
-        # мы возвращаем err, и GUI сам решит показывать её или нет, 
-        # чтобы избежать всплывающих красных табличек.
-        log.error("switch_mode(%s) ошибка: %s", ui_mode, exc)
+        log.error("switch_mode(%s) ошибка: %s", selected, exc)
+        post_event({"type": "error", "message": str(exc)})
         return False, str(exc)
 
 
 def get_current_mode() -> str:
-    """
-    Возвращает текущий UI-режим: 'dns_only' | 'combo' | 'dpi_only' | 'off'.
-    Определяется по конфигу движка.
-    """
+    """Return the explicit top-level mode: ``vpn``, ``combo``, or ``dpi``."""
     try:
-        cfg = get_engine().config
-        dpi = cfg.get("dpi_mode", "off")
-        if dpi == "off":
-            return "dns_only"
-        if dpi == "combo":
-            return "combo"
-        if dpi == "zapret":
-            return "dpi_only"
-        return "dns_only"
+        cfg = getattr(get_engine(), "config", {}) or {}
+        if "routing_mode" in cfg:
+            selected = str(cfg.get("routing_mode", "")).strip().lower()
+            return selected if selected in ("vpn", "combo", "dpi") else "dpi"
+        # Read-only fallback before config schema v6 has written its migration.
+        legacy = str(cfg.get("dpi_mode", "off")).strip().lower()
+        return {"combo": "combo", "dpi_only": "dpi"}.get(legacy, "dpi")
     except Exception:
-        return "dns_only"
+        return "vpn"
 
 
 # ── DPI hostlist guard (C1: «Не стрелять себе в ногу») ───────────────────────
@@ -285,7 +484,7 @@ def count_dpi_targets(cfg: dict | None = None) -> int:
 
 def _dpi_guard_error_text() -> str:
     return (
-        "Для режимов Combo / DPI Only нужны цели: включите хотя бы один сервис "
+        "Для режимов Combo / DPI нужны цели: включите хотя бы один сервис "
         "или добавьте домен в «Маршрутизация» → «Диспетчер задач». "
         "Без целей WinWS не должен касаться всего трафика."
     )
@@ -305,11 +504,12 @@ def get_active_dns_profile(cfg: dict) -> dict:
         from profile_utils import get_active_dns_profile as _g  # type: ignore
         return _g(cfg)
     except Exception:
-        return {"id": cfg.get("active_dns_profile", "builtin-xbox-dns"),
-                "name": "xbox-dns.ru (заглушка)", "ipv4_primary": "176.99.11.77",
-                "ipv4_secondary": "176.99.11.88", "ipv6_primary": "", "ipv6_secondary": "",
-                "doh_url": "https://xbox-dns.ru/dns-query", "dot_host": "xbox-dns.ru",
-                "dot_port": 853, "doq_host": "xbox-dns.ru", "doq_port": 853, "dnscrypt_stamp": ""}
+        return {"id": cfg.get("active_dns_profile", "builtin-dns-ai"),
+                "name": "DNS-AI (заглушка)", "ipv4_primary": "194.87.196.13",
+                "ipv4_secondary": "186.246.49.127", "ipv6_primary": "2a00:b700:5::3:62",
+                "ipv6_secondary": "2a0a:2b41:0:500d::53",
+                "doh_url": "https://dns.dns-ai.ru/dns-query", "dot_host": "dns.dns-ai.ru",
+                "dot_port": 853, "doq_host": "dns.dns-ai.ru", "doq_port": 853, "dnscrypt_stamp": ""}
 
 
 def get_all_dns_profiles(cfg: dict) -> list:
@@ -347,7 +547,7 @@ def profile_builtin_id() -> str:
         from profile_utils import BUILTIN_PROFILE_ID  # type: ignore
         return BUILTIN_PROFILE_ID
     except Exception:
-        return "builtin-xbox-dns"
+        return "builtin-dns-ai"
 
 
 def get_profile_by_id(cfg: dict, pid: str):
@@ -389,26 +589,30 @@ def probe_host(host: str, port: int = 53, timeout: float = 2.5):
         return False, None
 
 
-def probe_doh(url: str, timeout: float = 4.0):
-    """Возвращает (ok: bool, latency_ms: int|None)."""
-    import time
-    if not url:
-        return False, None
+def probe_doh_detail(url: str, timeout: float = 4.0, connect_ip: str | None = None):
+    """Проверяет DoH и возвращает ``(ok, latency_ms, понятная_причина)``."""
     try:
-        import base64
+        from endpoint_probe import probe_doh_endpoint  # type: ignore
+        result = probe_doh_endpoint(url, timeout=timeout, connect_ip=connect_ip)
+        return result.ok, result.latency_ms, result.detail
+    except Exception as exc:
+        return False, None, f"DoH: {exc}"
 
-        import requests
-        from dnslib import DNSRecord
-        req = DNSRecord.question("google.com", "A")
-        b64 = base64.urlsafe_b64encode(req.pack()).rstrip(b"=").decode()
-        t0 = time.perf_counter()
-        resp = requests.get(url, headers={"Accept": "application/dns-message"},
-                            params={"dns": b64}, timeout=timeout)
-        resp.raise_for_status()
-        DNSRecord.parse(resp.content)
-        return True, int((time.perf_counter() - t0) * 1000)
-    except Exception:
-        return False, None
+
+def probe_doh(url: str, timeout: float = 4.0):
+    """Совместимый короткий результат DoH-проверки для прежних вызовов UI."""
+    ok, latency_ms, _detail = probe_doh_detail(url, timeout=timeout)
+    return ok, latency_ms
+
+
+def probe_profile_dns_endpoint(profile: dict, endpoint: str, timeout: float = 4.0):
+    """Проверяет IP из профиля выбранным в самом профиле DNS-транспортом."""
+    try:
+        from endpoint_probe import probe_profile_endpoint  # type: ignore
+        result = probe_profile_endpoint(profile, endpoint, timeout=timeout)
+        return result.ok, result.latency_ms, result.detail
+    except Exception as exc:
+        return False, None, f"DNS endpoint: {exc}"
 
 
 def get_routed_preset_map() -> dict:
@@ -667,8 +871,8 @@ def get_startup_health() -> dict:
                 from core.dpi.winws_engine import get_winws_engine
                 if not get_winws_engine().is_available():
                     problems.append(
-                        "Режим DPI включен, но winws.exe не найден в папке bin/. "
-                        "Скачайте релиз zapret (winws) и поместите winws.exe в UmbraNet1/bin/ "
+                        "Режим DPI включен, но e1-spike.exe не найден в папке bin/. "
+                        "Поместите e1-spike.exe в папку bin/ рядом с программой "
                         "или переключитесь в режим 'Только DNS'."
                     )
         except Exception as exc:
@@ -730,12 +934,11 @@ def get_startup_health() -> dict:
 def set_dns_to_localhost(fallback_ipv4: str = "1.1.1.1",
                          fallback_ipv6: str = "",
                          enable_ipv6: bool = True) -> tuple:
-    """Прописывает системный DNS Windows на 127.0.0.1 (наш локальный сервер).
+    """Legacy/diagnostic helper that points Windows DNS to 127.0.0.1.
 
-    Вызывается после успешного engine.start() — именно это переключает
-    трафик браузера через наш DNS-сервер. Без этого вызова DNS-сервер
-    работает, но Windows его игнорирует и продолжает слать запросы
-    напрямую к провайдеру.
+    It is never called by the VPN / Combo / DPI lifecycle. Only an explicit
+    diagnostic or recovery action may use it; PAC routing does not depend on
+    local DNS or this system-wide change.
 
     Возвращает (ok: bool, message: str, adapters: list).
     """
@@ -789,40 +992,40 @@ def dpi_available() -> tuple[bool, str]:
         from core.dpi.winws_engine import get_winws_engine  # type: ignore
         engine = get_winws_engine()
         if not engine.is_available():
-            return False, f"winws.exe не найден: {engine.exe_path}"
+            return False, f"e1-spike.exe не найден: {engine.exe_path}"
         return True, ""
     except Exception as exc:
         return False, str(exc)
 
 
 def mode_info(ui_mode: str | None = None) -> dict:
-    """Человекочитаемое описание режима DNS Only / Combo / DPI Only."""
+    """Human-readable description of the explicit VPN / Combo / DPI modes."""
     ui_mode = ui_mode or get_current_mode()
     dpi_ok, dpi_reason = dpi_available()
     data = {
-        "dns_only": {
-            "title": "DNS Only",
+        "vpn": {
+            "title": "VPN",
             "emoji": "⚙",
-            "summary": "Стабильный основной режим",
-            "details": "Локальный DNS, маршрутизация доменов, DoH/DoT/DoQ/DNSCrypt, bogus-IP, blocklist/allowlist. DPI выключен.",
+            "summary": "Проверенный выход для выбранных сервисов",
+            "details": "PAC направляет только выбранные домены в локальный gateway и далее в настроенный HTTP CONNECT/SOCKS5 выход. Нет готового выхода — нет прямого fallback.",
             "warning": "",
         },
         "combo": {
             "title": "Combo",
             "emoji": "⚡",
-            "summary": "DNS + DPI combo",
-            "details": "DNS-функции остаются активны, сверху включается DPI-движок в мягком combo-режиме.",
-            "warning": "" if dpi_ok else f"DPI сейчас недоступен: {dpi_reason}. DNS-часть всё равно будет работать.",
+            "summary": "VPN для AI и DPI для медиа/игр",
+            "details": "AI и вручную добавленные сервисы идут через PAC/VPN; YouTube, Discord и другие DPI-цели — через e1-spike без локального DNS-перехвата.",
+            "warning": "" if dpi_ok else f"DPI сейчас недоступен: {dpi_reason}. VPN-часть можно использовать отдельно.",
         },
-        "dpi_only": {
-            "title": "DPI Only",
+        "dpi": {
+            "title": "DPI",
             "emoji": "🛡",
-            "summary": "Агрессивный DPI-режим",
-            "details": "DNS остаётся для резолва и журнала запросов, DPI работает в режиме zapret. Используйте, если DNS Only/Combo не помогает.",
-            "warning": "" if dpi_ok else f"DPI сейчас недоступен: {dpi_reason}. Проверьте bin/winws.exe и поставляемые с ним файлы WinDivert.",
+            "summary": "Только e1-spike для выбранных целей",
+            "details": "Выбранные домены обрабатываются DPI-стратегией напрямую; PAC/VPN не включается.",
+            "warning": "" if dpi_ok else f"DPI сейчас недоступен: {dpi_reason}. Проверьте bin/e1-spike.exe и WinDivert.",
         },
     }
-    return data.get(ui_mode, data["dns_only"])
+    return data.get(ui_mode, data["vpn"])
 
 
 # ── Диагностика / системный DNS ─────────────────────────────────────────────
@@ -844,6 +1047,14 @@ def get_current_dns() -> dict:
 
 
 def flush_dns_cache() -> bool:
+    """Обновляет кэши UmbraNet и Windows одним безопасным действием UI."""
+    try:
+        engine = get_engine()
+        clear_runtime = getattr(engine, "clear_dns_cache", None)
+        if callable(clear_runtime):
+            clear_runtime("запрос из интерфейса")
+    except Exception as exc:
+        log.warning("Не удалось очистить DNS-кэш UmbraNet: %s", exc)
     try:
         from process_monitor import flush_dns_cache as _g  # type: ignore
         return bool(_g())
@@ -1220,17 +1431,18 @@ def resolve_process_exes(names, interrupt=None) -> dict:
         return {}
 
 
-# DoH-URL встроенного профиля xbox-dns.ru (для окна «Тест DNS»).
+# URL основного встроенного профиля. Xbox остаётся доступен отдельным профилем.
+DEFAULT_DOH_URL = "https://dns.dns-ai.ru/dns-query"
 XBOX_DOH_URL = "https://xbox-dns.ru/dns-query"
 
 
 def active_doh_url() -> str:
-    """DoH-URL активного профиля, иначе xbox-dns.ru."""
+    """DoH URL активного профиля, иначе DNS-AI как основной встроенный."""
     try:
         prof = get_active_dns_profile(get_engine().config)
-        return (prof or {}).get("doh_url") or XBOX_DOH_URL
+        return (prof or {}).get("doh_url") or DEFAULT_DOH_URL
     except Exception:
-        return XBOX_DOH_URL
+        return DEFAULT_DOH_URL
 
 
 def resolve_system(domain: str, timeout: float = 4.0):
@@ -1245,39 +1457,27 @@ def resolve_system(domain: str, timeout: float = 4.0):
         return None, str(exc)
 
 
-def resolve_doh(domain: str, doh_url: str, timeout: float = 5.0):
-    """Резолв домена через DoH (json, затем wireformat). (ips|None, ms|error_str)."""
-    import base64
+def resolve_doh(
+    domain: str,
+    doh_url: str,
+    timeout: float = 5.0,
+    connect_ip: str | None = None,
+):
+    """Резолвит A-записи через DoH без рекурсивного поиска имени апстрима."""
     import time
     try:
-        import requests
         from dnslib import DNSRecord
-    except Exception as exc:
-        return None, f"нет библиотек: {exc}"
-    # JSON-форма
-    try:
-        t0 = time.perf_counter()
-        resp = requests.get(doh_url, headers={"Accept": "application/dns-json"},
-                            params={"name": domain, "type": "A"}, timeout=timeout)
-        if resp.status_code == 200 and "json" in resp.headers.get("content-type", ""):
-            ms = int((time.perf_counter() - t0) * 1000)
-            ips = [a["data"] for a in resp.json().get("Answer", []) if a.get("type") == 1]
-            if ips:
-                return ips, ms
-    except Exception as exc:
-        log_recoverable(log, 'Диагностический DoH-запрос не удался; пробуем резервный путь', exc, level=logging.DEBUG)
-    # wireformat
-    try:
-        t0 = time.perf_counter()
-        req = DNSRecord.question(domain, "A")
-        b64 = base64.urlsafe_b64encode(req.pack()).rstrip(b"=").decode()
-        resp = requests.get(doh_url, headers={"Accept": "application/dns-message"},
-                            params={"dns": b64}, timeout=timeout)
-        resp.raise_for_status()
-        ms = int((time.perf_counter() - t0) * 1000)
-        rec = DNSRecord.parse(resp.content)
-        ips = [str(rr.rdata) for rr in rec.rr if rr.rtype == 1]
-        return ips, ms
+        from endpoint_probe import query_doh_record  # type: ignore
+        started = time.perf_counter()
+        response, _transport = query_doh_record(
+            doh_url,
+            DNSRecord.question(domain, "A"),
+            timeout=timeout,
+            connect_ip=connect_ip,
+        )
+        latency = int((time.perf_counter() - started) * 1000)
+        ips = [str(answer.rdata) for answer in response.rr if answer.rtype == 1]
+        return ips, latency
     except Exception as exc:
         return None, str(exc)
 
@@ -1444,6 +1644,29 @@ def set_auto_transport(enabled: bool) -> None:
     _patch_ui_state("auto_transport", bool(enabled))
 
 
+def get_doctor_notify() -> bool:
+    """Показывать ли фоновые уведомления Автодоктора/аудита (2026-10-06).
+
+    Жалоба пользователя: «постоянные уведомления, которые нельзя отключить».
+    Галочка живёт в umbranet_ui.json (поле doctor_notify), по умолчанию выкл.
+    Уже сохранённый ручной выбор пользователя не меняется.
+    """
+    try:
+        import ui_state as _us
+        return bool(_us.get_value("doctor_notify", False))
+    except Exception:
+        return False
+
+
+def set_doctor_notify(value: bool) -> None:
+    """Сохраняет состояние галочки «Уведомления» в виджете лечения."""
+    try:
+        import ui_state as _us
+        _us.update_state(doctor_notify=bool(value))
+    except Exception:
+        pass
+
+
 def get_nav_order(default_keys: list[str]) -> list[str]:
     """Возвращает сохранённый порядок вкладок бокового меню.
 
@@ -1542,7 +1765,9 @@ def measure_transports() -> dict:
 
     doh = (prof or {}).get("doh_url")
     if doh:
-        ok, ms = probe_doh(doh)
+        ok, ms, _detail = probe_doh_detail(
+            doh, connect_ip=(prof or {}).get("ipv4_primary") or None
+        )
         if ok and ms is not None:
             results["doh"] = ms
 
@@ -1683,26 +1908,13 @@ def probe_tcp(host: str, port: int = 53, timeout: float = 2.5):
         return False, None, str(exc)
 
 
-def probe_doh_diag(url: str, timeout: float = 4.0):
-    """DoH-проверка (wireformat). Возвращает (ok, latency_ms|None, comment)."""
-    import time
-    if not url:
-        return False, None, "не задан"
-    try:
-        import base64
-
-        import requests
-        from dnslib import DNSRecord
-        req = DNSRecord.question("google.com", "A")
-        b64 = base64.urlsafe_b64encode(req.pack()).rstrip(b"=").decode()
-        t0 = time.perf_counter()
-        resp = requests.get(url, headers={"Accept": "application/dns-message"},
-                            params={"dns": b64}, timeout=timeout)
-        resp.raise_for_status()
-        DNSRecord.parse(resp.content)
-        return True, int((time.perf_counter() - t0) * 1000), "DoH доступен"
-    except Exception as exc:
-        return False, None, str(exc)
+def probe_doh_diag(
+    url: str,
+    timeout: float = 4.0,
+    connect_ip: str | None = None,
+):
+    """DoH-проверка с транспортом и причиной ошибки для диагностики."""
+    return probe_doh_detail(url, timeout=timeout, connect_ip=connect_ip)
 
 
 def run_diagnostics() -> list:
@@ -1748,7 +1960,9 @@ def run_diagnostics() -> list:
         rows.append(("Профиль UDP IPv6", "INFO", None, "не задан"))
 
     if prof.get("doh_url"):
-        ok, ms, c = probe_doh_diag(prof["doh_url"])
+        ok, ms, c = probe_doh_diag(
+            prof["doh_url"], connect_ip=prof.get("ipv4_primary") or None
+        )
         rows.append(("Профиль DoH", "OK" if ok else "FAIL", ms, c))
     else:
         rows.append(("Профиль DoH", "INFO", None, "не задан"))
@@ -1788,24 +2002,38 @@ def run_diagnostics() -> list:
 import queue as _queue
 
 _event_queue: _queue.Queue = _queue.Queue(maxsize=256)
+# Route health may change on a worker thread. One pending invalidation is
+# enough: when the UI drains it, it always reads the newest sanitized snapshot.
+_transport_status_event_lock = threading.Lock()
+_transport_status_event_pending = False
 
 
-def post_event(event: dict) -> None:
-    """Кладёт событие в очередь. Вызывается из любого потока."""
+def post_event(event: dict) -> bool:
+    """Кладёт событие в очередь. Вызывается из любого потока.
+
+    ``False`` lets coalesced producers release their pending marker if a full
+    queue rejected the event; older callers may continue to ignore the return.
+    """
     try:
         _event_queue.put_nowait(event)
+        return True
     except _queue.Full:
-        pass  # переполнение — старые события дропаем молча
+        return False  # переполнение — старые события дропаем молча
 
 
 def drain_events() -> list:
     """Забирает все накопившиеся события. Вызывать из UI-потока (QTimer)."""
+    global _transport_status_event_pending
     events = []
     while True:
         try:
-            events.append(_event_queue.get_nowait())
+            event = _event_queue.get_nowait()
         except _queue.Empty:
             break
+        events.append(event)
+        if isinstance(event, dict) and event.get("type") == "transport_status_changed":
+            with _transport_status_event_lock:
+                _transport_status_event_pending = False
     return events
 
 
@@ -1825,11 +2053,15 @@ def normalize_domain(value: str) -> str:
     return d.rstrip(".")
 
 
-def get_current_dns_settings() -> dict:
-    """Текущие DNS-адреса Windows по адаптерам. На других ОС — пустой dict."""
+def get_current_dns_settings(use_cache: bool = True) -> dict:
+    """Текущие DNS-адреса Windows по адаптерам. На других ОС — пустой dict.
+
+    use_cache=False — свежее чтение (аудит после Стопа обязан видеть реальное
+    состояние, а не кэш пятилетней давности — поле 2026-10-06).
+    """
     try:
         from process_monitor import get_current_dns as _g  # type: ignore
-        return _g() or {}
+        return _g(use_cache=use_cache) or {}
     except Exception:
         return {}
 
@@ -2080,12 +2312,14 @@ def diagnose_domain(domain: str) -> dict:
     doh_url = prof.get("doh_url") or active_doh
     doh_ips, doh_ms = (None, None)
     if doh_url:
-        doh_ips, doh_ms = resolve_doh(d, doh_url)
+        doh_ips, doh_ms = resolve_doh(
+            d, doh_url, connect_ip=prof.get("ipv4_primary") or None
+        )
         if doh_ips:
             add("ok", "Активный DoH-профиль отвечает", f"{doh_ms} мс → {', '.join(doh_ips[:5])}")
         else:
             add("warn", "Активный DoH-профиль не ответил", str(doh_ms))
-            actions.append("Попробуйте другой DNS-профиль или транспорт в «DNS-профили».")
+            actions.append("Проверьте параметры DoH и доступность upstream в диагностике сети.")
 
     sys_ips, sys_ms = resolve_system(d)
     if sys_ips:
@@ -2463,6 +2697,81 @@ def network_restore_latest() -> tuple[bool, str]:
         return False, str(exc)
 
 
+def verify_teardown() -> dict:
+    """Проверка ПОСЛЕ остановки: не осталось ли хвостов, которые «продолжают работать».
+
+    Зачем: раньше после «Стоп» никто не проверял итог. Пользователь видел, что
+    обход всё ещё работает, а «лечение» не находило ничего — потому что смотреть
+    было не на что. Аудит отвечает на два вопроса:
+      1) не остался ли наш winws.exe (он держит WinDivert и продолжает обработку
+         трафика — прямой механизм «Стоп нажат, а обход живёт»);
+      2) вернулся ли системный DNS к настройкам пользователя (не остался ли
+         захваченным наш 127.0.0.1 — тогда резолв уходит на fallback-резолвер
+         и сайты «продолжают работать» уже без движка).
+    Чужие winws.exe — только заметка: это не наши хвосты.
+    Ничего не чинит сам — только докладывает (лог + журнал запросов + событие UI).
+    """
+    report = {
+        "ok": True,
+        "problems": [],
+        "notes": [],
+        "winws_own": [],
+        "winws_foreign": [],
+        "dns_localhost_adapters": [],
+    }
+
+    # 1) Наши winws.exe.
+    try:
+        from winws_engine import get_winws_engine  # type: ignore
+        w = get_winws_engine()
+        own = []
+        if w and hasattr(w, "scan_own_processes"):
+            own, _scanned = w.scan_own_processes()
+        report["winws_own"] = [{"pid": p, "path": str(path)} for p, path in own]
+        if own:
+            report["ok"] = False
+            report["problems"].append(
+                "после остановки работает winws.exe нашей установки: "
+                + ", ".join(f"PID {p}" for p, _ in own[:3])
+                + " — обход мог продолжать работать"
+            )
+        if w and hasattr(w, "foreign_processes"):
+            foreign = w.foreign_processes() or []
+            if foreign:
+                report["winws_foreign"] = [{"pid": p, "path": str(path)} for p, path in foreign[:5]]
+                report["notes"].append(
+                    "рядом работают чужие winws.exe (сторонние DPI-программы): "
+                    + ", ".join(f"PID {p}" for p, _ in foreign[:3])
+                )
+    except Exception as exc:
+        log_recoverable(log, 'Аудит остановки: не удалось проверить процессы winws', exc, level=logging.WARNING)
+
+    # 2) Системный DNS: не остался ли захваченным. Читаем СВЕЖЕЕ состояние —
+    # кэш чтения врёт после недавнего восстановления (поле 2026-10-06).
+    try:
+        dns = get_current_dns_settings(use_cache=False) or {}
+        leftovers = []
+        for name, vals in dns.items():
+            if not isinstance(vals, dict):
+                continue
+            servers = [str(s).strip() for s in (vals.get("ipv4") or [])]
+            servers += [str(s).strip() for s in (vals.get("ipv6") or [])]
+            if any(s in ("127.0.0.1", "::1") for s in servers):
+                leftovers.append(str(name))
+        report["dns_localhost_adapters"] = leftovers
+        if leftovers:
+            report["ok"] = False
+            report["problems"].append(
+                "системный DNS всё ещё указывает на UmbraNet: "
+                + ", ".join(leftovers[:3])
+                + " — резолв может уходить на fallback-резолвер"
+            )
+    except Exception as exc:
+        log_recoverable(log, 'Аудит остановки: не удалось прочитать системный DNS', exc, level=logging.WARNING)
+
+    return report
+
+
 def network_snapshot_info() -> dict:
     """Информация о последнем снапшоте сети (для тултипа кнопки отката)."""
     try:
@@ -2724,6 +3033,17 @@ def _dpi_write_ai_strategy_from_variant(variant: dict, score: dict, generation_d
         existing_items = m.list_strategies(enabled_only=False)
         if len(existing_items) >= DPI_STRATEGY_LIMIT:
             return False, f"Достигнут лимит: максимум {DPI_STRATEGY_LIMIT} стратегий", ""
+        # Ворота сохранения (последний рубеж): поломанная стратегия не пишется.
+        from ai_strategy.validate import validate_strategy_args  # type: ignore
+        vres = validate_strategy_args(
+            list(variant.get("args", []) or []),
+            bin_dir=m.strategies_dir.parent / "bin",
+        )
+        if not vres.get("ok"):
+            return False, (
+                "Отказ сохранения — стратегия структурно поломана: "
+                + "; ".join(vres.get("problems") or [])
+            ), ""
         n = _dpi_next_strategy_number(existing_items)
         if not n:
             return False, f"Нет свободных Uz-слотов: максимум Uz{DPI_STRATEGY_LIMIT}", ""
@@ -2804,6 +3124,78 @@ def dpi_strategy_ai_cleanup_runtime() -> dict:
     return {"stopped": stopped, "errors": errors}
 
 
+def _dpi_local_port_conflicts(ports=(53,)) -> tuple[list[dict], str]:
+    """Возвращает локальные TCP LISTEN и UDP bind-сокеты на проверяемых портах.
+
+    Для генерации важен локальный DNS-порт 53. 443 проверять как «занятый
+    локальный порт» нельзя: пробы открывают исходящие HTTPS-соединения, а не
+    слушают этот порт. Ошибка обзора возвращается отдельно и не маскируется.
+    """
+    try:
+        import socket
+        import psutil
+
+        wanted = {int(port) for port in ports}
+        connections = psutil.net_connections(kind="inet")
+    except Exception as exc:
+        return [], str(exc)
+
+    found: list[dict] = []
+    seen: set[tuple] = set()
+    for conn in connections:
+        local = getattr(conn, "laddr", None)
+        if not local:
+            continue
+        try:
+            if hasattr(local, "port"):
+                port = int(local.port)
+                host = str(getattr(local, "ip", "") or "*")
+            else:
+                port = int(local[1])
+                host = str(local[0] or "*")
+        except (IndexError, TypeError, ValueError):
+            continue
+        if port not in wanted:
+            continue
+
+        sock_type = getattr(conn, "type", None)
+        if sock_type == socket.SOCK_STREAM:
+            if str(getattr(conn, "status", "")).upper() != str(psutil.CONN_LISTEN).upper():
+                continue
+            protocol = "TCP"
+        elif sock_type == socket.SOCK_DGRAM:
+            protocol = "UDP"
+        else:
+            continue
+
+        pid = getattr(conn, "pid", None)
+        try:
+            pid = int(pid) if pid is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        process_name = ""
+        if pid is not None:
+            try:
+                process_name = str(psutil.Process(pid).name() or "")
+            except Exception:
+                pass
+
+        key = (protocol, host, port, pid)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append({
+            "protocol": protocol,
+            "host": host,
+            "port": port,
+            "pid": pid,
+            "process_name": process_name,
+        })
+
+    found.sort(key=lambda item: (item["protocol"], item["host"], item["pid"] or 0))
+    return found, ""
+
+
 def _dpi_generation_preflight(winws, progress) -> dict:
     """Проверки ПЕРЕД подбором: чтобы не гонять 5 минут впустую.
 
@@ -2819,20 +3211,72 @@ def _dpi_generation_preflight(winws, progress) -> dict:
     """
     result = {"abort": False, "reason": "", "warnings": []}
 
-    # 1. Чужие winws.exe (другая копия UmbraNet / zapret / GoodbyeDPI). WinDivert
-    #    занимается монопольно, поэтому нашему winws будет нечего показывать.
+    def abort_preflight(reason: str) -> dict:
+        result["abort"] = True
+        result["reason"] = reason
+        for note in result["warnings"]:
+            try:
+                progress(f"AI-генерация: внимание — {note}")
+            except Exception as exc:
+                log_recoverable(log, 'Не удалось передать предупреждение AI-генерации в UI', exc, level=logging.DEBUG)
+        try:
+            progress(f"AI-генерация: остановлена до запуска — {reason}")
+        except Exception as exc:
+            log_recoverable(log, 'Не удалось передать причину остановки AI-генерации в UI', exc, level=logging.DEBUG)
+        return result
+
+    # Проверяем настоящий локальный DNS-bind (TCP/UDP 53) и конкурирующий DPI.
+    # WinError 10054 сам по себе не доказывает занятый порт: это сброс уже
+    # установленного сетевого соединения. Zapret/WinWS может конфликтовать с
+    # UmbraNet через WinDivert, поэтому его проверяем отдельно от портов.
+    port_conflicts, port_scan_error = _dpi_local_port_conflicts((53,))
+    if port_scan_error:
+        result["warnings"].append(
+            f"Не удалось проверить занятость локального TCP/UDP-порта 53: {port_scan_error}"
+        )
+    if port_conflicts:
+        owners = []
+        for item in port_conflicts:
+            host = str(item.get("host") or "*")
+            address = f"[{host}]:{item.get('port')}" if ":" in host else f"{host}:{item.get('port')}"
+            process_name = str(item.get("process_name") or "")
+            pid = item.get("pid")
+            owner = process_name or (f"PID {pid}" if pid is not None else "процесс не определён")
+            if process_name and pid is not None:
+                owner += f" (PID {pid})"
+            owners.append(f"{item.get('protocol', '?')} {address} — {owner}")
+        reason = (
+            "Перед генерацией обнаружена занятость локального DNS-порта 53: "
+            + "; ".join(owners)
+            + ". Генерация остановлена до запуска. Освободите порт вручную и повторите."
+        )
+        result["port_conflicts"] = port_conflicts
+        return abort_preflight(reason)
+
+    # Zapret обычно конкурирует не за TCP/UDP-порт, а за драйвер WinDivert.
+    # На Windows он запускает winws.exe; проверяем и его, и другой e1-spike.exe.
     try:
         foreign = winws.foreign_processes() if hasattr(winws, "foreign_processes") else None
         if foreign:
-            names = ", ".join(f"PID {pid} ({path or 'путь неизвестен'})" for pid, path in foreign[:3])
+            names = ", ".join(
+                f"PID {pid} ({path or 'путь неизвестен'})" for pid, path in foreign[:5]
+            )
+            reason = (
+                "Перед генерацией обнаружен сторонний DPI-процесс (winws.exe/e1-spike.exe): "
+                f"{names}. Он может занимать WinDivert. Генерация остановлена до запуска. "
+                "Закройте процесс вручную и повторите; автоматическое завершение пока не выполняется."
+            )
+            result["dpi_processes"] = foreign
+            return abort_preflight(reason)
+        if foreign is None:
             result["warnings"].append(
-                f"рядом работает другая программа с winws.exe: {names}. "
-                "Она может держать WinDivert — тогда подбор будет пустым даже при верной стратегии."
+                "Не удалось проверить сторонние winws.exe/e1-spike.exe; проверка WinDivert неполная."
             )
     except Exception as exc:
-        log.debug("preflight: обзор чужих winws не удался: %s", exc)
+        log.debug("preflight: обзор чужих DPI-процессов не удался: %s", exc)
+        result["warnings"].append(f"Не удалось проверить сторонние DPI-процессы: {exc}")
 
-    # 2. Работает ли разрешение имён вообще. Это решающая проверка.
+    # Работает ли разрешение имён вообще. Это решающая проверка.
     try:
         from ai_strategy.probes import resolve_probe  # type: ignore
         dns = resolve_probe("www.youtube.com", timeout=3.0)
@@ -2938,6 +3382,7 @@ def dpi_strategy_ai_run_controlled(mode: str = "quick", on_progress=None, should
 
     try:
         from ai_strategy.mutations import generate_variants  # type: ignore
+        from ai_strategy.validate import validate_strategy_args  # type: ignore
         from ai_strategy.probes import run_basic_probes  # type: ignore
         from ai_strategy.scoring import choose_best, score_variant  # type: ignore
         from ai_strategy.session import session_policy  # type: ignore
@@ -3002,6 +3447,18 @@ def dpi_strategy_ai_run_controlled(mode: str = "quick", on_progress=None, should
                 f"AI-генерация: вариант {idx}/{len(variants)} • "
                 f"seed={seed_id} • mutation={mutation} • mask={mask_id}"
             )
+            # Структурные ворота (цель: только полностью рабочие стратегии).
+            # Поломанный вариант не запускаем и не тратим на него probes.
+            vres = validate_strategy_args(list(variant.get("args", []) or []))
+            if not vres.get("ok"):
+                scores.append({
+                    "variant_id": vid,
+                    "score": 0,
+                    "ok": False,
+                    "error": "структурная валидация: " + "; ".join(vres.get("problems") or []),
+                })
+                progress(f"AI-генерация: {vid} отклонён — {scores[-1]['error']}")
+                continue
             args, err = _dpi_expand_ai_variant_args(list(variant.get("args", []) or []), generation_domains)
             if not args:
                 scores.append({
@@ -3024,7 +3481,7 @@ def dpi_strategy_ai_run_controlled(mode: str = "quick", on_progress=None, should
                     progress(f"AI-генерация: WinWS запущен для {vid} за {start_ms} мс")
                 if cancelled():
                     try:
-                        winws.stop()
+                        winws.stop(reset_connections=False)
                     except Exception as exc:
                         log_recoverable(log, 'Не удалось остановить WinWS после отмены генерации', exc, level=logging.ERROR)
                     progress("AI-генерация: отменена пользователем")
@@ -3102,7 +3559,7 @@ def dpi_strategy_ai_run_controlled(mode: str = "quick", on_progress=None, should
             finally:
                 try:
                     if started or winws.is_running():
-                        if not winws.stop():
+                        if not winws.stop(reset_connections=False):
                             progress(f"AI-генерация: WinWS не остановился для {vid}")
                     # ВАЖНО: зачистка обязана идти ПОСЛЕ КАЖДОГО варианта, а не
                     # только когда stop() вернул False. Раньше здесь стоял
@@ -3256,7 +3713,7 @@ def dpi_strategy_check_all_controlled(on_progress=None, should_cancel=None) -> d
             finally:
                 try:
                     if started or winws.is_running():
-                        if not winws.stop():
+                        if not winws.stop(reset_connections=False):
                             progress(f"Проверка Uz: WinWS не остановился для {sid}")
                     # См. комментарий в AI-генерации: зачистка после КАЖДОЙ
                     # стратегии. Она дешёвая (WinAPI-обзор, без PowerShell), но

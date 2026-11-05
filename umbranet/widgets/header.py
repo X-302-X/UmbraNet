@@ -2,7 +2,7 @@
 UmbraNet - верхняя панель контента (PySide6).
 
 Содержит:
-  • ModeSwitch — три режима DPI (DNS Only / Combo / DPI Only);
+  • ModeSwitch — три режима маршрутизации (VPN / Combo / DPI);
   • ControlBar  — индикатор статуса + Start/Stop/Restart.
 
 Сигналы:
@@ -60,7 +60,8 @@ def _qss_label(color: str, size: int) -> str:
 
 def _power_qss(bg1: str, bg2: str,
                hover1: str, hover2: str,
-               pressed1: str, pressed2: str) -> str:
+               pressed1: str, pressed2: str,
+               fg: str | None = None) -> str:
     """
     QSS для кнопки btn_power.
 
@@ -78,7 +79,7 @@ def _power_qss(bg1: str, bg2: str,
     return (
         f"QPushButton{{"
         f"  background: {theme.grad(bg1, bg2)};"
-        f"  color: {theme.WHITE};"
+        f"  color: {fg or theme.text_on_color(bg1)};"
         "  border: none;"
         f"  border-radius: {r};"
         "  font-size: 13px;"
@@ -143,7 +144,7 @@ class ModeSwitch(QFrame):
         for key, m in theme.MODES.items():
             btn = QPushButton(self.button_label(key))
             # Не используем Qt tooltip на кнопках режима: при быстром клике
-            # DNS Only ↔ Combo Qt успевает показать маленькое всплывающее окно,
+            # VPN ↔ Combo Qt успевает показать маленькое всплывающее окно,
             # которое выглядит как баг/мигание. Описание режимов оставляем в
             # документации/«О программе», а сами кнопки должны переключаться
             # без всплывающих окон.
@@ -228,7 +229,7 @@ class ModeSwitch(QFrame):
         определённый момент сразу становятся мелкими… дергается»).
 
         Чтобы ужать кнопку МЕЖДУ полной подписью и значком, подпись укорачивается
-        по мере ужима: «DNS Only» → «DNS O…» → «DNS…» → значок. Ширина кнопки
+        по мере ужима: «VPN» → «VP…» → значок. Ширина кнопки
         задаётся явно и меняется на каждом шаге на считаные пиксели, так что
         рывка в раскладке нет ни в один момент.
 
@@ -354,8 +355,11 @@ class ControlBar(QFrame):
     startClicked   = Signal()
     stopClicked    = Signal()
     restartClicked = Signal()
+    # Emitted only after a visible status/button state mutation.  The shell
+    # uses it to recalculate the header once, instead of polling layout work.
+    visualStateChanged = Signal()
 
-    def __init__(self, running: bool = False, mode: str = "dns_only"):
+    def __init__(self, running: bool = False, mode: str = "vpn"):
         super().__init__()
         self._running = running
         self._can_start = True  # C1: Старт заблокирован без целей
@@ -392,7 +396,8 @@ class ControlBar(QFrame):
         self.btn_restart.setFixedHeight(_BTN_H)
         self.btn_restart.setStyleSheet(
             f"QPushButton{{"
-            f"  background:{theme.grad(theme.ORANGE,'#f59e0b')};color:{theme.WHITE};"
+            f"  background:{theme.grad(theme.ORANGE, theme.YELLOW)};"
+            f"  color:{theme.text_on_color(theme.ORANGE)};"
             f"  border:none;border-radius:{r_r};"
             "  font-size:13px;font-weight:600;padding:0 12px;"
             "}"
@@ -620,9 +625,12 @@ class ControlBar(QFrame):
 
     # ── публичные методы ──────────────────────────────────────────────────────
 
-    def set_can_start(self, can: bool):
-        """Делает кнопку Старт серой если нет выбранных сервисов."""
-        self._can_start = bool(can)
+    def set_can_start(self, can: bool) -> bool:
+        """Set Start availability once; unchanged values do not touch Qt/QSS."""
+        can = bool(can)
+        if can == self._can_start:
+            return False
+        self._can_start = can
         if not getattr(self, "_running", False):
             # Только когда остановлен — Старт может быть серым
             if not self._can_start:
@@ -639,6 +647,8 @@ class ControlBar(QFrame):
                     self._dot.setStyleSheet(_qss_label(theme.MUTED, 14))
                     self._status.setText("Остановлен")
                     self._status.setStyleSheet(_qss_label(theme.SUBTEXT, 13))
+        self.visualStateChanged.emit()
+        return True
 
     def _sync_status_tooltip(self):
         """Подсказка точки-индикатора повторяет текст статуса.
@@ -651,7 +661,7 @@ class ControlBar(QFrame):
         except Exception:
             pass
 
-    def set_running(self, running: bool, mode: str = "dns_only", admin_warn: bool = False):
+    def set_running(self, running: bool, mode: str = "vpn", admin_warn: bool = False):
         self._running = running
         # Убираем любой graphics-эффект — glow не совместим с border-radius QSS
         self.btn_power.setGraphicsEffect(None)
@@ -660,12 +670,12 @@ class ControlBar(QFrame):
             color = theme.YELLOW if admin_warn else theme.GREEN
             self._dot.setStyleSheet(_qss_label(color, 14))
 
-            # Определяем текст статуса в зависимости от режима
-            if mode == "dns_only":
-                status_text = "DNS запущен"
+            # Определяем текст статуса в зависимости от режима.
+            if mode == "vpn":
+                status_text = "VPN запущен"
             elif mode == "combo":
-                status_text = "DNS + DPI запущены"
-            elif mode == "dpi_only":
+                status_text = "VPN + DPI запущены"
+            elif mode == "dpi":
                 status_text = "DPI запущено"
             else:
                 status_text = "Работает"
@@ -677,9 +687,10 @@ class ControlBar(QFrame):
             self._power_text = "⏹  Стоп"
             self._render_power()
             self.btn_power.setStyleSheet(_power_qss(
-                bg1=theme.RED,      bg2="#f43f5e",
-                hover1="#ff6070",   hover2="#ff3050",
-                pressed1="#cc0020", pressed2="#cc2040",
+                bg1=theme.RED, bg2=theme.RED,
+                hover1=theme.PINK, hover2=theme.PINK,
+                pressed1=theme.RED, pressed2=theme.RED,
+                fg=theme.text_on_color(theme.RED),
             ))
             self.btn_restart.setEnabled(True)
             self.btn_power.setEnabled(True)
@@ -698,9 +709,10 @@ class ControlBar(QFrame):
             self._power_text = "▶  Старт"
             self._render_power()
             self.btn_power.setStyleSheet(_power_qss(
-                bg1=theme.GREEN,    bg2="#10b981",
-                hover1="#55ffaa",   hover2="#20d490",
-                pressed1="#1e8a55", pressed2="#0e7a45",
+                bg1=theme.GREEN, bg2=theme.GREEN,
+                hover1=theme.ACCENT3, hover2=theme.ACCENT3,
+                pressed1=theme.GREEN, pressed2=theme.GREEN,
+                fg=theme.text_on_color(theme.GREEN),
             ))
             self.btn_restart.setEnabled(False)
             self.btn_power.setEnabled(bool(can))
@@ -709,6 +721,21 @@ class ControlBar(QFrame):
             else:
                 self.btn_power.setToolTip("")
         self._sync_status_tooltip()
+        self.visualStateChanged.emit()
+
+    def set_vpn_blocked(self, message: str):
+        """Show a running strict route with no verified exit as degraded, not green.
+
+        The Stop control remains available: PAC is intentionally still active so
+        selected VPN destinations are blocked rather than silently sent DIRECT.
+        """
+        if not getattr(self, "_running", False) or not message:
+            return
+        self._dot.setStyleSheet(_qss_label(theme.YELLOW, 14))
+        self._status.setText(message)
+        self._status.setStyleSheet(_qss_label(theme.YELLOW, 13))
+        self._sync_status_tooltip()
+        self.visualStateChanged.emit()
 
     def set_busy(self, action: str):
         """Промежуточный статус пока идёт start/stop/restart."""
@@ -729,6 +756,7 @@ class ControlBar(QFrame):
         self._render_power()
         self.btn_power.setStyleSheet(_idle_qss())
         self._sync_status_tooltip()
+        self.visualStateChanged.emit()
 
     def set_ai_busy(self):
         """Промежуточный статус controlled AI-генерации."""
@@ -743,6 +771,7 @@ class ControlBar(QFrame):
         self._render_power()
         self.btn_power.setStyleSheet(_idle_qss())
         self._sync_status_tooltip()
+        self.visualStateChanged.emit()
 
     def set_error(self, message: str):
         """Показывает ошибку запуска."""
@@ -754,3 +783,4 @@ class ControlBar(QFrame):
         self.btn_power.setEnabled(True)
         self.btn_restart.setEnabled(False)
         self._sync_status_tooltip()
+        self.visualStateChanged.emit()

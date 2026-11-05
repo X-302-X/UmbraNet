@@ -9,8 +9,8 @@ import sys
 import sysconfig
 
 MIN_PYTHON = (3, 10)
-MAX_PYTHON = (3, 15)  # exclusive; pinned Qt wheels support up to Python 3.14
-SUPPORTED_PYTHON = "3.10–3.14"
+MAX_PYTHON = (3, 16)  # exclusive; pinned Qt wheels support up to Python 3.15
+SUPPORTED_PYTHON = "3.10–3.15"
 
 
 def compatibility_error(version, implementation, bits, platform_tag, free_threaded=False):
