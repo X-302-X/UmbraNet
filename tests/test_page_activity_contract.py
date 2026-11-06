@@ -68,11 +68,16 @@ def test_server_status_views_refresh_on_activation_without_polling_timers():
     assert "self._vpn_exit_list.set_page_active(False)" in routing_deactivate
 
 
-def test_strategy_lab_populates_after_visible_activation_not_in_constructor():
+def test_strategy_lab_prewarms_before_first_show_not_in_constructor():
+    # The shell now builds the library via prewarm() while the MainWindow is
+    # still hidden: constructing rows in the first activation frame briefly
+    # surfaced a native mini-window on fresh installs. The activation path
+    # remains as a safety net if the page was never prewarmed.
     init = _method(STRATEGY_LAB, "__init__")
     activate = _method(STRATEGY_LAB, "page_activated")
     deactivate = _method(STRATEGY_LAB, "page_deactivated")
     deferred = _method(STRATEGY_LAB, "_refresh_after_first_show")
+    prewarm = _method(STRATEGY_LAB, "prewarm")
 
     assert "super().__init__(parent)" in init
     assert "self.refresh()" not in init
@@ -81,6 +86,9 @@ def test_strategy_lab_populates_after_visible_activation_not_in_constructor():
     assert "self._page_active = False" in deactivate
     assert "if not self._page_active or self._initial_refresh_done:" in deferred
     assert "self.refresh()" in deferred
+    assert "self.refresh()" in prewarm
+    assert "self._initial_refresh_done = True" in prewarm
+    assert "prewarm" in APP
     assert "page = StrategyLabView(self.stack)" in APP
     assert "area = QScrollArea(self.stack)" in APP
     assert 'self._ensure_page("strategy_lab")' in APP
