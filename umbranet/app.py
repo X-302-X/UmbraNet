@@ -513,9 +513,16 @@ class MainWindow(GlowContainer):
         self._ensure_page("routing")
         # StrategyLab is the one complex scrollable page whose native Qt
         # construction visibly flashed on Windows when deferred until a click.
-        # Create its empty shell before MainWindow is ever shown; JSON loading
-        # and row construction remain deferred until first activation.
+        # Create its shell before MainWindow is ever shown and prebuild the
+        # library while everything is hidden: the first activation is a plain
+        # stack switch instead of a one-time heavy construction (which on
+        # fresh installs surfaced a native mini-window).
         self._ensure_page("strategy_lab")
+        _lab = self._views.get("strategy_lab")
+        if _lab is not None:
+            _prewarm = getattr(_lab, "prewarm", None)
+            if callable(_prewarm):
+                _prewarm()
         right.addWidget(self.stack, 1)
 
         right_wrap = QWidget()

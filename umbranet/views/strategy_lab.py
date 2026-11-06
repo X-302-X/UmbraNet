@@ -586,10 +586,10 @@ class StrategyLabView(QWidget):
         # complex lazy page creates any child. That prevents Windows from ever
         # treating the short construction interval as a top-level native window.
         super().__init__(parent)
-        # The page is created lazily by MainWindow. Do not synchronously scan
-        # JSON files or build the strategy rows before this QWidget belongs to
-        # the visible stack: on Windows an unparented first layout may briefly
-        # flash as a tiny native window and stalls the shell.
+        # The page shell is built eagerly in MainWindow.__init__; the library
+        # itself is compiled there too, via prewarm(), while everything is
+        # still hidden. Building it in the first activation frame used to
+        # surface a native mini-window on fresh installs.
         self.engine = None
         self._page_active = False
         self._initial_refresh_done = False
@@ -757,6 +757,22 @@ class StrategyLabView(QWidget):
     def page_deactivated(self) -> None:
         """Do not build the initial library after the person has left the page."""
         self._page_active = False
+
+    def prewarm(self) -> None:
+        """Build the library while the window is not shown yet.
+
+        Called once from MainWindow.__init__. Constructing rows lazily in the
+        first activation frame briefly surfaced a native mini-window on fresh
+        installs, so the heavy work happens here, while the page is hidden.
+        The activation path stays as a safety net: page_activated() and
+        _refresh_after_first_show() only fall back to building when prewarm()
+        never ran.
+        """
+        self._page_active = True
+        if self._initial_refresh_done or self._initial_refresh_scheduled:
+            return
+        self._initial_refresh_done = True
+        self.refresh()
 
     def _refresh_after_first_show(self) -> None:
         self._initial_refresh_scheduled = False
